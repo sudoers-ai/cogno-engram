@@ -35,6 +35,7 @@ from cogno_engram.types import (
     GraphNode,
     HybridWeights,
     MemoryRecord,
+    NodeContext,
     RetrievalQuery,
     Session,
     TurnRecord,
@@ -247,6 +248,21 @@ class PostgresStore(_PgBase):
         return [Session(id=str(r["id"]), scope=r["scope"], started_at=r["started_at"],
                         ended_at=r["ended_at"], summary=r["summary"]) for r in rows]
 
+    async def get_active_session(self, scope: str, *,
+                                 within_seconds: int = 12 * 3600) -> Optional[Session]:
+        _require_scope(scope)
+        async with self._conn() as conn:
+            cur = await conn.execute(
+                "SELECT id, scope, started_at, ended_at, summary FROM sessions "
+                "WHERE scope = %s AND ended_at IS NULL "
+                "AND started_at > now() - make_interval(secs => %s) "
+                "ORDER BY started_at DESC LIMIT 1", (scope, within_seconds))
+            row = await cur.fetchone()
+        if not row:
+            return None
+        return Session(id=str(row["id"]), scope=row["scope"], started_at=row["started_at"],
+                       ended_at=row["ended_at"], summary=row["summary"])
+
     # ── turns ────────────────────────────────────────────────────────────
     async def save_turn(self, turn: TurnRecord) -> None:
         _require_scope(turn.scope)
@@ -263,6 +279,16 @@ class PostgresStore(_PgBase):
                 (turn.scope, turn.session_id, turn.turn_n, user_input, response, turn.feedback,
                  turn.goal, turn.goal_status, turn.sentiment, turn.domains, turn.pii_types))
 
+    async def update_turn_response(self, scope: str, session_id: str, turn_n: int,
+                                   response: str) -> None:
+        _require_scope(scope)
+        if self._mask_pii:
+            response = _mask_pii(response)
+        async with self._conn() as conn:
+            await conn.execute(
+                "UPDATE turns SET response = %s WHERE scope = %s AND session_id = %s AND turn_n = %s",
+                (response, scope, session_id, turn_n))
+
     async def load_turns(self, session_id: str) -> list[TurnRecord]:
         async with self._conn() as conn:
             cur = await conn.execute(
@@ -271,6 +297,13 @@ class PostgresStore(_PgBase):
                 "FROM turns WHERE session_id = %s ORDER BY turn_n ASC", (session_id,))
             rows = await cur.fetchall()
         return [self._row_to_turn(r) for r in rows]
+
+    async def turn_count(self, session_id: str) -> int:
+        async with self._conn() as conn:
+            cur = await conn.execute(
+                "SELECT count(*) AS c FROM turns WHERE session_id = %s", (session_id,))
+            row = await cur.fetchone()
+        return int(row["c"])
 
     async def recent_turns(self, scope: str, *, limit: int = 5,
                            exclude_session: str = "") -> list[TurnRecord]:
@@ -372,6 +405,14 @@ class PostgresStore(_PgBase):
                         SELECT id FROM memories WHERE scope = %s AND tsv @@ {tsq} LIMIT %s)""",
                 (delta, scope, query_text, limit))
             return cur.rowcount
+
+    async def memory_count(self, scope: str) -> int:
+        _require_scope(scope)
+        async with self._conn() as conn:
+            cur = await conn.execute(
+                "SELECT count(*) AS c FROM memories WHERE scope = %s", (scope,))
+            row = await cur.fetchone()
+        return int(row["c"])
 
     # ── concurrency: pg_advisory_lock keyed on the session id ────────────
     @asynccontextmanager
@@ -506,6 +547,39 @@ class PostgresKnowledgeGraph(_PgBase):
             rows = await cur.fetchall()
         return [GraphNode(scope=r["scope"], label=r["label"], node_type=r["node_type"],
                           attributes=r["attributes"], id=r["id"]) for r in rows]
+
+    async def get_node_context(self, scope: str, label: str) -> Optional[NodeContext]:
+        _require_scope(scope)
+        node = await self.find_node(scope, label)
+        if node is None:
+            return None
+        edges = await self.walk(scope, label, max_depth=1)
+        edges = [e for e in edges
+                 if label.lower() in (e.source.lower(), e.target.lower())]
+        return NodeContext(node=node, edges=edges, neighbors=await self.neighbors(scope, label))
+
+    async def list_nodes(self, scope: str, *, node_type: Optional[str] = None,
+                         limit: int = 100) -> list[GraphNode]:
+        _require_scope(scope)
+        sql = "SELECT id, scope, label, node_type, attributes FROM knowledge_nodes WHERE scope = %s"
+        params: list = [scope]
+        if node_type is not None:
+            sql += " AND node_type = %s"
+            params.append(node_type)
+        sql += " ORDER BY id LIMIT %s"
+        params.append(limit)
+        async with self._conn() as conn:
+            cur = await conn.execute(sql, params)
+            rows = await cur.fetchall()
+        return [GraphNode(scope=r["scope"], label=r["label"], node_type=r["node_type"],
+                          attributes=r["attributes"], id=r["id"]) for r in rows]
+
+    async def delete_node(self, scope: str, label: str) -> bool:
+        _require_scope(scope)
+        async with self._conn() as conn:
+            cur = await conn.execute(
+                "DELETE FROM knowledge_nodes WHERE scope = %s AND label ILIKE %s", (scope, label))
+            return cur.rowcount > 0   # edges cascade via FK ON DELETE CASCADE
 
     async def delete_edges_by_session(self, scope: str, session_id: str) -> int:
         _require_scope(scope)

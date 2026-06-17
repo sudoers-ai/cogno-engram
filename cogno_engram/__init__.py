@@ -2,6 +2,7 @@
 
 from cogno_engram import hypnos
 from cogno_engram.adapters.in_memory import InMemoryBuffer, InMemoryGraph, InMemoryStore
+from cogno_engram.graph_context import format_graph_context, ingest_entities
 from cogno_engram.reranker import RerankConfig, recency_score, rerank
 from cogno_engram.ports import (
     ConversationBuffer,
@@ -16,6 +17,7 @@ from cogno_engram.types import (
     GraphNode,
     HybridWeights,
     MemoryRecord,
+    NodeContext,
     RetrievalQuery,
     Session,
     SessionSummary,
@@ -29,11 +31,12 @@ __all__ = [
     # ports
     "MemoryStore", "SupportsVectorSearch", "ConversationBuffer", "KnowledgeGraph",
     # types
-    "Session", "TurnRecord", "MemoryRecord", "GraphNode", "GraphEdge",
+    "Session", "TurnRecord", "MemoryRecord", "GraphNode", "GraphEdge", "NodeContext",
     "RetrievalQuery", "HybridWeights", "SessionSummary",
     "DEFAULT_CONFIDENCE", "VALID_NODE_TYPES",
     # reference adapters
     "InMemoryStore", "InMemoryBuffer", "InMemoryGraph",
-    # consolidation + reranking
+    # consolidation + reranking + graph helpers
     "hypnos", "rerank", "RerankConfig", "recency_score",
+    "ingest_entities", "format_graph_context",
 ]

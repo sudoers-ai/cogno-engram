@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import math
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import AsyncIterator, Optional
 from uuid import uuid4
 
@@ -21,6 +21,7 @@ from cogno_engram.types import (
     GraphNode,
     HybridWeights,
     MemoryRecord,
+    NodeContext,
     RetrievalQuery,
     Session,
     TurnRecord,
@@ -88,6 +89,15 @@ class InMemoryStore:
         sessions.sort(key=lambda s: s.started_at, reverse=True)
         return sessions[:limit]
 
+    async def get_active_session(self, scope: str, *,
+                                 within_seconds: int = 12 * 3600) -> Optional[Session]:
+        _require_scope(scope)
+        cutoff = _now() - timedelta(seconds=within_seconds)
+        candidates = [s for s in self._sessions.values()
+                      if s.scope == scope and s.ended_at is None and s.started_at >= cutoff]
+        candidates.sort(key=lambda s: s.started_at, reverse=True)
+        return candidates[0] if candidates else None
+
     # ── turns ────────────────────────────────────────────────────────────
     async def save_turn(self, turn: TurnRecord) -> None:
         _require_scope(turn.scope)
@@ -95,10 +105,20 @@ class InMemoryStore:
             turn.created_at = _now()
         self._turns.append(turn)
 
+    async def update_turn_response(self, scope: str, session_id: str, turn_n: int,
+                                   response: str) -> None:
+        _require_scope(scope)
+        for turn in self._turns:
+            if turn.scope == scope and turn.session_id == session_id and turn.turn_n == turn_n:
+                turn.response = response
+
     async def load_turns(self, session_id: str) -> list[TurnRecord]:
         turns = [t for t in self._turns if t.session_id == session_id]
         turns.sort(key=lambda t: t.turn_n)
         return turns
+
+    async def turn_count(self, session_id: str) -> int:
+        return sum(1 for t in self._turns if t.session_id == session_id)
 
     async def recent_turns(self, scope: str, *, limit: int = 5,
                            exclude_session: str = "") -> list[TurnRecord]:
@@ -164,6 +184,10 @@ class InMemoryStore:
                 if touched >= limit:
                     break
         return touched
+
+    async def memory_count(self, scope: str) -> int:
+        _require_scope(scope)
+        return sum(1 for m in self._memories if m.scope == scope)
 
     # ── concurrency ──────────────────────────────────────────────────────
     def session_lock(self, scope: str, session_id: str):
@@ -285,6 +309,33 @@ class InMemoryGraph:
             elif edge.target.lower() == label.lower():
                 labels.add(edge.source.lower())
         return [n for (s, lbl), n in self._nodes.items() if s == scope and lbl in labels]
+
+    async def get_node_context(self, scope: str, label: str) -> Optional[NodeContext]:
+        _require_scope(scope)
+        node = self._nodes.get((scope, label.lower()))
+        if node is None:
+            return None
+        edges = [e for e in self._edges
+                 if e.scope == scope and label.lower() in (e.source.lower(), e.target.lower())]
+        return NodeContext(node=node, edges=edges, neighbors=await self.neighbors(scope, label))
+
+    async def list_nodes(self, scope: str, *, node_type: Optional[str] = None,
+                         limit: int = 100) -> list[GraphNode]:
+        _require_scope(scope)
+        nodes = [n for (s, _), n in self._nodes.items()
+                 if s == scope and (node_type is None or n.node_type == node_type)]
+        return nodes[:limit]
+
+    async def delete_node(self, scope: str, label: str) -> bool:
+        _require_scope(scope)
+        key = (scope, label.lower())
+        if key not in self._nodes:
+            return False
+        del self._nodes[key]
+        # cascade: drop edges touching the node
+        self._edges = [e for e in self._edges
+                       if not (e.scope == scope and label.lower() in (e.source.lower(), e.target.lower()))]
+        return True
 
     async def delete_edges_by_session(self, scope: str, session_id: str) -> int:
         _require_scope(scope)

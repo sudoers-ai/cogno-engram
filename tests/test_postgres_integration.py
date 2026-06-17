@@ -230,3 +230,40 @@ async def test_delete_edges_by_session_prunes(graph):
     deleted = await graph.delete_edges_by_session(scope, "sess1")
     assert deleted == 2
     assert {e.relation for e in await graph.walk(scope, "José", max_depth=3)} == {"KNOWS"}
+
+
+# ── parent-parity surface (added for completeness) ─────────────────────────
+
+async def test_get_active_session_and_ttl(store):
+    scope = f"t/{uuid4()}"
+    s = await store.create_session(scope)
+    assert (await store.get_active_session(scope)).id == s.id
+    assert await store.get_active_session(scope, within_seconds=0) is None  # outside TTL
+    await store.close_session(s.id)
+    assert await store.get_active_session(scope) is None                    # closed
+
+
+async def test_update_turn_response_and_counts(store):
+    scope = f"t/{uuid4()}"
+    s = await store.create_session(scope)
+    await store.save_turn(TurnRecord(s.id, scope, 1, "oi"))
+    await store.save_turn(TurnRecord(s.id, scope, 2, "tudo bem?"))
+    await store.update_turn_response(scope, s.id, 1, "olá!")
+    turns = await store.load_turns(s.id)
+    assert turns[0].response == "olá!"
+    assert await store.turn_count(s.id) == 2
+    await store.save_memory(MemoryRecord(scope, "fact", "x"))
+    assert await store.memory_count(scope) == 1
+
+
+async def test_graph_node_context_list_delete(graph):
+    scope = f"t/{uuid4()}"
+    await _build_jose_rex(graph, scope)
+    ctx = await graph.get_node_context(scope, "José")
+    assert ctx is not None and {e.relation for e in ctx.edges} == {"OWNS"}
+    assert {n.label for n in ctx.neighbors} == {"Rex"}
+    assert {n.label for n in await graph.list_nodes(scope)} == {"José", "Rex", "Pastor Alemão"}
+    assert [n.label for n in await graph.list_nodes(scope, node_type="ANIMAL")] == ["Rex"]
+    assert await graph.delete_node(scope, "Rex") is True
+    assert await graph.find_node(scope, "Rex") is None
+    assert await graph.walk(scope, "José", max_depth=2) == []   # edges cascaded

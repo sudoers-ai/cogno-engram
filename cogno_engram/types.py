@@ -134,3 +134,11 @@ class SessionSummary:
     session_id: str
     summary: str
     memories: list[MemoryRecord] = field(default_factory=list)
+
+
+@dataclass
+class NodeContext:
+    """A node with its incident edges and neighbour nodes (one-hop context)."""
+    node: GraphNode
+    edges: list[GraphEdge] = field(default_factory=list)
+    neighbors: list[GraphNode] = field(default_factory=list)

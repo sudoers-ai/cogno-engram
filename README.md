@@ -86,10 +86,19 @@ Pass 1 is pure (`sim·0.60 + recency·0.25 + category·0.15`, half-life and boos
 A self-contained quality harness (no DB, no model — deterministic) over the in-memory adapter, scoring the substrate's three jobs:
 
 ```bash
-python3 cognobench.py                 # retrieval (hit@1) + consolidation + graph
+python3 cognobench.py                 # 5 deterministic dims: retrieval/buffer/consolidation/graph/lifecycle
 python3 cognobench.py --only graph
 python3 cognobench.py --min-score 100 # CI gate
+# opt-in, model-dependent: hypnos Tier-2 extraction quality vs a real Ollama model
+python3 cognobench.py --only llm_consolidation
 ```
+
+Dimensions: **retrieval** (hit@1, vector + BM25-only), **buffer** (sliding-window
+retention), **consolidation** (Tier-1 micro), **graph** (multi-hop walk),
+**lifecycle** (end-to-end: turns → Tier-1 → retrieval+rerank), and the opt-in
+**llm_consolidation** (Tier-2 quality against Ollama). Case distributions are
+modelled on the parent's real data (goal-heavy memories, BM25-dominant retrieval,
+NEEDS/PREFERS graph) — all synthetic.
 
 ## Testing
 

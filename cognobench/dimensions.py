@@ -11,6 +11,7 @@ from cognobench.consolidation_cases import CASES as CONSOLIDATION_CASES
 from cognobench.embedder import HashingEmbedder
 from cognobench.graph_cases import CASES as GRAPH_CASES
 from cognobench.lifecycle_cases import CASES as LIFECYCLE_CASES
+from cognobench.llm_consolidation_cases import CASES as LLM_CONSOLIDATION_CASES
 from cognobench.retrieval_cases import CASES as RETRIEVAL_CASES
 from cognobench.types import CheckResult, DimensionResult
 
@@ -116,10 +117,42 @@ async def run_buffer(limit: int | None = None) -> DimensionResult:
     return dim
 
 
+async def run_llm_consolidation(limit: int | None = None, *,
+                                model: str = "mistral:latest",
+                                base_url: str = "http://localhost:11434") -> DimensionResult:
+    """Gated: hypnos Tier-2 extraction QUALITY against a real Ollama model.
+
+    Soft, model-dependent. Auto-skips (0 checks) if Ollama is unreachable, so the
+    default deterministic run is unaffected.
+    """
+    from cognobench.ollama import OllamaBackend, is_available
+    dim = DimensionResult("llm_consolidation")
+    if not await is_available(base_url):
+        return dim     # 0 checks → reported as skipped
+    backend = OllamaBackend(model=model, base_url=base_url)
+    cases = LLM_CONSOLIDATION_CASES[:limit] if limit else LLM_CONSOLIDATION_CASES
+    for case in cases:
+        store = InMemoryStore()
+        session = await store.create_session("bench")
+        for i, (user, resp) in enumerate(case.turns, 1):
+            await store.save_turn(TurnRecord(session.id, "bench", i, user, response=resp))
+        mems = await hypnos.periodic_consolidate(
+            store, backend, scope="bench", session_id=session.id, extract_relations=False)
+        blob = " | ".join(m.content for m in mems).lower()
+        for term in case.expect_contains:
+            dim.checks.append(CheckResult(case.id, f"contains:{term}(soft)", term, blob,
+                                          term.lower() in blob))
+    return dim
+
+
+# Deterministic dimensions run by default; the LLM one is opt-in (`--only`).
+DETERMINISTIC = ["retrieval", "buffer", "consolidation", "graph", "lifecycle"]
+
 DIMENSIONS = {
     "retrieval": run_retrieval,
     "buffer": run_buffer,
     "consolidation": run_consolidation,
     "graph": run_graph,
     "lifecycle": run_lifecycle,
+    "llm_consolidation": run_llm_consolidation,
 }

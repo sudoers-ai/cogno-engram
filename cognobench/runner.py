@@ -4,7 +4,7 @@ import argparse
 import asyncio
 import sys
 
-from cognobench.dimensions import DIMENSIONS
+from cognobench.dimensions import DETERMINISTIC, DIMENSIONS
 from cognobench.report import render
 from cognobench.types import DimensionResult
 
@@ -12,14 +12,14 @@ ALL = list(DIMENSIONS)
 
 
 async def _run(only: list[str], limit: int | None) -> list[DimensionResult]:
-    names = only or ALL
+    names = only or DETERMINISTIC   # default: deterministic dims (llm_consolidation is opt-in)
     return [await DIMENSIONS[n](limit) for n in names]
 
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description="EngramBench — quality harness for cogno-engram")
     p.add_argument("--only", nargs="+", choices=ALL, default=[],
-                   help="run only these dimensions")
+                   help="run only these dimensions (incl. opt-in 'llm_consolidation')")
     p.add_argument("--limit", type=int, default=None, help="cap cases per dimension")
     p.add_argument("--min-score", type=float, default=0.0,
                    help="exit non-zero if overall %% is below this")

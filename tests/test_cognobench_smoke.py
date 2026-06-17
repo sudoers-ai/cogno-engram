@@ -1,6 +1,5 @@
 """Smoke test guarding the EngramBench plumbing in CI (no DB, no model)."""
 
-import pytest
 
 from cognobench.dimensions import run_consolidation, run_graph, run_retrieval
 

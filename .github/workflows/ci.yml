@@ -32,7 +32,7 @@ jobs:
         run: python3 cognobench.py --min-score 100
 
   integration:
-    # The Postgres + pgvector adapter, exercised against a real service container.
+    # The Postgres + Redis adapters, exercised against real service containers.
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -46,6 +46,15 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -54,8 +63,9 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e ".[dev,postgres]"
-      - name: Postgres integration tests
+          pip install -e ".[dev,postgres,redis]"
+      - name: Integration tests (Postgres + Redis)
         env:
           ENGRAM_TEST_DSN: postgresql://postgres:postgres@localhost:5432/postgres
-        run: pytest tests/test_postgres_integration.py -q
+          ENGRAM_TEST_REDIS_URL: redis://localhost:6379/0
+        run: pytest tests/test_postgres_integration.py tests/test_redis_integration.py -q

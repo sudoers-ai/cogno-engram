@@ -38,6 +38,8 @@ from cogno_engram.types import (  # noqa: E402
 DSN = os.getenv("ENGRAM_TEST_DSN", "")
 EMB_DIM = 8
 
+# (asyncio_mode=auto in pyproject handles the async marker — no module pytestmark)
+
 
 async def _connect():
     return await psycopg.AsyncConnection.connect(DSN, autocommit=True, connect_timeout=3)
@@ -52,9 +54,6 @@ async def _pg_available() -> bool:
         return True
     except Exception:
         return False
-
-
-pytestmark = pytest.mark.asyncio
 
 
 @pytest.fixture

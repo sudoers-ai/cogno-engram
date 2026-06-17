@@ -84,11 +84,13 @@ python3 cognobench.py --min-score 100 # CI gate
 pip install -e ".[dev]"
 python3 -m pytest -q                   # unit + bench-smoke (Postgres tests auto-skip)
 
-# Run the Postgres integration suite against a real pgvector:
+# Run the integration suites against real services:
 docker run -d --rm --name engram-pg -e POSTGRES_PASSWORD=postgres \
     -p 55432:5432 pgvector/pgvector:pg16
+docker run -d --rm --name engram-redis -p 56379:6379 redis:7-alpine
 ENGRAM_TEST_DSN=postgresql://postgres:postgres@localhost:55432/postgres \
-    python3 -m pytest tests/test_postgres_integration.py -q
+ENGRAM_TEST_REDIS_URL=redis://localhost:56379/0 \
+    python3 -m pytest tests/test_postgres_integration.py tests/test_redis_integration.py -q
 ```
 
 ## What lives in the host (not here)

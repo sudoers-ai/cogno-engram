@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from cogno_engram import hypnos, rerank
-from cogno_engram.adapters.in_memory import InMemoryGraph, InMemoryStore
+from cogno_engram.adapters.in_memory import InMemoryBuffer, InMemoryGraph, InMemoryStore
 from cogno_engram.types import GraphEdge, GraphNode, MemoryRecord, RetrievalQuery, TurnRecord
 
+from cognobench.buffer_cases import CASES as BUFFER_CASES
 from cognobench.consolidation_cases import CASES as CONSOLIDATION_CASES
 from cognobench.embedder import HashingEmbedder
 from cognobench.graph_cases import CASES as GRAPH_CASES
@@ -21,12 +22,15 @@ async def run_retrieval(limit: int | None = None) -> DimensionResult:
     for case in cases:
         store = InMemoryStore()
         for category, content in case.memories:
-            await store.save_memory(MemoryRecord("bench", category, content, embedding=emb.embed(content)))
+            embedding = emb.embed(content) if case.use_embedding else None
+            await store.save_memory(MemoryRecord("bench", category, content, embedding=embedding))
+        q_emb = emb.embed(case.query) if case.use_embedding else None
         out = await store.load_memories(
-            "bench", query=RetrievalQuery(text=case.query, embedding=emb.embed(case.query)), limit=3)
+            "bench", query=RetrievalQuery(text=case.query, embedding=q_emb), limit=3)
         top = out[0].content if out else ""
+        name = "hit@1" if case.use_embedding else "hit@1(bm25)"
         dim.checks.append(CheckResult(
-            case.id, "hit@1", case.expect_top, top, case.expect_top.lower() in top.lower()))
+            case.id, name, case.expect_top, top, case.expect_top.lower() in top.lower()))
     return dim
 
 
@@ -93,8 +97,28 @@ async def run_lifecycle(limit: int | None = None) -> DimensionResult:
     return dim
 
 
+async def run_buffer(limit: int | None = None) -> DimensionResult:
+    """Short-term buffer retention — which terms survive the sliding window."""
+    dim = DimensionResult("buffer")
+    cases = BUFFER_CASES[:limit] if limit else BUFFER_CASES
+    for case in cases:
+        buf = InMemoryBuffer()
+        for i, text in enumerate(case.turns, 1):
+            await buf.push("bench", "sess", TurnRecord("sess", "bench", i, text))
+        window = await buf.window("bench", "sess", size=case.window_size)
+        text = " | ".join(t.user_input for t in window)
+        for term in case.expect_present:
+            dim.checks.append(CheckResult(case.id, f"present:{term}", "present", text,
+                                          term.lower() in text.lower()))
+        for term in case.expect_absent:
+            dim.checks.append(CheckResult(case.id, f"absent:{term}", "absent", text,
+                                          term.lower() not in text.lower()))
+    return dim
+
+
 DIMENSIONS = {
     "retrieval": run_retrieval,
+    "buffer": run_buffer,
     "consolidation": run_consolidation,
     "graph": run_graph,
     "lifecycle": run_lifecycle,

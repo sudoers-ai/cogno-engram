@@ -17,6 +17,7 @@ class RetrievalCase:
     memories: list[tuple[str, str]]      # (category, content)
     query: str
     expect_top: str                      # substring expected at rank 1
+    use_embedding: bool = True           # False → BM25-only (reflects real data: ~0% embedded)
     description: str = ""
 
 
@@ -101,5 +102,31 @@ CASES: list[RetrievalCase] = [
         ],
         query="o cliente tem restrição alimentar de lactose",
         expect_top="lactose",
+    ),
+    # ── BM25-only (no embedding) — reflects production reality: in the parent's
+    #    PG dump only ~2/626 memories carried an embedding, so retrieval leans on
+    #    BM25/chronological. These cases retrieve with NO query embedding. ──
+    RetrievalCase(
+        id="bm25_only_goal_recall",
+        memories=[
+            ("goal", "o cliente quer parcelar a fatura do cartão"),
+            ("goal", "o cliente quer abrir uma conta poupança"),
+            ("fact", "o cliente tem dois cartões de crédito"),
+        ],
+        query="parcelar fatura cartão",
+        expect_top="parcelar a fatura",
+        use_embedding=False,
+        description="BM25-only path (the common case in production)",
+    ),
+    RetrievalCase(
+        id="bm25_only_pii_recall",
+        memories=[
+            ("pii", "o cliente informou o CPF durante o cadastro"),
+            ("preference", "o cliente prefere atendimento por email"),
+            ("goal", "o cliente quer atualizar o endereço"),
+        ],
+        query="cliente informou CPF cadastro",
+        expect_top="CPF",
+        use_embedding=False,
     ),
 ]

@@ -63,4 +63,17 @@ CASES: list[GraphCase] = [
         start="Carlos", max_depth=2,
         expect_relations={"PREFERS", "FLAVOUR"},
     ),
+    # ── Real-distribution flavour: in the parent's PG dump the graph is dominated
+    #    by NEEDS/PREFERS relations over CONCEPT/OBJECT nodes (not PERSON/ANIMAL). ──
+    GraphCase(
+        id="needs_prefers_concepts",
+        nodes=[("cliente", "CONCEPT"), ("parcelamento", "CONCEPT"),
+               ("cartão", "OBJECT"), ("pix", "CONCEPT")],
+        edges=[("cliente", "parcelamento", "NEEDS"),
+               ("cliente", "pix", "PREFERS"),
+               ("parcelamento", "cartão", "RELATED_TO")],
+        start="cliente", max_depth=2,
+        expect_relations={"NEEDS", "PREFERS", "RELATED_TO"},
+        description="NEEDS/PREFERS over CONCEPT/OBJECT — the real graph shape",
+    ),
 ]

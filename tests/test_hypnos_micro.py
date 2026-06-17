@@ -1,5 +1,3 @@
-import pytest
-
 from cogno_engram import hypnos
 from cogno_engram.types import TurnRecord
 
@@ -50,9 +48,3 @@ def test_new_domain_becomes_preference():
     mems = hypnos.micro_consolidate(cur, prev)
     prefs = [m for m in mems if m.category == "preference"]
     assert [m.content for m in prefs] == ["Interested in domain: HEALTH"]
-
-
-async def test_tier2_and_tier3_are_declared_but_unimplemented():
-    # the contract exists (signatures); LLM bodies land in the build-out phase
-    with pytest.raises(NotImplementedError):
-        await hypnos.periodic_consolidate(None, None, scope="s", session_id="x")

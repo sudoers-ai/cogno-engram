@@ -68,6 +68,19 @@ store = PostgresStore(dsn=dsn, mask_pii=True)
 hits = await store.load_memories("acme/phone1", query=RetrievalQuery(text="...", embedding=[...]))
 ```
 
+## Reranking
+
+`load_memories` returns relevance-ordered candidates; `rerank` refines them with a two-pass pipeline before you inject the top-k:
+
+```python
+from cogno_engram import rerank, RerankConfig
+
+candidates = await store.load_memories("acme/phone1", query=q, limit=20)
+top = rerank(candidates, query_text=q.text, top_k=5)   # sim + recency-decay + category boost
+```
+
+Pass 1 is pure (`sim·0.60 + recency·0.25 + category·0.15`, half-life and boosts configurable via `RerankConfig`). Pass 2 is an optional **host-injected** cross-encoder callable `(query, [content]) -> [score]` — so cogno-engram ships no heavy ML dependency.
+
 ## EngramBench
 
 A self-contained quality harness (no DB, no model — deterministic) over the in-memory adapter, scoring the substrate's three jobs:

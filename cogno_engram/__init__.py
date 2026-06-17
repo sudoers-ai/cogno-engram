@@ -2,6 +2,7 @@
 
 from cogno_engram import hypnos
 from cogno_engram.adapters.in_memory import InMemoryBuffer, InMemoryGraph, InMemoryStore
+from cogno_engram.reranker import RerankConfig, recency_score, rerank
 from cogno_engram.ports import (
     ConversationBuffer,
     KnowledgeGraph,
@@ -33,6 +34,6 @@ __all__ = [
     "DEFAULT_CONFIDENCE", "VALID_NODE_TYPES",
     # reference adapters
     "InMemoryStore", "InMemoryBuffer", "InMemoryGraph",
-    # consolidation
-    "hypnos",
+    # consolidation + reranking
+    "hypnos", "rerank", "RerankConfig", "recency_score",
 ]

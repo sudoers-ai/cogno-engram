@@ -53,18 +53,47 @@ pip install "cogno-engram[redis]"        # Redis buffer adapter
 
 The Tier-2/3 consolidation drives an LLM through a `cogno-anima` `LLMBackend` (host-injected).
 
-## What lives in the host (not here)
+## Postgres + pgvector adapter
 
-Business identity (`tenants`/`identities`), billing/token ledgers, persona/domain schemas, feedback *capture* (emoji → ±1), persona switching, OTP/rate-limiting, and the consolidation **worker loop**. `cogno-engram` only knows `scope`, sessions/turns/memories, the graph, and the buffer.
+The reference adapter implements `MemoryStore` (hybrid retrieval = `0.60·vector + 0.40·BM25 + 0.05·feedback`) and `KnowledgeGraph` (recursive-CTE multi-hop walk) over one database. Call `ensure_schema` once for the idempotent DDL (tables + indexes; no alembic required):
 
-## Development
+```python
+import psycopg
+from cogno_engram.adapters.postgres import PostgresStore, ensure_schema
+
+async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as conn:
+    await ensure_schema(conn)                 # CREATE TABLE/INDEX IF NOT EXISTS
+
+store = PostgresStore(dsn=dsn, mask_pii=True)
+hits = await store.load_memories("acme/phone1", query=RetrievalQuery(text="...", embedding=[...]))
+```
+
+## EngramBench
+
+A self-contained quality harness (no DB, no model — deterministic) over the in-memory adapter, scoring the substrate's three jobs:
+
+```bash
+python3 cognobench.py                 # retrieval (hit@1) + consolidation + graph
+python3 cognobench.py --only graph
+python3 cognobench.py --min-score 100 # CI gate
+```
+
+## Testing
 
 ```bash
 pip install -e ".[dev]"
-python3 -m pytest -q
-ruff check cogno_engram tests
-mypy cogno_engram
+python3 -m pytest -q                   # unit + bench-smoke (Postgres tests auto-skip)
+
+# Run the Postgres integration suite against a real pgvector:
+docker run -d --rm --name engram-pg -e POSTGRES_PASSWORD=postgres \
+    -p 55432:5432 pgvector/pgvector:pg16
+ENGRAM_TEST_DSN=postgresql://postgres:postgres@localhost:55432/postgres \
+    python3 -m pytest tests/test_postgres_integration.py -q
 ```
+
+## What lives in the host (not here)
+
+Business identity (`tenants`/`identities`), billing/token ledgers, persona/domain schemas, feedback *capture* (emoji → ±1), persona switching, OTP/rate-limiting, and the consolidation **worker loop**. `cogno-engram` only knows `scope`, sessions/turns/memories, the graph, and the buffer.
 
 ## License
 

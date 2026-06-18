@@ -189,6 +189,26 @@ class InMemoryStore:
         _require_scope(scope)
         return sum(1 for m in self._memories if m.scope == scope)
 
+    async def delete_memories(self, scope: str, *, older_than: Optional[datetime] = None,
+                              category: Optional[str] = None,
+                              max_confidence: Optional[float] = None) -> int:
+        _require_scope(scope)
+
+        def keep(m: MemoryRecord) -> bool:
+            if m.scope != scope:
+                return True
+            if older_than is not None and (m.created_at is None or m.created_at >= older_than):
+                return True
+            if category is not None and m.category != category:
+                return True
+            if max_confidence is not None and m.confidence > max_confidence:
+                return True
+            return False   # matches all active filters → delete
+
+        before = len(self._memories)
+        self._memories = [m for m in self._memories if keep(m)]
+        return before - len(self._memories)
+
     # ── concurrency ──────────────────────────────────────────────────────
     def session_lock(self, scope: str, session_id: str):
         _require_scope(scope)

@@ -56,6 +56,14 @@ include = ["cogno_engram*"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 
+[tool.coverage.run]
+# The Postgres/Redis adapters are exercised by the gated integration job, not the
+# unit job — omit them from the unit coverage gate (they'd otherwise read as ~20%).
+omit = [
+    "cogno_engram/adapters/postgres.py",
+    "cogno_engram/adapters/redis_buffer.py",
+]
+
 [tool.ruff]
 line-length = 110
 target-version = "py310"

@@ -267,3 +267,66 @@ async def test_graph_node_context_list_delete(graph):
     assert await graph.delete_node(scope, "Rex") is True
     assert await graph.find_node(scope, "Rex") is None
     assert await graph.walk(scope, "José", max_depth=2) == []   # edges cascaded
+
+
+# ── maintenance + partitioning ─────────────────────────────────────────────
+
+class _Embedder:
+    async def embed(self, text):
+        return [float(len(text) % 7)] + [0.0] * (EMB_DIM - 1)
+
+
+async def test_maintenance_prune_and_reembed(store):
+    from datetime import timedelta
+    from cogno_engram import maintenance
+    scope = f"t/{uuid4()}"
+    # an old low-confidence memory (force created_at into the past) + a durable fact
+    await store.save_memory(MemoryRecord(scope, "fact", "stale", confidence=0.6))
+    await store.save_memory(MemoryRecord(scope, "fact", "durable", confidence=1.0))
+    async with await psycopg.AsyncConnection.connect(DSN, autocommit=True) as c:
+        await c.execute("UPDATE memories SET created_at = now() - interval '400 days' WHERE scope = %s",
+                        (scope,))
+    n = await maintenance.prune_memories(store, scope, older_than=timedelta(days=180),
+                                         max_confidence=0.75)
+    assert n == 1
+    remaining = await store.load_memories(scope)
+    assert [m.content for m in remaining] == ["durable"]
+    # reembed the survivor
+    assert await maintenance.reembed_memories(store, _Embedder(), scope) == 1
+
+
+async def test_maintenance_prune_orphan_nodes(graph):
+    scope = f"t/{uuid4()}"
+    await graph.upsert_node(GraphNode(scope, "A", "CONCEPT"))
+    await graph.upsert_node(GraphNode(scope, "B", "CONCEPT"))
+    await graph.upsert_edge(GraphEdge(scope, "A", "B", "REL"))
+    await graph.upsert_node(GraphNode(scope, "Lonely", "CONCEPT"))
+    from cogno_engram import maintenance
+    assert await maintenance.prune_orphan_nodes(graph, scope) == 1
+    assert await graph.find_node(scope, "Lonely") is None
+    assert await graph.find_node(scope, "A") is not None
+
+
+async def test_hash_partitioning_roundtrip():
+    if not await _pg_available():
+        pytest.skip("set ENGRAM_TEST_DSN to run")
+    conn = await psycopg.AsyncConnection.connect(DSN, autocommit=True)
+    for tbl in ("knowledge_edges", "knowledge_nodes", "memories", "turns", "sessions"):
+        await conn.execute(f"DROP TABLE IF EXISTS {tbl} CASCADE")
+    await ensure_schema(conn, embedding_dim=EMB_DIM, partition_by_scope=True, partitions=4)
+    # partitions were created
+    cur = await conn.execute(
+        "SELECT count(*) FROM pg_inherits i "
+        "JOIN pg_class p ON p.oid = i.inhparent WHERE p.relname = 'turns'")
+    assert (await cur.fetchone())[0] == 4   # 4 hash partitions of turns
+    await conn.close()
+
+    store = PostgresStore(dsn=DSN)
+    scope = f"t/{uuid4()}"
+    s = await store.create_session(scope)
+    await store.save_turn(TurnRecord(s.id, scope, 1, "particionado"))
+    await store.save_turn(TurnRecord(s.id, scope, 1, "dup ignored"))   # ON CONFLICT (scope,sess,turn)
+    assert [t.user_input for t in await store.load_turns(s.id)] == ["particionado"]
+    await store.save_memory(MemoryRecord(scope, "fact", "x", embedding=[1.0] + [0.0] * (EMB_DIM - 1)))
+    out = await store.load_memories(scope, query=RetrievalQuery(text="x"))
+    assert out and out[0].content == "x"

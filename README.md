@@ -68,6 +68,26 @@ store = PostgresStore(dsn=dsn, mask_pii=True)
 hits = await store.load_memories("acme/phone1", query=RetrievalQuery(text="...", embedding=[...]))
 ```
 
+For scale, opt the high-volume tables into HASH(scope) partitioning (the generic
+equivalent of the parent's LIST(tenant), with zero DDL per new scope):
+
+```python
+await ensure_schema(conn, partition_by_scope=True, partitions=8)
+```
+
+## Maintenance (sleep-time upkeep)
+
+Like `hypnos`, the host schedules; engram does the work — keeping the substrate
+bounded and consistent over time:
+
+```python
+from cogno_engram import maintenance
+
+await maintenance.prune_memories(store, scope, older_than=timedelta(days=180), max_confidence=0.75)
+await maintenance.reembed_memories(store, embedder, scope)      # after an embedding-model change
+await maintenance.prune_orphan_nodes(kg, scope)                 # drop edgeless graph nodes
+```
+
 ## Reranking
 
 `load_memories` returns relevance-ordered candidates; `rerank` refines them with a two-pass pipeline before you inject the top-k:

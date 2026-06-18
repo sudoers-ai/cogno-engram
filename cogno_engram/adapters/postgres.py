@@ -24,6 +24,7 @@ import hashlib
 import json
 import re
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Any, AsyncIterator, Optional
 from uuid import uuid4
 
@@ -69,13 +70,24 @@ def _mask_pii(text: str) -> str:
 
 
 async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
-                        ts_config: str = DEFAULT_TS_CONFIG) -> None:
+                        ts_config: str = DEFAULT_TS_CONFIG,
+                        partition_by_scope: bool = False, partitions: int = 8) -> None:
     """Create the engram schema idempotently (extension + tables + indexes).
 
     No alembic required — this is the zero-friction path. Migrations can be
     layered on top by a host that wants versioned schema.
+
+    ``partition_by_scope`` opts the high-volume ``turns`` and ``memories`` tables
+    into HASH(scope) partitioning over a fixed number of buckets (``partitions``),
+    the generic equivalent of the parent's LIST(tenant) partitioning — zero DDL
+    per new scope. Every query carries ``scope`` so partition pruning applies.
     """
     await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+
+    # sessions / knowledge_* stay unpartitioned (low volume); turns/memories opt in.
+    pk = "PRIMARY KEY (id, scope)" if partition_by_scope else "PRIMARY KEY (id)"
+    part = "PARTITION BY HASH (scope)" if partition_by_scope else ""
+
     await conn.execute(
         """
         CREATE TABLE IF NOT EXISTS sessions (
@@ -88,9 +100,9 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
         """
     )
     await conn.execute(
-        """
+        f"""
         CREATE TABLE IF NOT EXISTS turns (
-            id           bigserial PRIMARY KEY,
+            id           bigserial,
             scope        text NOT NULL,
             session_id   uuid NOT NULL,
             turn_n       integer NOT NULL,
@@ -100,17 +112,18 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
             goal         text NOT NULL DEFAULT '',
             goal_status  text NOT NULL DEFAULT '',
             sentiment    text NOT NULL DEFAULT '',
-            domains      text[] NOT NULL DEFAULT '{}',
-            pii_types    text[] NOT NULL DEFAULT '{}',
+            domains      text[] NOT NULL DEFAULT '{{}}',
+            pii_types    text[] NOT NULL DEFAULT '{{}}',
             created_at   timestamptz NOT NULL DEFAULT now(),
-            UNIQUE (session_id, turn_n)
-        )
+            {pk},
+            UNIQUE (scope, session_id, turn_n)
+        ) {part}
         """
     )
     await conn.execute(
         f"""
         CREATE TABLE IF NOT EXISTS memories (
-            id             uuid PRIMARY KEY,
+            id             uuid,
             scope          text NOT NULL,
             category       text NOT NULL,
             content        text NOT NULL,
@@ -119,10 +132,17 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
             embedding      vector({embedding_dim}),
             tsv            tsvector GENERATED ALWAYS AS (to_tsvector('{ts_config}', content)) STORED,
             created_at     timestamptz NOT NULL DEFAULT now(),
+            {pk},
             UNIQUE (scope, category, content)
-        )
+        ) {part}
         """
     )
+    if partition_by_scope:
+        for tbl in ("turns", "memories"):
+            for k in range(partitions):
+                await conn.execute(
+                    f"CREATE TABLE IF NOT EXISTS {tbl}_p{k} PARTITION OF {tbl} "
+                    f"FOR VALUES WITH (MODULUS {partitions}, REMAINDER {k})")
     await conn.execute(
         f"""
         CREATE TABLE IF NOT EXISTS knowledge_nodes (
@@ -275,7 +295,7 @@ class PostgresStore(_PgBase):
                    (scope, session_id, turn_n, user_input, response, feedback,
                     goal, goal_status, sentiment, domains, pii_types)
                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                   ON CONFLICT (session_id, turn_n) DO NOTHING""",
+                   ON CONFLICT (scope, session_id, turn_n) DO NOTHING""",
                 (turn.scope, turn.session_id, turn.turn_n, user_input, response, turn.feedback,
                  turn.goal, turn.goal_status, turn.sentiment, turn.domains, turn.pii_types))
 
@@ -413,6 +433,25 @@ class PostgresStore(_PgBase):
                 "SELECT count(*) AS c FROM memories WHERE scope = %s", (scope,))
             row = await cur.fetchone()
         return int(row["c"])
+
+    async def delete_memories(self, scope: str, *, older_than: Optional[datetime] = None,
+                              category: Optional[str] = None,
+                              max_confidence: Optional[float] = None) -> int:
+        _require_scope(scope)
+        sql = "DELETE FROM memories WHERE scope = %s"
+        params: list = [scope]
+        if older_than is not None:
+            sql += " AND created_at < %s"
+            params.append(older_than)
+        if category is not None:
+            sql += " AND category = %s"
+            params.append(category)
+        if max_confidence is not None:
+            sql += " AND confidence <= %s"
+            params.append(max_confidence)
+        async with self._conn() as conn:
+            cur = await conn.execute(sql, params)
+            return cur.rowcount
 
     # ── concurrency: pg_advisory_lock keyed on the session id ────────────
     @asynccontextmanager

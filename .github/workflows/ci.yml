@@ -26,8 +26,9 @@ jobs:
       - name: Type-check (mypy)
         run: mypy cogno_engram
       - name: Unit + bench-smoke tests
-        # Postgres integration tests auto-skip without ENGRAM_TEST_DSN.
-        run: pytest -q
+        # Postgres/Redis integration tests auto-skip without their env vars; their
+        # adapters are omitted from the coverage gate (covered by the integration job).
+        run: pytest -q --cov=cogno_engram --cov-report=term-missing --cov-fail-under=90
       - name: EngramBench gate
         run: python3 cognobench.py --min-score 100
 

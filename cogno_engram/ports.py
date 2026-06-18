@@ -21,6 +21,7 @@ loud, never silently span tenants).
 from __future__ import annotations
 
 from contextlib import AbstractAsyncContextManager
+from datetime import datetime
 from typing import Optional, Protocol, runtime_checkable
 
 from cogno_engram.types import (
@@ -67,6 +68,9 @@ class MemoryStore(Protocol):
     async def adjust_feedback_score(self, scope: str, query_text: str, delta: float,
                                     *, limit: int = 10) -> int: ...
     async def memory_count(self, scope: str) -> int: ...
+    async def delete_memories(self, scope: str, *, older_than: Optional[datetime] = None,
+                              category: Optional[str] = None,
+                              max_confidence: Optional[float] = None) -> int: ...
 
     # ── concurrency primitive (host decides when to hold it) ─────────────
     def session_lock(self, scope: str, session_id: str) -> AbstractAsyncContextManager[None]: ...

@@ -57,6 +57,11 @@ include = ["cogno_engram*"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Put the repo root on sys.path so `tests/` (no __init__.py) can import the
+# top-level `cognobench` package under the bare `pytest` console script (which,
+# unlike `python -m pytest`, does not add the cwd). Mirrors how cogno-anima's
+# tests/ package achieves the same via __init__.py.
+pythonpath = ["."]
 
 [tool.coverage.run]
 # The Postgres/Redis adapters are exercised by the gated integration job, not the

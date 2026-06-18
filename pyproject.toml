@@ -41,9 +41,11 @@ dev = [
 # Reference adapters — install only what you wire up.
 postgres = ["psycopg[binary,pool]>=3.1", "pgvector>=0.2"]
 redis = ["redis>=5.0"]
-# hypnos consolidation drives an LLM via a cogno-anima LLMBackend (host-injected).
-# cogno-anima is the sibling cognition library; install it editable for type-checking
-# and for the Tier-2/Tier-3 consolidation paths.
+# hypnos consolidation drives an LLM via a cogno-synapse LLMBackend (host-injected).
+# Sibling libs, imported under TYPE_CHECKING only (engram has no runtime dep on them):
+#   cogno-synapse — the LLMBackend/Embedder protocols used by Tier-2/Tier-3 consolidation
+#   cogno-anima   — the IntentResult/IdResult/StageMetrics types in cogno_engram.types
+# Install them editable for full type-checking of those paths.
 
 [build-system]
 requires = ["setuptools>=77.0.3", "wheel"]

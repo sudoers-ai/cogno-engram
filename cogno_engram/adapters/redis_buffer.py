@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 from redis.asyncio import Redis, from_url
 
@@ -43,7 +43,9 @@ def _dump(turn: TurnRecord) -> str:
     return json.dumps(data, ensure_ascii=False)
 
 
-def _load(raw: str) -> TurnRecord:
+def _load(raw: str | bytes) -> TurnRecord:
+    # redis-py types list values as ``bytes | str`` regardless of the client's
+    # ``decode_responses`` flag; ``json.loads`` accepts both, so widen the param.
     data = json.loads(raw)
     created = data.pop("created_at", None)
     return TurnRecord(created_at=datetime.fromisoformat(created) if created else None, **data)
@@ -79,7 +81,12 @@ class RedisConversationBuffer:
 
     async def window(self, scope: str, session_id: str, *, size: int = 10) -> list[TurnRecord]:
         _require_scope(scope)
-        items = await self._redis.lrange(self._key(scope, session_id), -size, -1)  # type: ignore[misc]
+        # redis-py's async overloads type lrange inconsistently across versions
+        # (an Awaitable|list union in some, list[bytes|str] in others); route the
+        # call through an Any reference so it type-checks regardless of the stub
+        # version installed — neither a [misc] await nor a [bytes|str] arg surfaces.
+        client: Any = self._redis
+        items = await client.lrange(self._key(scope, session_id), -size, -1)
         return [_load(i) for i in items]
 
     async def clear(self, scope: str, session_id: str) -> None:

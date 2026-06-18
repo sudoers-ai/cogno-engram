@@ -17,9 +17,9 @@ Three complementary tiers (ported from the parent's ConsolidationManager):
   * Tier 3 — ``consolidate_session`` : async, on session close/idle, holistic
                                        LLM pass (+ feedback-driven KG pruning).
 
-Tiers 2 and 3 take a ``cogno_anima`` ``LLMBackend`` and (optionally) an
+Tiers 2 and 3 take a ``cogno_synapse`` ``LLMBackend`` and (optionally) an
 ``Embedder``, both **duck-typed and host-injected** — engram never imports
-cogno-anima at runtime. The backend is called as
+cogno-synapse at runtime. The backend is called as
 ``await backend.generate(system, prompt) -> (text, tokens_in, tokens_out)``;
 the embedder as ``await embedder.embed(text) -> list[float]``.
 """
@@ -42,7 +42,7 @@ from cogno_engram.types import (
 )
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
-    from cogno_anima.llm.base import Embedder, LLMBackend
+    from cogno_synapse import Embedder, LLMBackend
 
 
 # ── Prompts (defaults; every consolidation fn accepts overrides) ──────────────

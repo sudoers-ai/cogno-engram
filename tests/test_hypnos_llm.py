@@ -88,6 +88,19 @@ async def test_periodic_malformed_json_is_tolerant():
     assert mems == []
 
 
+async def test_malformed_json_logs_warning(caplog):
+    import logging
+    store = InMemoryStore()
+    scope, sid = "acme/p", "s1"
+    await _seed(store, scope, sid, [TurnRecord(sid, scope, 1, "oi")])
+    backend = ScriptedBackend(["not json at all"])
+    with caplog.at_level(logging.WARNING, logger="cogno_engram.hypnos"):
+        await hypnos.periodic_consolidate(store, backend, scope=scope, session_id=sid,
+                                          extract_relations=False)
+    assert any("event=parse_failed kind=memories" in r.message
+               and r.levelno == logging.WARNING for r in caplog.records)
+
+
 async def test_periodic_extracts_relations_into_graph():
     store = InMemoryStore()
     kg = InMemoryGraph()

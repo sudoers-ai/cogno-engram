@@ -9,11 +9,14 @@ orphaned graph nodes.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from cogno_engram.ports import KnowledgeGraph, MemoryStore
 from cogno_engram.types import MemoryRecord, RetrievalQuery
+
+logger = logging.getLogger("cogno_engram.maintenance")
 
 
 async def prune_memories(
@@ -34,8 +37,11 @@ async def prune_memories(
     """
     now = now or datetime.now(timezone.utc)
     cutoff = now - older_than
-    return await store.delete_memories(scope, older_than=cutoff, category=category,
-                                       max_confidence=max_confidence)
+    deleted = await store.delete_memories(scope, older_than=cutoff, category=category,
+                                          max_confidence=max_confidence)
+    logger.info("stage=maintenance event=prune_memories scope=%s removed=%d category=%s",
+                scope, deleted, category or "*")
+    return deleted
 
 
 async def reembed_memories(
@@ -58,6 +64,7 @@ async def reembed_memories(
         await store.save_memory(MemoryRecord(scope, m.category, m.content,
                                              confidence=m.confidence, embedding=vec or None))
         count += 1
+    logger.info("stage=maintenance event=reembed scope=%s reprocessed=%d", scope, count)
     return count
 
 
@@ -72,4 +79,5 @@ async def prune_orphan_nodes(kg: KnowledgeGraph, scope: str, *, limit: int = 100
         if not await kg.neighbors(scope, node.label):
             if await kg.delete_node(scope, node.label):
                 deleted += 1
+    logger.info("stage=maintenance event=prune_orphan_nodes scope=%s removed=%d", scope, deleted)
     return deleted

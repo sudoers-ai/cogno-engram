@@ -18,12 +18,15 @@ passes them here to refine the ordering before injecting the top-k.
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Callable, Optional, Sequence
 
 from cogno_engram.types import MemoryRecord
+
+logger = logging.getLogger("cogno_engram.reranker")
 
 DEFAULT_HALF_LIFE_DAYS = 7.0
 
@@ -102,11 +105,16 @@ def rerank(
     # Descending by score; ties broken toward the earlier (more relevant) position.
     scored.sort(key=lambda t: (t[0], -t[1]), reverse=True)
     pass1 = [mem for _, _, mem in scored]
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug("stage=reranker pass=1 candidates=%d top_score=%.3f",
+                     len(scored), scored[0][0] if scored else 0.0)
 
     if cross_encoder is not None and query_text:
         shortlist = pass1[: max(top_k * 2, 20)]
         ce_scores = cross_encoder(query_text, [m.content for m in shortlist])
         order = sorted(range(len(shortlist)), key=lambda i: ce_scores[i], reverse=True)
+        logger.debug("stage=reranker pass=2 event=cross_encoder shortlist=%d top_k=%d",
+                     len(shortlist), top_k)
         return [shortlist[i] for i in order][:top_k]
 
     return pass1[:top_k]

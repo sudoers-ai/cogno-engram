@@ -27,6 +27,7 @@ the embedder as ``await embedder.embed(text) -> list[float]``.
 from __future__ import annotations
 
 import json
+import logging
 from typing import TYPE_CHECKING, Any, Optional
 
 from cogno_engram.ports import KnowledgeGraph, MemoryStore
@@ -43,6 +44,8 @@ from cogno_engram.types import (
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from cogno_synapse import Embedder, LLMBackend
+
+logger = logging.getLogger("cogno_engram.hypnos")
 
 
 # ── Prompts (defaults; every consolidation fn accepts overrides) ──────────────
@@ -161,8 +164,10 @@ def _parse_memories(text: str, scope: str, confidence: float) -> list[MemoryReco
     try:
         data = json.loads(_strip_fence(text))
     except (json.JSONDecodeError, ValueError):
+        logger.warning("stage=hypnos event=parse_failed kind=memories scope=%s", scope)
         return []
     if not isinstance(data, dict):
+        logger.warning("stage=hypnos event=parse_failed kind=memories reason=not_object scope=%s", scope)
         return []
     out: list[MemoryRecord] = []
     for category, items in data.items():
@@ -199,8 +204,10 @@ async def _extract_relations(kg: KnowledgeGraph, backend: Any, *, scope: str, se
     try:
         data = json.loads(_strip_fence(text))
     except (json.JSONDecodeError, ValueError):
+        logger.warning("stage=hypnos event=parse_failed kind=relations scope=%s", scope)
         return 0
     if not isinstance(data, dict):
+        logger.warning("stage=hypnos event=parse_failed kind=relations reason=not_object scope=%s", scope)
         return 0
 
     for node in data.get("nodes", []) or []:
@@ -259,6 +266,8 @@ async def periodic_consolidate(
     if extract_relations and kg is not None:
         await _extract_relations(kg, backend, scope=scope, session_id=session_id, turns=turns,
                                  embedder=embedder, system=relation_system, prompt=relation_prompt)
+    logger.info("stage=hypnos tier=2 event=periodic_done turns=%d extracted=%d",
+                len(turns), len(mems))
     return mems
 
 
@@ -302,4 +311,6 @@ async def consolidate_session(
     if close:
         await store.close_session(session.id, summary=summary)
 
+    logger.info("stage=hypnos tier=3 event=session_done turns=%d memories=%d disliked=%d",
+                len(turns), len(mems), disliked)
     return SessionSummary(session_id=session.id, summary=summary, memories=mems)

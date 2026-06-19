@@ -47,6 +47,22 @@ DEFAULT_EMBEDDING_DIM = 768
 # Text-search config for BM25; Portuguese is the parent's primary language.
 DEFAULT_TS_CONFIG = "portuguese"
 
+# ``ts_config`` is interpolated into SQL by name (a regconfig identifier cannot be
+# a bound parameter), so it MUST be a bare SQL identifier — never tenant-supplied
+# free text. Accept an optionally schema-qualified lowercase identifier only; this
+# allows a host's custom dictionary (e.g. ``my_schema.unaccent_pt``) while making
+# injection via the config impossible.
+_TS_CONFIG_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$")
+
+
+def _validate_ts_config(ts_config: str) -> str:
+    if not _TS_CONFIG_RE.match(ts_config or ""):
+        raise ValueError(
+            f"invalid ts_config {ts_config!r}: must be a bare SQL identifier "
+            "(letters/digits/underscore, optionally schema-qualified) — it is "
+            "interpolated into SQL and must not be tenant-supplied free text")
+    return ts_config
+
 
 def _require_scope(scope: str) -> str:
     if not scope or not scope.strip():
@@ -82,6 +98,7 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
     the generic equivalent of the parent's LIST(tenant) partitioning — zero DDL
     per new scope. Every query carries ``scope`` so partition pruning applies.
     """
+    ts_config = _validate_ts_config(ts_config)  # interpolated into the tsvector DDL
     await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
 
     # sessions / knowledge_* stay unpartitioned (low volume); turns/memories opt in.
@@ -203,7 +220,7 @@ class _PgBase:
             raise ValueError("provide either dsn= or pool=")
         self._dsn = dsn
         self._pool = pool
-        self._ts = ts_config
+        self._ts = _validate_ts_config(ts_config)
         self._mask_pii = mask_pii
 
     @asynccontextmanager

@@ -96,6 +96,29 @@ async def test_session_and_turn_roundtrip(store):
     assert (await store.get_session(s.id)).scope == scope
 
 
+async def test_admin_turns_subtree_pagination_and_scopes(store):
+    # a unique tenant prefix so the assertion is isolated from other tests' rows
+    tenant = f"adm{uuid4().hex[:8]}"
+    s1 = await store.create_session(f"{tenant}/u1")
+    s2 = await store.create_session(f"{tenant}/u2")
+    await store.save_turn(TurnRecord(s1.id, f"{tenant}/u1", 0, "a"))
+    await store.save_turn(TurnRecord(s2.id, f"{tenant}/u2", 0, "b"))
+    await store.save_turn(TurnRecord(s1.id, f"{tenant}/u1", 1, "c"))
+    # a different tenant must NOT leak in
+    other = await store.create_session(f"oth{uuid4().hex[:8]}/u9")
+    await store.save_turn(TurnRecord(other.id, other.scope, 0, "x"))
+
+    turns, total = await store.admin_turns(tenant)
+    assert total == 3 and {t.scope for t in turns} == {f"{tenant}/u1", f"{tenant}/u2"}
+    assert await store.admin_scopes(tenant) == [f"{tenant}/u1", f"{tenant}/u2"]
+    # exact identity subtree
+    _t, total_u1 = await store.admin_turns(f"{tenant}/u1")
+    assert total_u1 == 2
+    # pagination keeps the running total
+    page, total = await store.admin_turns(tenant, limit=2, offset=0)
+    assert len(page) == 2 and total == 3
+
+
 async def test_close_session_and_recent(store):
     scope = f"t/{uuid4()}"
     s = await store.create_session(scope)

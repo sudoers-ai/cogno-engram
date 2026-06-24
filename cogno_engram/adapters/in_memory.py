@@ -133,6 +133,22 @@ class InMemoryStore:
             if turn.scope == scope and turn.session_id == session_id and turn.turn_n == turn_n:
                 turn.feedback = feedback
 
+    @staticmethod
+    def _under(scope: str, prefix: str) -> bool:
+        # the scope IS the prefix, or a descendant ``prefix/…`` (subtree match)
+        return scope == prefix or scope.startswith(prefix + "/")
+
+    async def admin_turns(self, scope_prefix: str, *, limit: int = 30,
+                          offset: int = 0) -> "tuple[list[TurnRecord], int]":
+        _require_scope(scope_prefix)
+        turns = [t for t in self._turns if self._under(t.scope, scope_prefix)]
+        turns.sort(key=lambda t: (t.created_at or _now()), reverse=True)
+        return turns[offset:offset + limit], len(turns)
+
+    async def admin_scopes(self, scope_prefix: str) -> list[str]:
+        _require_scope(scope_prefix)
+        return sorted({t.scope for t in self._turns if self._under(t.scope, scope_prefix)})
+
     # ── memories ─────────────────────────────────────────────────────────
     async def save_memory(self, memory: MemoryRecord) -> None:
         _require_scope(memory.scope)

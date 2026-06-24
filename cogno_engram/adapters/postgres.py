@@ -362,6 +362,44 @@ class PostgresStore(_PgBase):
                 (feedback, scope, session_id, turn_n))
 
     @staticmethod
+    def _subtree_like(scope_prefix: str) -> str:
+        # match descendants ``prefix/…``; escape LIKE metacharacters (scope is opaque)
+        esc = scope_prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        return esc + "/%"
+
+    # WHERE the scope IS the prefix OR a ``prefix/…`` descendant (subtree). ESCAPE '\' pairs the
+    # escaping in _subtree_like. Not partition-pruned — an admin/maintenance read.
+    _SUBTREE = "(scope = %s OR scope LIKE %s ESCAPE '\\')"
+
+    async def admin_turns(self, scope_prefix: str, *, limit: int = 30,
+                          offset: int = 0) -> "tuple[list[TurnRecord], int]":
+        _require_scope(scope_prefix)
+        like = self._subtree_like(scope_prefix)
+        async with self._conn() as conn:
+            cur = await conn.execute(
+                "SELECT scope, session_id, turn_n, user_input, response, feedback, goal, "
+                "goal_status, sentiment, domains, pii_types, created_at "
+                f"FROM turns WHERE {self._SUBTREE} "
+                "ORDER BY created_at DESC, id DESC LIMIT %s OFFSET %s",
+                (scope_prefix, like, limit, offset))
+            rows = await cur.fetchall()
+            ccur = await conn.execute(
+                f"SELECT count(*) AS c FROM turns WHERE {self._SUBTREE}", (scope_prefix, like))
+            crow = await ccur.fetchone()
+        total = crow["c"] if crow else 0
+        return [self._row_to_turn(r) for r in rows], int(total)
+
+    async def admin_scopes(self, scope_prefix: str) -> list[str]:
+        _require_scope(scope_prefix)
+        like = self._subtree_like(scope_prefix)
+        async with self._conn() as conn:
+            cur = await conn.execute(
+                f"SELECT DISTINCT scope FROM turns WHERE {self._SUBTREE} ORDER BY scope",
+                (scope_prefix, like))
+            rows = await cur.fetchall()
+        return [r["scope"] for r in rows]
+
+    @staticmethod
     def _row_to_turn(r: dict) -> TurnRecord:
         return TurnRecord(
             session_id=str(r["session_id"]), scope=r["scope"], turn_n=r["turn_n"],

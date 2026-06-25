@@ -59,6 +59,14 @@ class MemoryStore(Protocol):
     async def set_feedback(self, scope: str, session_id: str, turn_n: int,
                            feedback: int) -> None: ...
     async def turn_count(self, session_id: str) -> int: ...
+    # Admin / cross-scope reads: all turns at or under a scope SUBTREE (``scope_prefix`` itself or
+    # any ``scope_prefix + "/" + …`` descendant), newest-first + a total for pagination. This is
+    # the one place a query spans scopes — e.g. a tenant's whole chat history, where the host's
+    # scope is ``tenant_id/identity`` (``make_scope``). NOT partition-pruned (the hash is over the
+    # full scope), so it's an admin/maintenance read, not a hot path.
+    async def admin_turns(self, scope_prefix: str, *, limit: int = 30,
+                          offset: int = 0) -> "tuple[list[TurnRecord], int]": ...
+    async def admin_scopes(self, scope_prefix: str) -> list[str]: ...   # distinct scopes w/ turns
 
     # ── memories ─────────────────────────────────────────────────────────
     async def save_memory(self, memory: MemoryRecord) -> None: ...   # upsert

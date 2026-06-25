@@ -19,6 +19,29 @@ async def test_session_and_turn_roundtrip(store):
     assert (await store.get_session(session.id)).scope == "acme/phone1"
 
 
+async def test_admin_turns_and_scopes_span_a_scope_subtree(store):
+    # admin reads span a scope SUBTREE (a tenant's whole history: tenant_id/identity)
+    await store.save_turn(TurnRecord("s1", "acme/u1", 0, "a"))
+    await store.save_turn(TurnRecord("s2", "acme/u2", 0, "b"))
+    await store.save_turn(TurnRecord("s3", "acme/u1", 1, "c"))
+    await store.save_turn(TurnRecord("s9", "globex/u9", 0, "x"))   # other tenant — excluded
+
+    turns, total = await store.admin_turns("acme")
+    assert total == 3 and {t.scope for t in turns} == {"acme/u1", "acme/u2"}
+    assert "globex/u9" not in {t.scope for t in turns}
+    # distinct scopes (the identity sidebar)
+    assert await store.admin_scopes("acme") == ["acme/u1", "acme/u2"]
+    # an exact identity scope narrows to that subtree
+    only_u1, total_u1 = await store.admin_turns("acme/u1")
+    assert total_u1 == 2 and all(t.scope == "acme/u1" for t in only_u1)
+    # pagination
+    page, total = await store.admin_turns("acme", limit=1, offset=0)
+    assert len(page) == 1 and total == 3
+    # blank prefix is rejected (never silently span everything)
+    with pytest.raises(ValueError):
+        await store.admin_turns("")
+
+
 async def test_close_session_records_summary(store):
     session = await store.create_session("s")
     await store.close_session(session.id, summary="all done")

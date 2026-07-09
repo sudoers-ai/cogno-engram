@@ -269,11 +269,39 @@ class PostgresStore(_PgBase):
         return Session(id=str(row["id"]), scope=row["scope"], started_at=row["started_at"],
                        ended_at=row["ended_at"], summary=row["summary"])
 
-    async def close_session(self, session_id: str, *, summary: str = "") -> None:
+    async def close_session(self, session_id: str, *, summary: str = "", scope: str = "") -> None:
         async with self._conn() as conn:
-            await conn.execute(
-                "UPDATE sessions SET ended_at = now(), summary = %s WHERE id = %s",
-                (summary, session_id))
+            if scope:
+                # UPSERT: a host that only save_turn()s has no sessions row to update — insert a
+                # closed one (keyed by the same session id) so the janitor's idle scan skips it.
+                await conn.execute(
+                    "INSERT INTO sessions (id, scope, ended_at, summary) "
+                    "VALUES (%s, %s, now(), %s) "
+                    "ON CONFLICT (id) DO UPDATE SET ended_at = now(), summary = EXCLUDED.summary",
+                    (session_id, scope, summary))
+            else:
+                await conn.execute(
+                    "UPDATE sessions SET ended_at = now(), summary = %s WHERE id = %s",
+                    (summary, session_id))
+
+    async def idle_sessions(self, *, idle_seconds: int = 1800,
+                            limit: int = 100) -> list[Session]:
+        # Turn-derived (the host persists turns without a sessions row): group the turns table by
+        # session, take the last activity, and keep those idle past the cutoff and NOT already
+        # closed (LEFT JOIN sessions → row absent, or present with ended_at NULL).
+        async with self._conn() as conn:
+            cur = await conn.execute(
+                "SELECT t.session_id AS id, t.scope AS scope, "
+                "       min(t.created_at) AS started_at, max(t.created_at) AS last_activity "
+                "FROM turns t LEFT JOIN sessions s ON s.id = t.session_id "
+                "WHERE s.id IS NULL OR s.ended_at IS NULL "
+                "GROUP BY t.session_id, t.scope "
+                "HAVING max(t.created_at) < now() - make_interval(secs => %s) "
+                "ORDER BY max(t.created_at) ASC LIMIT %s",
+                (idle_seconds, limit))
+            rows = await cur.fetchall()
+        return [Session(id=str(r["id"]), scope=r["scope"], started_at=r["started_at"])
+                for r in rows]
 
     async def recent_sessions(self, scope: str, *, limit: int = 5) -> list[Session]:
         _require_scope(scope)

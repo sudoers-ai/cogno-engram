@@ -77,11 +77,40 @@ class InMemoryStore:
     async def get_session(self, session_id: str) -> Optional[Session]:
         return self._sessions.get(session_id)
 
-    async def close_session(self, session_id: str, *, summary: str = "") -> None:
+    async def close_session(self, session_id: str, *, summary: str = "", scope: str = "") -> None:
         session = self._sessions.get(session_id)
         if session is not None:
             session.ended_at = _now()
             session.summary = summary
+        elif scope:
+            # UPSERT a closed row for a turn-derived session that never had a create_session
+            # (host-persisted turns) — so the janitor's idle scan won't re-pick it.
+            self._sessions[session_id] = Session(
+                id=session_id, scope=scope, started_at=_now(), ended_at=_now(), summary=summary)
+
+    async def idle_sessions(self, *, idle_seconds: int = 1800,
+                            limit: int = 100) -> list[Session]:
+        cutoff = _now() - timedelta(seconds=idle_seconds)
+        # last activity per session_id, derived from turns (the host may never create_session)
+        last: dict[str, tuple[str, "datetime", "datetime"]] = {}   # sid → (scope, first, last)
+        for t in self._turns:
+            ts = t.created_at or _now()
+            cur = last.get(t.session_id)
+            if cur is None:
+                last[t.session_id] = (t.scope, ts, ts)
+            else:
+                sc, first, lst = cur
+                last[t.session_id] = (sc, min(first, ts), max(lst, ts))
+        out = []
+        for sid, (scope, first, lst) in last.items():
+            if lst >= cutoff:
+                continue                                   # still recently active
+            sess = self._sessions.get(sid)
+            if sess is not None and sess.ended_at is not None:
+                continue                                   # already closed/consolidated
+            out.append(Session(id=sid, scope=scope, started_at=first))
+        out.sort(key=lambda s: s.started_at)               # oldest-idle first
+        return out[:limit]
 
     async def recent_sessions(self, scope: str, *, limit: int = 5) -> list[Session]:
         _require_scope(scope)

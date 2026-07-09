@@ -128,6 +128,31 @@ async def test_close_session_and_recent(store):
     assert recent and recent[0].id == s.id
 
 
+async def test_idle_sessions_and_close_upsert(store):
+    # turn-derived sessions (the host save_turn()s without create_session): idle scan groups the
+    # turns table, keeps those past the cutoff and not-yet-closed, and close_session(scope=) upserts
+    # a closed row so the next scan skips it. Backdate created_at via a raw conn (save_turn defaults
+    # created_at to now()).
+    scope = f"jan{uuid4().hex[:8]}/u"
+    idle_id, fresh_id = str(uuid4()), str(uuid4())
+    await store.save_turn(TurnRecord(idle_id, scope, 0, "q0"))
+    await store.save_turn(TurnRecord(idle_id, scope, 1, "q1"))
+    await store.save_turn(TurnRecord(fresh_id, scope, 0, "hi"))
+    conn = await _connect()
+    await conn.execute("UPDATE turns SET created_at = now() - interval '45 min' WHERE session_id = %s",
+                       (idle_id,))
+
+    idle = await store.idle_sessions(idle_seconds=1800)
+    ids = [s.id for s in idle]
+    assert idle_id in ids and fresh_id not in ids
+
+    await store.close_session(idle_id, summary="consolidated", scope=scope)
+    closed = await store.get_session(idle_id)
+    assert closed is not None and closed.ended_at is not None and closed.summary == "consolidated"
+    assert idle_id not in [s.id for s in await store.idle_sessions(idle_seconds=1800)]
+    await conn.close()
+
+
 async def test_pii_masking_on_write(store):
     scope = f"t/{uuid4()}"
     s = await store.create_session(scope)

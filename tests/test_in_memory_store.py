@@ -49,6 +49,48 @@ async def test_close_session_records_summary(store):
     assert reloaded.ended_at is not None and reloaded.summary == "all done"
 
 
+async def test_idle_sessions_finds_stale_turn_derived_sessions(store):
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    # a turn-derived session (no create_session — the host only save_turn()s), last activity 45m ago
+    await store.save_turn(TurnRecord("sess-idle", "t/u1", 0, "q0",
+                                     created_at=now - timedelta(minutes=50)))
+    await store.save_turn(TurnRecord("sess-idle", "t/u1", 1, "q1",
+                                     created_at=now - timedelta(minutes=45)))
+    # a fresh session — active 1m ago → NOT idle
+    await store.save_turn(TurnRecord("sess-fresh", "t/u2", 0, "hi",
+                                     created_at=now - timedelta(minutes=1)))
+
+    idle = await store.idle_sessions(idle_seconds=1800)   # 30 min
+    assert [s.id for s in idle] == ["sess-idle"]
+    assert idle[0].scope == "t/u1" and idle[0].started_at == now - timedelta(minutes=50)
+
+
+async def test_close_session_upserts_and_excludes_from_idle_scan(store):
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    await store.save_turn(TurnRecord("sess-x", "t/u", 0, "q",
+                                     created_at=now - timedelta(minutes=45)))
+    assert [s.id for s in await store.idle_sessions(idle_seconds=1800)] == ["sess-x"]
+
+    # close_session(scope=...) upserts a closed row for a session that never had create_session
+    await store.close_session("sess-x", summary="consolidated", scope="t/u")
+    closed = await store.get_session("sess-x")
+    assert closed is not None and closed.ended_at is not None and closed.summary == "consolidated"
+    assert await store.idle_sessions(idle_seconds=1800) == []      # not re-picked
+
+
+async def test_idle_sessions_oldest_first_and_limit(store):
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    for i, mins in enumerate((90, 60, 120)):
+        await store.save_turn(TurnRecord(f"s{i}", "t/u", 0, "q",
+                                         created_at=now - timedelta(minutes=mins)))
+    ordered = await store.idle_sessions(idle_seconds=1800)
+    assert [s.id for s in ordered] == ["s2", "s0", "s1"]           # 120m, 90m, 60m — oldest first
+    assert len(await store.idle_sessions(idle_seconds=1800, limit=2)) == 2
+
+
 async def test_scope_isolation(store):
     await store.save_memory(MemoryRecord("tenantA/p", "fact", "A secret"))
     await store.save_memory(MemoryRecord("tenantB/p", "fact", "B secret"))

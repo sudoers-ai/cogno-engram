@@ -111,14 +111,21 @@ python3 cognobench.py --only graph
 python3 cognobench.py --min-score 100 # CI gate
 # opt-in, model-dependent: hypnos Tier-2 extraction quality vs a real Ollama model
 python3 cognobench.py --only llm_consolidation
+# opt-in: the FULL edge-capture path (Tier-2 relation extraction → graph at kg_scope)
+python3 cognobench.py --only graph_capture --model mistral:latest
+# visualize every graph the bench built/captured as one self-contained HTML
+python3 cognobench.py --only graph graph_capture --graph-html graphs.html
 ```
 
 Dimensions: **retrieval** (hit@1, vector + BM25-only), **buffer** (sliding-window
 retention), **consolidation** (Tier-1 micro), **graph** (multi-hop walk),
 **lifecycle** (end-to-end: turns → Tier-1 → retrieval+rerank), and the opt-in
-**llm_consolidation** (Tier-2 quality against Ollama). Case distributions are
-modelled on the parent's real data (goal-heavy memories, BM25-dominant retrieval,
-NEEDS/PREFERS graph) — all synthetic.
+**llm_consolidation** (Tier-2 memory quality against Ollama) and **graph_capture**
+(Tier-2 relation extraction against Ollama: hard invariants — no dangling edges,
+valid confidence, session-tagged, graph rows only at `kg_scope` — plus soft
+entity-connectivity checks). Case distributions are modelled on the parent's real
+data (goal-heavy memories, BM25-dominant retrieval, NEEDS/PREFERS graph) — all
+synthetic.
 
 ## Testing
 

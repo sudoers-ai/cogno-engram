@@ -63,3 +63,16 @@ async def test_scope_isolation(graph):
 async def test_blank_scope_rejected(graph):
     with pytest.raises(ValueError):
         await graph.find_node("", "X")
+
+
+async def test_upsert_edge_auto_creates_missing_endpoints():
+    # Parity with the Postgres adapter (_resolve_node_id INSERTs on miss): an edge whose
+    # endpoints were never declared must not dangle — they materialise as CONCEPT nodes.
+    from cogno_engram.adapters.in_memory import InMemoryGraph
+    g = InMemoryGraph()
+    await g.upsert_edge(GraphEdge("s", "Maria", "Mimi", "OWNS", source_session="sess"))
+    src = await g.find_node("s", "Maria")
+    tgt = await g.find_node("s", "Mimi")
+    assert src is not None and tgt is not None
+    assert src.node_type == "CONCEPT" and tgt.node_type == "CONCEPT"
+    assert [e.relation for e in await g.walk("s", "Maria", max_depth=1)] == ["OWNS"]

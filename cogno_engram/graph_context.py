@@ -28,11 +28,14 @@ async def ingest_entities(
     entities: Iterable[Entity],
     *,
     embedder: Optional[Any] = None,
+    attributes: Optional[dict] = None,
 ) -> int:
     """Channel-1 ingestion: upsert each NER entity as a graph node. Returns the count.
 
     ``embedder`` (duck-typed ``cogno-anima`` Embedder) optionally embeds the node
-    label for later semantic node search.
+    label for later semantic node search. ``attributes`` is merged into every
+    ingested node (upsert semantics: keys overwrite) — e.g. the host stamps
+    ``{"identity_id": ...}`` so a shared-scope graph keeps per-node provenance.
     """
     count = 0
     for ent in entities:
@@ -44,7 +47,7 @@ async def ingest_entities(
             continue
         if ntype not in VALID_NODE_TYPES:
             ntype = "CONCEPT"
-        node = GraphNode(scope, str(label).strip(), ntype)
+        node = GraphNode(scope, str(label).strip(), ntype, attributes=dict(attributes or {}))
         if embedder is not None:
             node.embedding = (await embedder.embed(node.label)) or None
         await kg.upsert_node(node)

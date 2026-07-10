@@ -302,14 +302,18 @@ class InMemoryGraph:
         _require_scope(node.scope)
         key = (node.scope, node.label.lower())
         existing = self._nodes.get(key)
+        now = datetime.now(timezone.utc)
         if existing is not None:
             existing.attributes.update(node.attributes)
             if node.embedding is not None:
                 existing.embedding = node.embedding
+            existing.updated_at = now                        # parity with Pg's updated_at = now()
             assert existing.id is not None
             return existing.id
         node.id = self._next_id
         self._next_id += 1
+        node.created_at = node.created_at or now
+        node.updated_at = node.updated_at or now
         self._nodes[key] = node
         return node.id
 

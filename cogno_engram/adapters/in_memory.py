@@ -315,6 +315,12 @@ class InMemoryGraph:
 
     async def upsert_edge(self, edge: GraphEdge) -> None:
         _require_scope(edge.scope)
+        # Parity with the Postgres adapter: an edge's endpoints are auto-created when missing
+        # (Pg's _resolve_node_id INSERTs with the column default node_type='CONCEPT'), so an
+        # LLM extraction that lists an edge without declaring both nodes never dangles.
+        for label in (edge.source, edge.target):
+            if (edge.scope, label.lower()) not in self._nodes:
+                await self.upsert_node(GraphNode(edge.scope, label, "CONCEPT"))
         for existing in self._edges:
             if (existing.scope == edge.scope and existing.source.lower() == edge.source.lower()
                     and existing.target.lower() == edge.target.lower()

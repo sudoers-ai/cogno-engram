@@ -245,6 +245,7 @@ async def periodic_consolidate(
     batch_n: int = 10,
     embedder: Optional["Embedder"] = None,
     kg: Optional[KnowledgeGraph] = None,
+    kg_scope: Optional[str] = None,
     extract_relations: bool = True,
     system: str = DEFAULT_PERIODIC_SYSTEM,
     prompt: str = DEFAULT_PERIODIC_PROMPT,
@@ -256,6 +257,9 @@ async def periodic_consolidate(
 
     Extracts durable memories (embedding + upserting them) and, if a graph is
     given, KG relations tagged with ``session_id`` (for later feedback pruning).
+    The graph is often shared at a BROADER scope than the memories (e.g. the host
+    keeps memories per identity but the knowledge graph per tenant) — pass
+    ``kg_scope`` to aim the graph writes there; default is ``scope``.
     """
     turns = [t for t in await store.load_turns(session_id) if t.feedback != -1][-batch_n:]
     if not turns:
@@ -264,8 +268,9 @@ async def periodic_consolidate(
     mems = _parse_memories(text, scope, confidence)
     await _embed_and_save(store, mems, embedder)
     if extract_relations and kg is not None:
-        await _extract_relations(kg, backend, scope=scope, session_id=session_id, turns=turns,
-                                 embedder=embedder, system=relation_system, prompt=relation_prompt)
+        await _extract_relations(kg, backend, scope=kg_scope or scope, session_id=session_id,
+                                 turns=turns, embedder=embedder,
+                                 system=relation_system, prompt=relation_prompt)
     logger.info("stage=hypnos tier=2 event=periodic_done turns=%d extracted=%d",
                 len(turns), len(mems))
     return mems
@@ -279,6 +284,7 @@ async def consolidate_session(
     *,
     session: Session,
     kg: Optional[KnowledgeGraph] = None,
+    kg_scope: Optional[str] = None,
     embedder: Optional["Embedder"] = None,
     close: bool = True,
     system: str = DEFAULT_FINAL_SYSTEM,
@@ -289,7 +295,10 @@ async def consolidate_session(
 
     Loads all turns (dropping disliked ones), runs a holistic LLM pass, writes a
     summary to the session, and prunes KG edges asserted by this session when any
-    turn was disliked (feedback-driven cleanup).
+    turn was disliked (feedback-driven cleanup). ``kg_scope`` mirrors Tier 2:
+    when the graph lives at a broader scope than the session (host keeps it per
+    tenant), pass it so the feedback pruning hits the edges Tier 2 actually
+    wrote; default is ``session.scope``.
     """
     turns = await store.load_turns(session.id)
     active = [t for t in turns if t.feedback != -1]
@@ -307,7 +316,7 @@ async def consolidate_session(
                f"Domains: {', '.join(domains) or 'general'}. Memories: {len(mems)}.")
 
     if disliked and kg is not None:
-        await kg.delete_edges_by_session(session.scope, session.id)
+        await kg.delete_edges_by_session(kg_scope or session.scope, session.id)
     if close:
         await store.close_session(session.id, summary=summary)
 

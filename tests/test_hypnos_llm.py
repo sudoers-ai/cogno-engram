@@ -159,3 +159,36 @@ async def test_final_no_active_turns_still_closes():
     result = await hypnos.consolidate_session(store, backend, session=session)
     assert result.memories == []
     assert (await store.get_session(session.id)).ended_at is not None
+
+
+async def test_periodic_relations_honour_kg_scope():
+    """The host keeps memories per identity but the graph per tenant — relations must
+    land at ``kg_scope``, not at the (narrower) memory scope."""
+    store = InMemoryStore()
+    kg = InMemoryGraph()
+    scope, sid = "acme/phone-1", "s1"
+    await _seed(store, scope, sid, [TurnRecord(sid, scope, 1, "o cachorro do José é o Rex")])
+    backend = ScriptedBackend([
+        _mem_json(fact=["o José tem um cachorro"]),
+        json.dumps({"nodes": [{"label": "José", "type": "PERSON"}, {"label": "Rex", "type": "ANIMAL"}],
+                    "edges": [{"source": "José", "target": "Rex", "relation": "OWNS", "confidence": 0.9}]}),
+    ])
+    mems = await hypnos.periodic_consolidate(store, backend, scope=scope, session_id=sid,
+                                             kg=kg, kg_scope="acme")
+    # memories stay at the identity scope, graph data lands at the tenant scope
+    assert [m.scope for m in mems] == [scope]
+    assert [e.relation for e in await kg.walk("acme", "José", max_depth=1)] == ["OWNS"]
+    assert await kg.walk(scope, "José", max_depth=1) == []
+
+
+async def test_final_prune_honours_kg_scope():
+    """Feedback pruning must hit the scope Tier 2 wrote the edges to."""
+    from cogno_engram.types import GraphEdge
+    store = InMemoryStore()
+    kg = InMemoryGraph()
+    session = await store.create_session("acme/phone-1")
+    await store.save_turn(TurnRecord(session.id, "acme/phone-1", 1, "ok", feedback=-1))
+    await kg.upsert_edge(GraphEdge("acme", "A", "B", "R", source_session=session.id))
+    backend = ScriptedBackend([_mem_json()])
+    await hypnos.consolidate_session(store, backend, session=session, kg=kg, kg_scope="acme")
+    assert await kg.walk("acme", "A", max_depth=1) == []

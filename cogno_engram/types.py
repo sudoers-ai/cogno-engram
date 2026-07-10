@@ -98,6 +98,8 @@ class GraphNode:
     attributes: dict = field(default_factory=dict)
     embedding: Optional[list[float]] = None
     id: Optional[int] = None
+    created_at: Optional[datetime] = None      # set by the adapter, not the caller
+    updated_at: Optional[datetime] = None
 
 
 @dataclass

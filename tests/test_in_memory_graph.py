@@ -76,3 +76,27 @@ async def test_upsert_edge_auto_creates_missing_endpoints():
     assert src is not None and tgt is not None
     assert src.node_type == "CONCEPT" and tgt.node_type == "CONCEPT"
     assert [e.relation for e in await g.walk("s", "Maria", max_depth=1)] == ["OWNS"]
+
+
+async def test_upsert_node_sets_and_bumps_timestamps():
+    from cogno_engram.adapters.in_memory import InMemoryGraph
+    g = InMemoryGraph()
+    await g.upsert_node(GraphNode("s", "Rex", "ANIMAL"))
+    first = await g.find_node("s", "Rex")
+    assert first.created_at is not None and first.updated_at is not None
+    await g.upsert_node(GraphNode("s", "Rex", "ANIMAL", attributes={"k": "v"}))
+    again = await g.find_node("s", "Rex")
+    assert again.created_at == first.created_at
+    assert again.updated_at >= first.updated_at
+
+
+async def test_ingest_entities_stamps_attributes():
+    from cogno_engram.adapters.in_memory import InMemoryGraph
+    from cogno_engram.graph_context import ingest_entities
+    g = InMemoryGraph()
+    n = await ingest_entities(g, "acme", [("Maria", "PERSON"), "troca"],
+                              attributes={"identity_id": "id-7"})
+    assert n == 2
+    maria = await g.find_node("acme", "Maria")
+    assert maria.attributes["identity_id"] == "id-7"
+    assert (await g.find_node("acme", "troca")).attributes["identity_id"] == "id-7"

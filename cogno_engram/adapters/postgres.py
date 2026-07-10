@@ -604,13 +604,15 @@ class PostgresKnowledgeGraph(_PgBase):
         _require_scope(scope)
         async with self._conn() as conn:
             cur = await conn.execute(
-                "SELECT id, scope, label, node_type, attributes FROM knowledge_nodes "
-                "WHERE scope = %s AND label ILIKE %s LIMIT 1", (scope, label))
+                "SELECT id, scope, label, node_type, attributes, created_at, updated_at "
+                "FROM knowledge_nodes WHERE scope = %s AND label ILIKE %s LIMIT 1",
+                (scope, label))
             row = await cur.fetchone()
         if not row:
             return None
         return GraphNode(scope=row["scope"], label=row["label"], node_type=row["node_type"],
-                         attributes=row["attributes"], id=row["id"])
+                         attributes=row["attributes"], id=row["id"],
+                         created_at=row["created_at"], updated_at=row["updated_at"])
 
     async def find_nodes_by_embedding(self, scope: str, embedding: list[float],
                                       *, limit: int = 5) -> list[GraphNode]:
@@ -683,7 +685,8 @@ class PostgresKnowledgeGraph(_PgBase):
     async def list_nodes(self, scope: str, *, node_type: Optional[str] = None,
                          limit: int = 100) -> list[GraphNode]:
         _require_scope(scope)
-        sql = "SELECT id, scope, label, node_type, attributes FROM knowledge_nodes WHERE scope = %s"
+        sql = ("SELECT id, scope, label, node_type, attributes, created_at, updated_at "
+               "FROM knowledge_nodes WHERE scope = %s")
         params: list = [scope]
         if node_type is not None:
             sql += " AND node_type = %s"
@@ -694,7 +697,9 @@ class PostgresKnowledgeGraph(_PgBase):
             cur = await conn.execute(sql, params)
             rows = await cur.fetchall()
         return [GraphNode(scope=r["scope"], label=r["label"], node_type=r["node_type"],
-                          attributes=r["attributes"], id=r["id"]) for r in rows]
+                          attributes=r["attributes"], id=r["id"],
+                          created_at=r["created_at"], updated_at=r["updated_at"])
+                for r in rows]
 
     async def delete_node(self, scope: str, label: str) -> bool:
         _require_scope(scope)

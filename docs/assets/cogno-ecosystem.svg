@@ -194,6 +194,11 @@
   <text x="824" y="719" class="t1" font-size="13" fill="var(--util-t)">cogno-aegis</text>
   <text x="824" y="736" class="t3" fill="var(--util-t)">encryption at rest · HMAC · input guard</text>
 
+  <!-- cogno-observability (operator monitoring — watches the whole host) -->
+  <rect x="380" y="756" width="658" height="50" rx="8" fill="var(--util-f)" stroke="var(--util-s)"/>
+  <text x="392" y="777" class="t1" font-size="13" fill="var(--util-t)">cogno-observability</text>
+  <text x="392" y="795" class="t3" fill="var(--util-t)">SRE/Ops monitoring — per-turn metrics → Prometheus · logs → Loki · one Grafana (operator, not tenant)</text>
+
   <!-- legend -->
   <g class="t3">
     <rect x="60" y="836" width="12" height="12" rx="3" fill="var(--mind-f)" stroke="var(--mind-s)"/>

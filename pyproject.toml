@@ -6,7 +6,8 @@ readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
-authors = [{ name = "Sudoers AI" }]
+authors = [{ name = "Vinicius Vale" }]
+maintainers = [{ name = "Sudoers AI" }]
 keywords = ["llm", "memory", "rag", "knowledge-graph", "pgvector", "redis", "agents", "consolidation"]
 classifiers = [
     "Development Status :: 3 - Alpha",

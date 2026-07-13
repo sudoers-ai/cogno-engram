@@ -25,6 +25,7 @@ from cogno_engram.types import (
     RetrievalQuery,
     Session,
     TurnRecord,
+    TurnTrace,
 )
 
 
@@ -64,6 +65,7 @@ class InMemoryStore:
     def __init__(self) -> None:
         self._sessions: dict[str, Session] = {}
         self._turns: list[TurnRecord] = []
+        self._traces: list[TurnTrace] = []
         self._memories: list[MemoryRecord] = []
         self._locks: dict[str, asyncio.Lock] = {}
 
@@ -148,6 +150,22 @@ class InMemoryStore:
 
     async def turn_count(self, session_id: str) -> int:
         return sum(1 for t in self._turns if t.session_id == session_id)
+
+    # ── turn traces (own table) ──────────────────────────────────────────
+    async def save_turn_trace(self, trace: TurnTrace) -> None:
+        _require_scope(trace.scope)
+        if trace.created_at is None:
+            trace.created_at = _now()
+        # UPSERT by (scope, session_id, turn_n).
+        self._traces = [t for t in self._traces
+                        if not (t.scope == trace.scope and t.session_id == trace.session_id
+                                and t.turn_n == trace.turn_n)]
+        self._traces.append(trace)
+
+    async def traces_for_session(self, session_id: str) -> list[TurnTrace]:
+        traces = [t for t in self._traces if t.session_id == session_id]
+        traces.sort(key=lambda t: t.turn_n)
+        return traces
 
     async def recent_turns(self, scope: str, *, limit: int = 5,
                            exclude_session: str = "") -> list[TurnRecord]:

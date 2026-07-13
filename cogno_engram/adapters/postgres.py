@@ -40,6 +40,7 @@ from cogno_engram.types import (
     RetrievalQuery,
     Session,
     TurnRecord,
+    TurnTrace,
 )
 
 # Default embedding width — nomic-embed-text (the parent's default embedder).
@@ -154,8 +155,22 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
         ) {part}
         """
     )
+    await conn.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS turn_traces (
+            id           bigserial,
+            scope        text NOT NULL,
+            session_id   uuid NOT NULL,
+            turn_n       integer NOT NULL,
+            trace        jsonb NOT NULL DEFAULT '{{}}'::jsonb,
+            created_at   timestamptz NOT NULL DEFAULT now(),
+            {pk},
+            UNIQUE (scope, session_id, turn_n)
+        ) {part}
+        """
+    )
     if partition_by_scope:
-        for tbl in ("turns", "memories"):
+        for tbl in ("turns", "memories", "turn_traces"):
             for k in range(partitions):
                 await conn.execute(
                     f"CREATE TABLE IF NOT EXISTS {tbl}_p{k} PARTITION OF {tbl} "
@@ -197,6 +212,7 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
         "CREATE INDEX IF NOT EXISTS idx_sessions_scope_time ON sessions (scope, started_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_turns_scope_time ON turns (scope, created_at DESC, id DESC)",
         "CREATE INDEX IF NOT EXISTS idx_turns_session ON turns (session_id, turn_n)",
+        "CREATE INDEX IF NOT EXISTS idx_turn_traces_session ON turn_traces (session_id, turn_n)",
         "CREATE INDEX IF NOT EXISTS idx_memories_scope_time ON memories (scope, created_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_memories_tsv ON memories USING gin (tsv)",
         "CREATE INDEX IF NOT EXISTS idx_memories_embedding ON memories "
@@ -369,6 +385,25 @@ class PostgresStore(_PgBase):
                 "SELECT count(*) AS c FROM turns WHERE session_id = %s", (session_id,))
             row = await cur.fetchone()
         return int(row["c"])
+
+    # ── turn traces (own table) ──────────────────────────────────────────
+    async def save_turn_trace(self, trace: "TurnTrace") -> None:
+        _require_scope(trace.scope)
+        async with self._conn() as conn:
+            await conn.execute(
+                "INSERT INTO turn_traces (scope, session_id, turn_n, trace) "
+                "VALUES (%s, %s, %s, %s::jsonb) "
+                "ON CONFLICT (scope, session_id, turn_n) DO UPDATE SET trace = EXCLUDED.trace",
+                (trace.scope, trace.session_id, trace.turn_n, json.dumps(trace.trace)))
+
+    async def traces_for_session(self, session_id: str) -> list["TurnTrace"]:
+        async with self._conn() as conn:
+            cur = await conn.execute(
+                "SELECT scope, session_id, turn_n, trace, created_at "
+                "FROM turn_traces WHERE session_id = %s ORDER BY turn_n ASC", (session_id,))
+            rows = await cur.fetchall()
+        return [TurnTrace(session_id=str(r["session_id"]), scope=r["scope"], turn_n=r["turn_n"],
+                          trace=r["trace"] or {}, created_at=r["created_at"]) for r in rows]
 
     async def recent_turns(self, scope: str, *, limit: int = 5,
                            exclude_session: str = "") -> list[TurnRecord]:

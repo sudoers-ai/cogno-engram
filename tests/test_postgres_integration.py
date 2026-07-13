@@ -61,7 +61,7 @@ async def pg():
     if not await _pg_available():
         pytest.skip("set ENGRAM_TEST_DSN to a reachable Postgres+pgvector to run")
     conn = await _connect()
-    for tbl in ("knowledge_edges", "knowledge_nodes", "memories", "turns", "sessions"):
+    for tbl in ("knowledge_edges", "knowledge_nodes", "turn_traces", "memories", "turns", "sessions"):
         await conn.execute(f"DROP TABLE IF EXISTS {tbl} CASCADE")
     await ensure_schema(conn, embedding_dim=EMB_DIM)
     await conn.close()
@@ -94,6 +94,22 @@ async def test_session_and_turn_roundtrip(store):
     turns = await store.load_turns(s.id)
     assert [t.turn_n for t in turns] == [1, 2]
     assert (await store.get_session(s.id)).scope == scope
+
+
+@pytest.mark.asyncio
+async def test_turn_trace_jsonb_roundtrip_and_upsert(store):
+    from cogno_engram.types import TurnTrace
+    scope = f"t/{uuid4()}"
+    s = await store.create_session(scope)
+    aristo = {"ner": {"aristotelian": {"QUANTITY": {"tag": "45 REAIS", "desc": "amount"}}}}
+    await store.save_turn_trace(TurnTrace(s.id, scope, 1, aristo))
+    got = await store.traces_for_session(s.id)
+    assert len(got) == 1
+    assert got[0].trace["ner"]["aristotelian"]["QUANTITY"]["tag"] == "45 REAIS"   # jsonb → dict
+    # UPSERT replaces, not duplicates
+    await store.save_turn_trace(TurnTrace(s.id, scope, 1, {"ner": {"intent": "SOCIAL"}}))
+    got = await store.traces_for_session(s.id)
+    assert len(got) == 1 and got[0].trace["ner"]["intent"] == "SOCIAL"
 
 
 async def test_admin_turns_subtree_pagination_and_scopes(store):
@@ -359,7 +375,7 @@ async def test_hash_partitioning_roundtrip():
     if not await _pg_available():
         pytest.skip("set ENGRAM_TEST_DSN to run")
     conn = await psycopg.AsyncConnection.connect(DSN, autocommit=True)
-    for tbl in ("knowledge_edges", "knowledge_nodes", "memories", "turns", "sessions"):
+    for tbl in ("knowledge_edges", "knowledge_nodes", "turn_traces", "memories", "turns", "sessions"):
         await conn.execute(f"DROP TABLE IF EXISTS {tbl} CASCADE")
     await ensure_schema(conn, embedding_dim=EMB_DIM, partition_by_scope=True, partitions=4)
     # partitions were created

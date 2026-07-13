@@ -19,6 +19,25 @@ async def test_session_and_turn_roundtrip(store):
     assert (await store.get_session(session.id)).scope == "acme/phone1"
 
 
+@pytest.mark.asyncio
+async def test_turn_trace_roundtrip_and_upsert(store):
+    from cogno_engram.types import TurnTrace
+    sid = "sess-1"
+    await store.save_turn_trace(TurnTrace(sid, "acme/u1", 2,
+        {"ner": {"aristotelian": {"TIME": {"tag": "TOMORROW", "desc": "relative"}}}}))
+    await store.save_turn_trace(TurnTrace(sid, "acme/u1", 1, {"ner": {"intent": "SOCIAL"}}))
+    traces = await store.traces_for_session(sid)
+    assert [t.turn_n for t in traces] == [1, 2]                       # ordered by turn_n
+    assert traces[1].trace["ner"]["aristotelian"]["TIME"]["tag"] == "TOMORROW"
+    # UPSERT: re-saving the same (scope, session, turn_n) replaces, not duplicates
+    await store.save_turn_trace(TurnTrace(sid, "acme/u1", 1, {"ner": {"intent": "ACTION_REQUEST"}}))
+    traces = await store.traces_for_session(sid)
+    assert len(traces) == 2 and traces[0].trace["ner"]["intent"] == "ACTION_REQUEST"
+    # blank scope rejected (engram invariant)
+    with pytest.raises(ValueError):
+        await store.save_turn_trace(TurnTrace(sid, "", 3, {}))
+
+
 async def test_admin_turns_and_scopes_span_a_scope_subtree(store):
     # admin reads span a scope SUBTREE (a tenant's whole history: tenant_id/identity)
     await store.save_turn(TurnRecord("s1", "acme/u1", 0, "a"))

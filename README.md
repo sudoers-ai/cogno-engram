@@ -12,7 +12,7 @@ A single abstraction over relational + key-value + graph collapses to a lowest-c
 
 | Port | Shape | Reference adapter |
 | --- | --- | --- |
-| `MemoryStore` | sessions / turns / memories + hybrid retrieval | Postgres + pgvector |
+| `MemoryStore` | sessions / turns / memories + hybrid retrieval + per-turn traces | Postgres + pgvector |
 | `ConversationBuffer` | sliding short-term window (+ TTL) | Redis |
 | `KnowledgeGraph` | typed nodes + directed edges + multi-hop walk | Postgres (recursive CTE) |
 
@@ -55,7 +55,9 @@ The Tier-2/3 consolidation drives an LLM through a `cogno-anima` `LLMBackend` (h
 
 ## Postgres + pgvector adapter
 
-The reference adapter implements `MemoryStore` (hybrid retrieval = `0.60·vector + 0.40·BM25 + 0.05·feedback`) and `KnowledgeGraph` (recursive-CTE multi-hop walk) over one database. Call `ensure_schema` once for the idempotent DDL (tables + indexes; no alembic required):
+The reference adapter implements `MemoryStore` (hybrid retrieval = `0.60·vector + 0.40·BM25 + 0.05·feedback`) and `KnowledgeGraph` (recursive-CTE multi-hop walk) over one database. Call `ensure_schema` once for the idempotent DDL (tables + indexes; no alembic required — re-running it additively creates any new table via `CREATE TABLE IF NOT EXISTS`):
+
+The high-volume tables (`turns`, `memories`, `turn_traces`) opt into `HASH(scope)` partitioning. `turn_traces` is a dedicated table holding one **opaque JSONB** trace per turn (`save_turn_trace` / `traces_for_session`) — the host composes it (e.g. the pipeline's NER/EGO signals for an audit view); engram never interprets it.
 
 ```python
 import psycopg

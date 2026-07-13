@@ -33,6 +33,7 @@ from cogno_engram.types import (
     RetrievalQuery,
     Session,
     TurnRecord,
+    TurnTrace,
 )
 
 
@@ -69,6 +70,12 @@ class MemoryStore(Protocol):
     async def set_feedback(self, scope: str, session_id: str, turn_n: int,
                            feedback: int) -> None: ...
     async def turn_count(self, session_id: str) -> int: ...
+
+    # ── turn traces (own table) ──────────────────────────────────────────
+    # The per-turn pipeline trace (audit/inspector). Kept OUT of the flat ``turns`` row:
+    # variable-shape, debug-oriented, opt-in. UPSERT by (scope, session_id, turn_n).
+    async def save_turn_trace(self, trace: TurnTrace) -> None: ...
+    async def traces_for_session(self, session_id: str) -> list[TurnTrace]: ...
     # Admin / cross-scope reads: all turns at or under a scope SUBTREE (``scope_prefix`` itself or
     # any ``scope_prefix + "/" + …`` descendant), newest-first + a total for pagination. This is
     # the one place a query spans scopes — e.g. a tenant's whole chat history, where the host's

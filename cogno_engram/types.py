@@ -78,6 +78,20 @@ class TurnRecord:
 
 
 @dataclass
+class TurnTrace:
+    """Per-turn pipeline trace, persisted in its OWN table (``turn_traces``), keyed to a
+    turn by ``(scope, session_id, turn_n)``. ``trace`` is an opaque dict the host composes
+    (e.g. cogno-host's ``build_turn_trace``: the NOUMENO/NER/ID/EGO/Drift signals + the
+    Aristotelian decomposition) — engram never interprets it. Feeds the audit/inspector
+    views without bloating the flat ``turns`` record."""
+    session_id: str
+    scope: str
+    turn_n: int
+    trace: dict = field(default_factory=dict)
+    created_at: Optional[datetime] = None
+
+
+@dataclass
 class MemoryRecord:
     scope: str
     category: str

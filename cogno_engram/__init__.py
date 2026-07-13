@@ -22,6 +22,7 @@ from cogno_engram.types import (
     Session,
     SessionSummary,
     TurnRecord,
+    TurnTrace,
 )
 
 __version__ = "0.1.0"
@@ -31,7 +32,7 @@ __all__ = [
     # ports
     "MemoryStore", "SupportsVectorSearch", "ConversationBuffer", "KnowledgeGraph",
     # types
-    "Session", "TurnRecord", "MemoryRecord", "GraphNode", "GraphEdge", "NodeContext",
+    "Session", "TurnRecord", "TurnTrace", "MemoryRecord", "GraphNode", "GraphEdge", "NodeContext",
     "RetrievalQuery", "HybridWeights", "SessionSummary",
     "DEFAULT_CONFIDENCE", "VALID_NODE_TYPES",
     # reference adapters

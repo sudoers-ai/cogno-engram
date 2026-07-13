@@ -117,6 +117,34 @@ async def test_periodic_extracts_relations_into_graph():
     assert edges[0].source_session == sid     # tagged for later pruning
 
 
+async def test_periodic_edge_filter_vetoes_relations():
+    # The caller (host) owns the domain judgement of what belongs in the durable graph. Here
+    # the filter drops a volatile relation while keeping a durable one.
+    store = InMemoryStore()
+    kg = InMemoryGraph()
+    scope, sid = "acme/p", "s1"
+    await _seed(store, scope, sid, [TurnRecord(sid, scope, 1, "José marcou com o Rex dia 10")])
+    backend = ScriptedBackend([
+        _mem_json(fact=["x"]),
+        json.dumps({"nodes": [{"label": "José", "type": "PERSON"}],
+                    "edges": [{"source": "José", "target": "Rex", "relation": "HAS_APPOINTMENT"},
+                              {"source": "José", "target": "Clinic", "relation": "WORKS_AT"}]}),
+    ])
+    dropped: list[tuple] = []
+
+    def _keep_durable(s: str, t: str, r: str) -> bool:
+        ok = "APPOINTMENT" not in r.upper()
+        if not ok:
+            dropped.append((s, t, r))
+        return ok
+
+    await hypnos.periodic_consolidate(store, backend, scope=scope, session_id=sid, kg=kg,
+                                      edge_filter=_keep_durable)
+    edges = await kg.walk(scope, "José", max_depth=1)
+    assert [e.relation for e in edges] == ["WORKS_AT"]          # volatile edge never persisted
+    assert dropped == [("José", "Rex", "HAS_APPOINTMENT")]      # filter saw + vetoed it
+
+
 async def test_periodic_empty_session_returns_empty():
     store = InMemoryStore()
     backend = ScriptedBackend([_mem_json(fact=["x"])])

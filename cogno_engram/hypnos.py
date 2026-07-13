@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from cogno_engram.ports import KnowledgeGraph, MemoryStore
 from cogno_engram.types import (
@@ -198,8 +198,13 @@ async def _embed_and_save(store: MemoryStore, mems: list[MemoryRecord], embedder
 
 async def _extract_relations(kg: KnowledgeGraph, backend: Any, *, scope: str, session_id: str,
                              turns: list[TurnRecord], embedder: Any,
-                             system: str, prompt: str) -> int:
-    """LLM relation extraction → upsert nodes + edges (source_session tagged)."""
+                             system: str, prompt: str,
+                             edge_filter: Optional[Callable[[str, str, str], bool]] = None) -> int:
+    """LLM relation extraction → upsert nodes + edges (source_session tagged).
+
+    ``edge_filter(source, target, relation) -> bool`` (optional) vetoes edges before upsert
+    — the caller decides which relations are worth persisting (e.g. a host dropping volatile
+    domain state that belongs to a live read, not the durable graph). Default keeps all."""
     text = await _generate(backend, system, prompt.format(transcript=_transcript(turns)))
     try:
         data = json.loads(_strip_fence(text))
@@ -224,12 +229,14 @@ async def _extract_relations(kg: KnowledgeGraph, backend: Any, *, scope: str, se
     for edge in data.get("edges", []) or []:
         if not isinstance(edge, dict) or not (edge.get("source") and edge.get("target") and edge.get("relation")):
             continue
+        src, tgt, rel = str(edge["source"]), str(edge["target"]), str(edge["relation"])
+        if edge_filter is not None and not edge_filter(src, tgt, rel):
+            continue                          # caller vetoed (e.g. volatile domain state)
         try:
             conf = float(edge.get("confidence", 1.0))
         except (TypeError, ValueError):
             conf = 1.0
-        await kg.upsert_edge(GraphEdge(scope, str(edge["source"]), str(edge["target"]),
-                                       str(edge["relation"]), conf, source_session=session_id))
+        await kg.upsert_edge(GraphEdge(scope, src, tgt, rel, conf, source_session=session_id))
         edges += 1
     return edges
 
@@ -252,6 +259,7 @@ async def periodic_consolidate(
     confidence: float = DEFAULT_CONFIDENCE["llm"],
     relation_system: str = DEFAULT_RELATION_SYSTEM,
     relation_prompt: str = DEFAULT_RELATION_PROMPT,
+    edge_filter: Optional[Callable[[str, str, str], bool]] = None,
 ) -> list[MemoryRecord]:
     """Tier 2 — periodic LLM extraction over the last ``batch_n`` (non-disliked) turns.
 
@@ -260,6 +268,10 @@ async def periodic_consolidate(
     The graph is often shared at a BROADER scope than the memories (e.g. the host
     keeps memories per identity but the knowledge graph per tenant) — pass
     ``kg_scope`` to aim the graph writes there; default is ``scope``.
+
+    ``edge_filter(source, target, relation) -> bool`` (optional) vetoes relations before they
+    are persisted — the caller owns the domain judgement of what belongs in the durable graph
+    (e.g. dropping volatile state like an appointment/status that a live tool read should own).
     """
     turns = [t for t in await store.load_turns(session_id) if t.feedback != -1][-batch_n:]
     if not turns:
@@ -270,7 +282,8 @@ async def periodic_consolidate(
     if extract_relations and kg is not None:
         await _extract_relations(kg, backend, scope=kg_scope or scope, session_id=session_id,
                                  turns=turns, embedder=embedder,
-                                 system=relation_system, prompt=relation_prompt)
+                                 system=relation_system, prompt=relation_prompt,
+                                 edge_filter=edge_filter)
     logger.info("stage=hypnos tier=2 event=periodic_done turns=%d extracted=%d",
                 len(turns), len(mems))
     return mems

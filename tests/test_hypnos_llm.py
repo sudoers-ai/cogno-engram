@@ -166,6 +166,37 @@ async def test_final_writes_summary_and_closes_session():
     assert reloaded.ended_at is not None and reloaded.summary == result.summary
 
 
+async def test_final_narrative_summary_wins_over_stats_line():
+    # The Tier-3 JSON's "summary" string becomes the session summary (the EARLIER CONTEXT
+    # a host injects next session); it must NOT leak into memories as a "summary" category.
+    store = InMemoryStore()
+    session = await store.create_session("acme/p")
+    await store.save_turn(TurnRecord(session.id, "acme/p", 1, "oi", domains=["FINANCE"]))
+    backend = ScriptedBackend([_mem_json(summary="Discussed travel savings; pix preference "
+                                                 "noted; booking left open.",
+                                         fact=["mora em SP"])])
+    result = await hypnos.consolidate_session(store, backend, session=session)
+    assert result.summary.startswith("Discussed travel savings")
+    assert {m.category for m in result.memories} == {"fact"}
+    assert (await store.get_session(session.id)).summary == result.summary
+
+
+async def test_final_falls_back_to_stats_line_without_narrative():
+    store = InMemoryStore()
+    session = await store.create_session("acme/p")
+    await store.save_turn(TurnRecord(session.id, "acme/p", 1, "oi", domains=["FINANCE"]))
+    backend = ScriptedBackend(["not json at all"])
+    result = await hypnos.consolidate_session(store, backend, session=session)
+    assert "Domains: FINANCE" in result.summary
+
+
+def test_parse_narrative_tolerant():
+    assert hypnos._parse_narrative("garbage") == ""
+    assert hypnos._parse_narrative(json.dumps({"summary": 42})) == ""
+    assert hypnos._parse_narrative(json.dumps(["list"])) == ""
+    assert hypnos._parse_narrative('```json\n{"summary": " ok "}\n```') == "ok"
+
+
 async def test_final_prunes_graph_on_disliked_turns():
     store = InMemoryStore()
     kg = InMemoryGraph()

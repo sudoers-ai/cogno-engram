@@ -73,11 +73,15 @@ transcript, extract durable structured memories about the user.
 
 Return ONLY a JSON object (use empty lists if nothing found):
 {
+  "summary": "2-3 sentence recap: what was discussed, what was resolved, what was left open",
   "preference": ["..."],
   "fact": ["name, location, profession, relationships..."],
   "goal": ["things the user wanted but did not finish"],
   "behavior": ["how they communicate"]
 }
+
+Rules for "summary": topics and outcomes only — NO exact dates, times, amounts or \
+identifiers (those must come from live data, never from a recap).
 
 Respond with the JSON object only."""
 
@@ -177,6 +181,19 @@ def _parse_memories(text: str, scope: str, confidence: float) -> list[MemoryReco
             if isinstance(item, str) and item.strip():
                 out.append(MemoryRecord(scope, str(category), item.strip(), confidence))
     return out
+
+
+def _parse_narrative(text: str) -> str:
+    """The optional ``"summary"`` string from the Tier-3 JSON (narrative session recap).
+
+    Tolerant like ``_parse_memories``: malformed JSON or a missing/non-string key
+    yields ``""`` (callers fall back to the stats line)."""
+    try:
+        data = json.loads(_strip_fence(text))
+    except (json.JSONDecodeError, ValueError):
+        return ""
+    summary = data.get("summary") if isinstance(data, dict) else None
+    return summary.strip() if isinstance(summary, str) else ""
 
 
 def _transcript(turns: list[TurnRecord]) -> str:
@@ -318,15 +335,19 @@ async def consolidate_session(
     disliked = len(turns) - len(active)
 
     mems: list[MemoryRecord] = []
+    narrative = ""
     if active:
         text = await _generate(backend, system,
                                prompt.format(turn_count=len(active), transcript=_transcript(active)))
         mems = _parse_memories(text, session.scope, confidence)
+        narrative = _parse_narrative(text)
         await _embed_and_save(store, mems, embedder)
 
+    # The narrative recap (same LLM call) is what a host can inject as EARLIER CONTEXT on the
+    # next session; the stats line is the fallback when the model omitted/garbled it.
     domains = sorted({d for t in active for d in t.domains})
-    summary = (f"Session with {len(turns)} turns. "
-               f"Domains: {', '.join(domains) or 'general'}. Memories: {len(mems)}.")
+    summary = narrative or (f"Session with {len(turns)} turns. "
+                            f"Domains: {', '.join(domains) or 'general'}. Memories: {len(mems)}.")
 
     if disliked and kg is not None:
         await kg.delete_edges_by_session(kg_scope or session.scope, session.id)

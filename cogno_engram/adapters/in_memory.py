@@ -272,6 +272,20 @@ class InMemoryStore:
         self._memories = [m for m in self._memories if keep(m)]
         return before - len(self._memories)
 
+    async def purge_scope(self, scope: str) -> int:
+        _require_scope(scope)
+        total = 0
+        sids = [sid for sid, s in self._sessions.items() if s.scope == scope]
+        total += len(sids)
+        for sid in sids:
+            del self._sessions[sid]
+        for coll_attr in ("_turns", "_traces", "_memories"):
+            coll = getattr(self, coll_attr)
+            before = len(coll)
+            setattr(self, coll_attr, [r for r in coll if r.scope != scope])
+            total += before - len(getattr(self, coll_attr))
+        return total
+
     # ── concurrency ──────────────────────────────────────────────────────
     def session_lock(self, scope: str, session_id: str):
         _require_scope(scope)
@@ -436,3 +450,11 @@ class InMemoryGraph:
         self._edges = [e for e in self._edges
                        if not (e.scope == scope and e.source_session == session_id)]
         return before - len(self._edges)
+
+    async def purge_scope(self, scope: str) -> int:
+        _require_scope(scope)
+        before_edges = len(self._edges)
+        self._edges = [e for e in self._edges if e.scope != scope]
+        before_nodes = len(self._nodes)
+        self._nodes = {k: n for k, n in self._nodes.items() if k[0] != scope}
+        return (before_edges - len(self._edges)) + (before_nodes - len(self._nodes))

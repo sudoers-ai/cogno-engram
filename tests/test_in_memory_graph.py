@@ -100,3 +100,22 @@ async def test_ingest_entities_stamps_attributes():
     maria = await g.find_node("acme", "Maria")
     assert maria.attributes["identity_id"] == "id-7"
     assert (await g.find_node("acme", "troca")).attributes["identity_id"] == "id-7"
+
+
+async def test_purge_scope_drops_nodes_and_edges_isolated(graph):
+    await _build_jose_rex(graph)                            # scope "s": 3 nodes, 2 edges
+    await graph.upsert_node(GraphNode("other", "Maria", "PERSON"))
+    await graph.upsert_edge(GraphEdge("other", "Maria", "Rex", "OWNS"))
+
+    removed = await graph.purge_scope("s")
+    assert removed == 5                                     # 3 nodes + 2 edges
+
+    assert await graph.find_node("s", "José") is None
+    assert await graph.list_nodes("s") == []
+    # neighbour scope intact
+    assert await graph.find_node("other", "Maria") is not None
+
+
+async def test_purge_scope_graph_rejects_blank_scope(graph):
+    with pytest.raises(ValueError):
+        await graph.purge_scope("")

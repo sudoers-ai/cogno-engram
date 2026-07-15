@@ -571,6 +571,17 @@ class PostgresStore(_PgBase):
             cur = await conn.execute(sql, params)
             return cur.rowcount
 
+    async def purge_scope(self, scope: str) -> int:
+        _require_scope(scope)
+        total = 0
+        async with self._conn() as conn:
+            # turn_traces + turns + sessions + memories all carry the scope column; drop them all.
+            for table in ("turn_traces", "turns", "sessions", "memories"):
+                cur = await conn.execute(
+                    f"DELETE FROM {table} WHERE scope = %s", (scope,))
+                total += cur.rowcount
+        return total
+
     # ── concurrency: pg_advisory_lock keyed on the session id ────────────
     @asynccontextmanager
     async def session_lock(self, scope: str, session_id: str) -> AsyncIterator[None]:
@@ -750,3 +761,15 @@ class PostgresKnowledgeGraph(_PgBase):
                 "DELETE FROM knowledge_edges WHERE scope = %s AND source_session = %s",
                 (scope, session_id))
             return cur.rowcount
+
+    async def purge_scope(self, scope: str) -> int:
+        _require_scope(scope)
+        total = 0
+        async with self._conn() as conn:
+            # Drop edges first (deleting nodes would cascade them, but the explicit delete gives an
+            # accurate count and covers any edge whose node was already gone).
+            for table in ("knowledge_edges", "knowledge_nodes"):
+                cur = await conn.execute(
+                    f"DELETE FROM {table} WHERE scope = %s", (scope,))
+                total += cur.rowcount
+        return total

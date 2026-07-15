@@ -181,3 +181,30 @@ async def test_session_lock_serializes(store):
 def test_supports_vector_capability(store):
     from cogno_engram.ports import SupportsVectorSearch
     assert isinstance(store, SupportsVectorSearch) and store.supports_vector() is True
+
+
+async def test_purge_scope_removes_all_scope_data_and_isolates(store):
+    from cogno_engram.types import TurnTrace
+    keep_scope, drop_scope = "acme/keep", "acme/drop"
+    # populate BOTH scopes across sessions/turns/traces/memories
+    for sc in (keep_scope, drop_scope):
+        sess = await store.create_session(sc)
+        await store.save_turn(TurnRecord(sess.id, sc, 1, "hi"))
+        await store.save_turn_trace(TurnTrace(sess.id, sc, 1, {"ner": {"intent": "SOCIAL"}}))
+        await store.save_memory(MemoryRecord(scope=sc, category="fact", content="x"))
+
+    removed = await store.purge_scope(drop_scope)
+    assert removed == 4                                    # session + turn + trace + memory
+
+    # the purged scope is empty on every surface …
+    assert await store.memory_count(drop_scope) == 0
+    assert await store.recent_turns(drop_scope) == []
+    assert await store.recent_sessions(drop_scope) == []
+    # … and the neighbour scope is untouched
+    assert await store.memory_count(keep_scope) == 1
+    assert len(await store.recent_sessions(keep_scope)) == 1
+
+
+async def test_purge_scope_rejects_blank_scope(store):
+    with pytest.raises(ValueError):
+        await store.purge_scope("")

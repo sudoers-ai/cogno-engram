@@ -132,6 +132,12 @@ class InMemoryStore:
     # ── turns ────────────────────────────────────────────────────────────
     async def save_turn(self, turn: TurnRecord) -> None:
         _require_scope(turn.scope)
+        # Match the Postgres adapter's ON CONFLICT (scope, session_id, turn_n) DO NOTHING: a
+        # retried/idempotent re-save of the same turn coordinate is a no-op, not a duplicate row
+        # (the in-memory adapter otherwise diverged, double-counting turns in local/test runs).
+        if any(t.scope == turn.scope and t.session_id == turn.session_id
+               and t.turn_n == turn.turn_n for t in self._turns):
+            return
         if turn.created_at is None:
             turn.created_at = _now()
         self._turns.append(turn)

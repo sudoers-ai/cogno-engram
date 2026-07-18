@@ -632,8 +632,19 @@ class PostgresKnowledgeGraph(_PgBase):
         row = await cur.fetchone()
         if row:
             return row["id"]
+        # Idempotent insert: two concurrent upsert_edge calls referencing a not-yet-existing
+        # label both miss the SELECT above; a bare INSERT then races the uq(scope, lower(label),
+        # node_type) index and the loser raises IntegrityError, failing that turn. ON CONFLICT
+        # DO NOTHING makes the loser return no row → re-SELECT the winner's id.
         cur = await conn.execute(
-            "INSERT INTO knowledge_nodes (scope, label) VALUES (%s, %s) RETURNING id",
+            "INSERT INTO knowledge_nodes (scope, label) VALUES (%s, %s) "
+            "ON CONFLICT (scope, lower(label), node_type) DO NOTHING RETURNING id",
+            (scope, label))
+        row = await cur.fetchone()
+        if row:
+            return row["id"]
+        cur = await conn.execute(
+            "SELECT id FROM knowledge_nodes WHERE scope = %s AND lower(label) = lower(%s) LIMIT 1",
             (scope, label))
         row = await cur.fetchone()
         return row["id"]

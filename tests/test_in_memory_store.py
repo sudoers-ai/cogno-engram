@@ -19,6 +19,17 @@ async def test_session_and_turn_roundtrip(store):
     assert (await store.get_session(session.id)).scope == "acme/phone1"
 
 
+async def test_save_turn_dedups_same_coordinate(store):
+    # Match the Postgres ON CONFLICT (scope, session_id, turn_n) DO NOTHING: a re-saved turn
+    # coordinate is a no-op, not a duplicate row (was a divergence — in-memory double-counted).
+    session = await store.create_session("acme/phone1")
+    await store.save_turn(TurnRecord(session.id, "acme/phone1", 1, "first"))
+    await store.save_turn(TurnRecord(session.id, "acme/phone1", 1, "first-again"))   # dup coord
+    turns = await store.load_turns(session.id)
+    assert [t.turn_n for t in turns] == [1]              # one row, not two
+    assert turns[0].user_input == "first"               # first write wins (DO NOTHING)
+
+
 @pytest.mark.asyncio
 async def test_turn_trace_roundtrip_and_upsert(store):
     from cogno_engram.types import TurnTrace

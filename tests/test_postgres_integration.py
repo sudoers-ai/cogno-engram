@@ -259,6 +259,31 @@ async def test_node_upsert_and_find(graph):
     assert node is not None and node.attributes == {"age": 40}
 
 
+async def test_node_label_matched_literally_not_as_like_pattern(graph):
+    # Node labels with SQL wildcard chars (_ and %) must match LITERALLY (exact, case-insensitive),
+    # like the in-memory adapter — not as ILIKE patterns, or find/delete would hit the wrong nodes.
+    scope = f"t/{uuid4()}"
+    await graph.upsert_node(GraphNode(scope, "conta_corrente", "CONCEPT"))
+    await graph.upsert_node(GraphNode(scope, "contaXcorrente", "CONCEPT"))   # matches _ as wildcard
+    await graph.upsert_node(GraphNode(scope, "100%", "CONCEPT"))
+    await graph.upsert_node(GraphNode(scope, "100pct", "CONCEPT"))
+
+    found = await graph.find_node(scope, "conta_corrente")
+    assert found is not None and found.label == "conta_corrente"            # not contaXcorrente
+    # delete by a %-bearing label must remove ONLY that node, never everything matching "100%"
+    assert await graph.delete_node(scope, "100%") is True
+    assert await graph.find_node(scope, "100pct") is not None               # survived
+
+
+async def test_walk_terminates_on_a_cycle(graph):
+    # A cyclic subgraph must not re-expand nodes (path guard) — bounded, terminating result.
+    scope = f"t/{uuid4()}"
+    for a, b in (("A", "B"), ("B", "C"), ("C", "A")):
+        await graph.upsert_edge(GraphEdge(scope, a, b, "LINK"))
+    edges = await graph.walk(scope, "A", max_depth=5)
+    assert {e.relation for e in edges} == {"LINK"} and len(edges) == 3      # each edge once
+
+
 async def test_multi_hop_walk(graph):
     scope = f"t/{uuid4()}"
     await _build_jose_rex(graph, scope)

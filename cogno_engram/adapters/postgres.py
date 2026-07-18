@@ -245,8 +245,14 @@ class _PgBase:
         # static psycopg row type (tuple) doesn't reflect.
         if self._pool is not None:
             async with self._pool.connection() as conn:
+                prev = conn.row_factory
                 conn.row_factory = dict_row
-                yield conn
+                try:
+                    yield conn
+                finally:
+                    # restore the pooled connection's factory so a later borrower that expects
+                    # tuple rows isn't handed dicts (a shared-pool consumer must not inherit this).
+                    conn.row_factory = prev
         else:
             assert self._dsn is not None  # __init__ guarantees dsn when pool is None
             conn = await psycopg.AsyncConnection.connect(
@@ -621,7 +627,7 @@ class PostgresKnowledgeGraph(_PgBase):
 
     async def _resolve_node_id(self, conn, scope: str, label: str) -> int:
         cur = await conn.execute(
-            "SELECT id FROM knowledge_nodes WHERE scope = %s AND label ILIKE %s LIMIT 1",
+            "SELECT id FROM knowledge_nodes WHERE scope = %s AND lower(label) = lower(%s) LIMIT 1",
             (scope, label))
         row = await cur.fetchone()
         if row:
@@ -651,7 +657,7 @@ class PostgresKnowledgeGraph(_PgBase):
         async with self._conn() as conn:
             cur = await conn.execute(
                 "SELECT id, scope, label, node_type, attributes, created_at, updated_at "
-                "FROM knowledge_nodes WHERE scope = %s AND label ILIKE %s LIMIT 1",
+                "FROM knowledge_nodes WHERE scope = %s AND lower(label) = lower(%s) LIMIT 1",
                 (scope, label))
             row = await cur.fetchone()
         if not row:
@@ -680,16 +686,24 @@ class PostgresKnowledgeGraph(_PgBase):
             cur = await conn.execute(
                 """
                 WITH RECURSIVE walk AS (
-                    SELECT n.id AS node_id, 0 AS depth, NULL::bigint AS edge_id
+                    SELECT n.id AS node_id, 0 AS depth, NULL::bigint AS edge_id,
+                           ARRAY[n.id] AS path
                     FROM knowledge_nodes n
-                    WHERE n.scope = %s AND n.label ILIKE %s
+                    WHERE n.scope = %s AND lower(n.label) = lower(%s)
                     UNION ALL
-                    SELECT CASE WHEN e.source_id = w.node_id THEN e.target_id ELSE e.source_id END,
-                           w.depth + 1, e.id
+                    -- carry the visited-node path so a cyclic subgraph expands each node ONCE
+                    -- (mirrors the in-memory walk's ``visited`` set); without this a cycle
+                    -- re-expands every node per path → exponential intermediate rows.
+                    SELECT nxt.node_id, w.depth + 1, nxt.edge_id, w.path || nxt.node_id
                     FROM walk w
-                    JOIN knowledge_edges e
-                      ON (e.source_id = w.node_id OR e.target_id = w.node_id) AND e.scope = %s
-                    WHERE w.depth < %s
+                    JOIN LATERAL (
+                        SELECT (CASE WHEN e.source_id = w.node_id THEN e.target_id
+                                     ELSE e.source_id END) AS node_id, e.id AS edge_id
+                        FROM knowledge_edges e
+                        WHERE (e.source_id = w.node_id OR e.target_id = w.node_id)
+                          AND e.scope = %s
+                    ) nxt ON true
+                    WHERE w.depth < %s AND NOT (nxt.node_id = ANY(w.path))
                 )
                 SELECT DISTINCT e.id, sn.label AS source, tn.label AS target,
                        e.relation, e.confidence, e.source_session
@@ -713,7 +727,7 @@ class PostgresKnowledgeGraph(_PgBase):
                    JOIN knowledge_edges e ON (e.source_id = n.id OR e.target_id = n.id)
                    JOIN knowledge_nodes nn
                      ON nn.id = CASE WHEN e.source_id = n.id THEN e.target_id ELSE e.source_id END
-                   WHERE n.scope = %s AND n.label ILIKE %s""", (scope, label))
+                   WHERE n.scope = %s AND lower(n.label) = lower(%s)""", (scope, label))
             rows = await cur.fetchall()
         return [GraphNode(scope=r["scope"], label=r["label"], node_type=r["node_type"],
                           attributes=r["attributes"], id=r["id"]) for r in rows]
@@ -751,7 +765,7 @@ class PostgresKnowledgeGraph(_PgBase):
         _require_scope(scope)
         async with self._conn() as conn:
             cur = await conn.execute(
-                "DELETE FROM knowledge_nodes WHERE scope = %s AND label ILIKE %s", (scope, label))
+                "DELETE FROM knowledge_nodes WHERE scope = %s AND lower(label) = lower(%s)", (scope, label))
             return cur.rowcount > 0   # edges cascade via FK ON DELETE CASCADE
 
     async def delete_edges_by_session(self, scope: str, session_id: str) -> int:

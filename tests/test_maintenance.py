@@ -66,3 +66,67 @@ async def test_prune_orphan_nodes(graph):
     assert n == 1
     assert await graph.find_node("s", "Orphan") is None
     assert await graph.find_node("s", "Connected") is not None
+
+
+# ── batch preference + knowledge-node re-embedding ────────────────────────
+
+class _BatchEmbedder(_Embedder):
+    """Records which path the caller took. Re-embedding is bulk by definition, so a
+    batch-capable embedder must not be driven one item at a time."""
+
+    def __init__(self):
+        self.batch_calls = 0
+        self.single_calls = 0
+
+    async def embed(self, text):
+        self.single_calls += 1
+        return await super().embed(text)
+
+    async def embed_batch(self, texts):
+        self.batch_calls += 1
+        return [[float(len(t)), 1.0] for t in texts]
+
+
+async def test_reembed_memories_uses_the_batch_path(store):
+    for c in ("alpha", "beta", "gamma"):
+        await store.save_memory(MemoryRecord("s", "fact", c))
+    emb = _BatchEmbedder()
+    assert await maintenance.reembed_memories(store, emb, "s") == 3
+    assert emb.batch_calls == 1 and emb.single_calls == 0     # one request, not three
+
+
+async def test_reembed_memories_falls_back_without_batch(store):
+    """The Embedder protocol does not require embed_batch — degrade, never crash."""
+    await store.save_memory(MemoryRecord("s", "fact", "solo"))
+    assert await maintenance.reembed_memories(store, _Embedder(), "s") == 1
+
+
+async def test_reembed_knowledge_nodes(graph):
+    await graph.upsert_node(GraphNode("s", "Ada Lovelace", "PERSON"))
+    await graph.upsert_node(GraphNode("s", "analytical engine", "CONCEPT"))
+    emb = _BatchEmbedder()
+    assert await maintenance.reembed_knowledge_nodes(graph, emb, "s") == 2
+    assert emb.batch_calls == 1
+    for node in await graph.list_nodes("s"):
+        assert node.embedding is not None
+
+
+async def test_reembed_knowledge_nodes_is_idempotent(graph):
+    """Keyed on (scope, label), so a second pass updates in place rather than duplicating."""
+    await graph.upsert_node(GraphNode("s", "Ada Lovelace", "PERSON"))
+    await maintenance.reembed_knowledge_nodes(graph, _Embedder(), "s")
+    await maintenance.reembed_knowledge_nodes(graph, _Embedder(), "s")
+    assert len(await graph.list_nodes("s")) == 1
+
+
+async def test_reembed_knowledge_nodes_scope_isolation(graph):
+    await graph.upsert_node(GraphNode("s", "mine", "CONCEPT"))
+    await graph.upsert_node(GraphNode("other", "theirs", "CONCEPT"))
+    assert await maintenance.reembed_knowledge_nodes(graph, _Embedder(), "s") == 1
+    [untouched] = await graph.list_nodes("other")
+    assert untouched.embedding is None                        # a switch never crosses scopes
+
+
+async def test_reembed_empty_scope_is_a_noop(store, graph):
+    assert await maintenance.reembed_memories(store, _Embedder(), "empty") == 0
+    assert await maintenance.reembed_knowledge_nodes(graph, _Embedder(), "empty") == 0

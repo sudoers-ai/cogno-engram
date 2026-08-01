@@ -58,14 +58,61 @@ async def reembed_memories(
     memory upserts on ``(scope, category, content)`` and updates the embedding.
     """
     mems = await store.load_memories(scope, query=RetrievalQuery(), limit=batch)
+    if not mems:
+        return 0
+    vectors = await _embed_all(embedder, [m.content for m in mems])
     count = 0
-    for m in mems:
-        vec = await embedder.embed(m.content)
+    for m, vec in zip(mems, vectors):
         await store.save_memory(MemoryRecord(scope, m.category, m.content,
                                              confidence=m.confidence, embedding=vec or None))
         count += 1
     logger.info("stage=maintenance event=reembed scope=%s reprocessed=%d", scope, count)
     return count
+
+
+async def reembed_knowledge_nodes(
+    kg: KnowledgeGraph,
+    embedder: Any,
+    scope: str,
+    *,
+    batch: int = 1000,
+) -> int:
+    """Recompute + upsert embeddings for a scope's graph nodes. Returns the number re-embedded.
+
+    The counterpart to :func:`reembed_memories`. Both must run after an embedding-model
+    switch: ``knowledge_nodes.embedding`` feeds ``find_nodes_by_embedding``, so a node left
+    in the OLD vector space is silently unreachable by semantic lookup — no error, just a
+    graph that stops answering. Re-embedding one store and not the other leaves the system
+    half-migrated in a way nothing reports.
+
+    Nodes are keyed by ``(scope, label)`` and the embedding is derived from the label, so
+    ``upsert_node`` updates in place — the operation is idempotent.
+    """
+    nodes = await kg.list_nodes(scope, limit=batch)
+    if not nodes:
+        return 0
+    vectors = await _embed_all(embedder, [n.label for n in nodes])
+    count = 0
+    for node, vec in zip(nodes, vectors):
+        node.embedding = vec or None
+        await kg.upsert_node(node)
+        count += 1
+    logger.info("stage=maintenance event=reembed_nodes scope=%s reprocessed=%d", scope, count)
+    return count
+
+
+async def _embed_all(embedder: Any, texts: "list[str]") -> "list[list[float]]":
+    """Embed a list, preferring the embedder's batch path.
+
+    Re-embedding is the bulk operation by definition — one request beats N round trips, and
+    against a metered cloud provider the difference is latency AND rate-limit headroom. Falls
+    back to sequential ``embed`` for an embedder that offers no batch (duck-typed: the
+    ``Embedder`` protocol does not require one).
+    """
+    batch_fn = getattr(embedder, "embed_batch", None)
+    if batch_fn is not None:
+        return list(await batch_fn(texts))
+    return [await embedder.embed(t) for t in texts]
 
 
 async def prune_orphan_nodes(kg: KnowledgeGraph, scope: str, *, limit: int = 1000) -> int:

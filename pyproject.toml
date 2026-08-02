@@ -1,6 +1,6 @@
 [project]
 name = "cogno-engram"
-version = "0.1.0"
+version = "0.1.1"
 description = "Persistence substrate for the Cogno cognitive pipeline — memory store, knowledge graph, conversation buffer, and sleep-time consolidation (hypnos)"
 readme = "README.md"
 requires-python = ">=3.10"

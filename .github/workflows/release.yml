@@ -7,6 +7,9 @@ name: release
 on:
   push:
     tags: ["v*"]
+  # Manual re-run without cutting a new tag — the one capability the deleted
+  # publish.yml had that this did not. Pick the tag as the ref when dispatching.
+  workflow_dispatch:
 
 jobs:
   build:

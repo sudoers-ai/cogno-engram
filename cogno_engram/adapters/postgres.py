@@ -537,6 +537,26 @@ class PostgresStore(_PgBase):
                              confidence=r["confidence"], feedback_score=r["feedback_score"],
                              created_at=r["created_at"], id=str(r["id"])) for r in rows]
 
+    async def scan_memories(self, scope: str, *, after_id: "Optional[str]" = None,
+                            limit: int = 1000) -> list[MemoryRecord]:
+        _require_scope(scope)
+        sql = ("SELECT id, scope, category, content, confidence, feedback_score, created_at "
+               "FROM memories WHERE scope = %s")
+        params: list = [scope]
+        if after_id is not None:
+            sql += " AND id > %s"
+            params.append(after_id)
+        # ORDER BY the cursor column, so the next page resumes exactly where this one ended
+        # regardless of what was inserted meanwhile.
+        sql += " ORDER BY id ASC LIMIT %s"
+        params.append(limit)
+        async with self._conn() as conn:
+            cur = await conn.execute(sql, params)
+            rows = await cur.fetchall()
+        return [MemoryRecord(scope=r["scope"], category=r["category"], content=r["content"],
+                             confidence=r["confidence"], feedback_score=r["feedback_score"],
+                             created_at=r["created_at"], id=str(r["id"])) for r in rows]
+
     async def adjust_feedback_score(self, scope: str, query_text: str, delta: float,
                                     *, limit: int = 10) -> int:
         _require_scope(scope)
@@ -763,6 +783,25 @@ class PostgresKnowledgeGraph(_PgBase):
             sql += " AND node_type = %s"
             params.append(node_type)
         sql += " ORDER BY id LIMIT %s"
+        params.append(limit)
+        async with self._conn() as conn:
+            cur = await conn.execute(sql, params)
+            rows = await cur.fetchall()
+        return [GraphNode(scope=r["scope"], label=r["label"], node_type=r["node_type"],
+                          attributes=r["attributes"], id=r["id"],
+                          created_at=r["created_at"], updated_at=r["updated_at"])
+                for r in rows]
+
+    async def scan_nodes(self, scope: str, *, after_id: Optional[int] = None,
+                         limit: int = 1000) -> list[GraphNode]:
+        _require_scope(scope)
+        sql = ("SELECT id, scope, label, node_type, attributes, created_at, updated_at "
+               "FROM knowledge_nodes WHERE scope = %s")
+        params: list = [scope]
+        if after_id is not None:
+            sql += " AND id > %s"
+            params.append(after_id)
+        sql += " ORDER BY id ASC LIMIT %s"
         params.append(limit)
         async with self._conn() as conn:
             cur = await conn.execute(sql, params)

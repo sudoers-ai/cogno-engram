@@ -51,21 +51,42 @@ async def reembed_memories(
     *,
     batch: int = 1000,
 ) -> int:
-    """Recompute + upsert embeddings for a scope's memories (e.g. after switching
-    embedding models). Returns the number re-embedded.
+    """Recompute + upsert embeddings for EVERY memory in a scope. Returns the number re-embedded.
 
     ``embedder`` is a duck-typed cogno-anima ``Embedder``. Idempotent: re-saving a
     memory upserts on ``(scope, category, content)`` and updates the embedding.
+
+    ``batch`` is the page size, **not a cap**: this walks until the scope is exhausted. It used
+    to be a cap — one `limit=batch` read and done — so a scope with more than 1000 memories was
+    silently left half-migrated in the OLD vector space while the caller printed the truncated
+    count as a success. That is the exact failure this module exists to prevent, and no test
+    caught it because every fixture had three rows.
+
+    Residual, stated rather than hidden: the walk is keyset-ordered on ``id``, which is stable
+    for rows that already exist but cannot see a row INSERTED behind the cursor mid-walk (the
+    ids are random uuids, not monotonic). Re-embedding is a maintenance step run against a
+    quiescent store; a row written during the walk belongs to the writer's model generation.
     """
-    mems = await store.load_memories(scope, query=RetrievalQuery(), limit=batch)
-    if not mems:
-        return 0
-    vectors = await _embed_all(embedder, [m.content for m in mems])
-    count = 0
-    for m, vec in zip(mems, vectors):
-        await store.save_memory(MemoryRecord(scope, m.category, m.content,
-                                             confidence=m.confidence, embedding=vec or None))
-        count += 1
+    count, cursor = 0, None
+    while True:
+        mems = await store.scan_memories(scope, after_id=cursor, limit=batch)
+        if not mems:
+            break
+        vectors = await _embed_all(embedder, [m.content for m in mems])
+        for m, vec in zip(mems, vectors):
+            # An empty vector means the embedder failed for this text. Writing it through would
+            # blank the stored embedding (``save_memory`` treats None as "clear"), turning a
+            # transient provider hiccup into permanent data loss — leave the old vector alone.
+            if not vec:
+                logger.warning("stage=maintenance event=reembed_skip_empty scope=%s id=%s",
+                               scope, m.id)
+                continue
+            await store.save_memory(MemoryRecord(scope, m.category, m.content,
+                                                 confidence=m.confidence, embedding=vec))
+            count += 1
+        cursor = mems[-1].id
+        if cursor is None or len(mems) < batch:
+            break
     logger.info("stage=maintenance event=reembed scope=%s reprocessed=%d", scope, count)
     return count
 
@@ -87,16 +108,28 @@ async def reembed_knowledge_nodes(
 
     Nodes are keyed by ``(scope, label)`` and the embedding is derived from the label, so
     ``upsert_node`` updates in place — the operation is idempotent.
+
+    ``batch`` is the page size, **not a cap** — see :func:`reembed_memories` for why that
+    distinction cost a silent half-migration. Node ids are monotonic, so this walk has none of
+    the concurrent-insert residual the memory walk carries.
     """
-    nodes = await kg.list_nodes(scope, limit=batch)
-    if not nodes:
-        return 0
-    vectors = await _embed_all(embedder, [n.label for n in nodes])
-    count = 0
-    for node, vec in zip(nodes, vectors):
-        node.embedding = vec or None
-        await kg.upsert_node(node)
-        count += 1
+    count, cursor = 0, None
+    while True:
+        nodes = await kg.scan_nodes(scope, after_id=cursor, limit=batch)
+        if not nodes:
+            break
+        vectors = await _embed_all(embedder, [n.label for n in nodes])
+        for node, vec in zip(nodes, vectors):
+            if not vec:      # never blank a stored vector over a transient embedder failure
+                logger.warning("stage=maintenance event=reembed_nodes_skip_empty scope=%s id=%s",
+                               scope, node.id)
+                continue
+            node.embedding = vec
+            await kg.upsert_node(node)
+            count += 1
+        cursor = nodes[-1].id
+        if cursor is None or len(nodes) < batch:
+            break
     logger.info("stage=maintenance event=reembed_nodes scope=%s reprocessed=%d", scope, count)
     return count
 

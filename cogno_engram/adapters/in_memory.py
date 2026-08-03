@@ -242,6 +242,14 @@ class InMemoryStore:
         scored.sort(key=lambda pair: pair[0], reverse=True)
         return [m for _, m in scored[:limit]]
 
+    async def scan_memories(self, scope: str, *, after_id: Optional[str] = None,
+                            limit: int = 1000) -> list[MemoryRecord]:
+        _require_scope(scope)
+        mems = sorted((m for m in self._memories if m.scope == scope), key=lambda m: m.id or "")
+        if after_id is not None:
+            mems = [m for m in mems if (m.id or "") > after_id]
+        return mems[:limit]
+
     async def adjust_feedback_score(self, scope: str, query_text: str, delta: float,
                                     *, limit: int = 10) -> int:
         _require_scope(scope)
@@ -437,6 +445,15 @@ class InMemoryGraph:
         _require_scope(scope)
         nodes = [n for (s, _), n in self._nodes.items()
                  if s == scope and (node_type is None or n.node_type == node_type)]
+        return nodes[:limit]
+
+    async def scan_nodes(self, scope: str, *, after_id: Optional[int] = None,
+                         limit: int = 1000) -> list[GraphNode]:
+        _require_scope(scope)
+        nodes = sorted((n for (s, _), n in self._nodes.items() if s == scope),
+                       key=lambda n: n.id or 0)
+        if after_id is not None:
+            nodes = [n for n in nodes if (n.id or 0) > after_id]
         return nodes[:limit]
 
     async def delete_node(self, scope: str, label: str) -> bool:

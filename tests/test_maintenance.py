@@ -55,6 +55,36 @@ async def test_reembed_memories(store):
     assert m.embedding is not None
 
 
+async def test_reembed_memories_walks_past_one_page(store):
+    """``batch`` is a PAGE SIZE, not a cap.
+
+    It used to be a cap: one `limit=batch` read and done, so a scope with more rows than the
+    batch was left half-migrated in the old vector space while the caller printed the truncated
+    count as a success — the exact silent failure this module exists to prevent. Every fixture
+    here had three rows, so nothing caught it. This one is deliberately larger than its page."""
+    for i in range(25):
+        await store.save_memory(MemoryRecord("s", "fact", f"memory number {i}"))
+    n = await maintenance.reembed_memories(store, _Embedder(), "s", batch=10)
+    assert n == 25
+    assert all(m.embedding is not None for m in store._memories if m.scope == "s")
+
+
+async def test_reembed_memories_keeps_the_old_vector_when_the_embedder_returns_nothing(store):
+    """An empty vector is an embedder failure, not an instruction to blank the column.
+
+    ``save_memory`` reads ``embedding=None`` as "leave/clear", so writing an empty result
+    through turned a transient provider hiccup into permanent loss of the stored vector."""
+    class _Broken:
+        async def embed(self, text):
+            return []
+
+    await store.save_memory(MemoryRecord("s", "fact", "keep me", embedding=[9.0, 9.0]))
+    n = await maintenance.reembed_memories(store, _Broken(), "s")
+    assert n == 0
+    [m] = [m for m in store._memories if m.scope == "s"]
+    assert m.embedding == [9.0, 9.0]
+
+
 # ── prune_orphan_nodes ────────────────────────────────────────────────────
 
 async def test_prune_orphan_nodes(graph):
@@ -109,6 +139,14 @@ async def test_reembed_knowledge_nodes(graph):
     assert emb.batch_calls == 1
     for node in await graph.list_nodes("s"):
         assert node.embedding is not None
+
+
+async def test_reembed_knowledge_nodes_walks_past_one_page(graph):
+    """The graph half of the page-size-not-a-cap fix — see the memory counterpart."""
+    for i in range(25):
+        await graph.upsert_node(GraphNode("s", f"concept {i}", "CONCEPT"))
+    assert await maintenance.reembed_knowledge_nodes(graph, _BatchEmbedder(), "s", batch=10) == 25
+    assert all(n.embedding is not None for n in await graph.list_nodes("s", limit=100))
 
 
 async def test_reembed_knowledge_nodes_is_idempotent(graph):

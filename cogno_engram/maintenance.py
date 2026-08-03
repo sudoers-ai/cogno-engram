@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from cogno_engram.ports import KnowledgeGraph, MemoryStore
-from cogno_engram.types import MemoryRecord, RetrievalQuery
+from cogno_engram.types import MemoryRecord
 
 logger = logging.getLogger("cogno_engram.maintenance")
 

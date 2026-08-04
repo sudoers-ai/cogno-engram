@@ -31,15 +31,21 @@ def names_a_test_database(dsn: str) -> bool:
     return _TEST_DB_MARKER in urlsplit(dsn).path.lstrip("/").lower()
 
 
-@pytest.fixture(autouse=True, scope="session")
-def _refuse_non_test_database() -> None:
-    """Abort the run when ``ENGRAM_TEST_DSN`` does not name a test database.
+def pytest_collection_modifyitems(items) -> None:
+    """Abort when a DSN-using test is about to run against a non-test database.
 
-    Unset DSN is the normal case: the Postgres suites skip on their own and nothing runs.
+    Fires on COLLECTION, not on every session: a stale ``ENGRAM_TEST_DSN`` in someone's
+    shell must not stop ``pytest tests/test_in_memory_store.py``, which never opens a
+    connection. The trigger is a collected test whose module reads the DSN — those are the
+    ones that ``DROP TABLE``.
+
+    Unset DSN is the normal case: those modules skip on their own and nothing runs.
     """
     dsn = os.environ.get("ENGRAM_TEST_DSN", "").strip()
     if not dsn or names_a_test_database(dsn):
         return
+    if not any(getattr(getattr(i, "module", None), "DSN", None) for i in items):
+        return                                   # nothing collected would touch that database
     database = urlsplit(dsn).path.lstrip("/")
     pytest.exit(
         f"refusing to run: ENGRAM_TEST_DSN points at database {database!r}, which is not a "

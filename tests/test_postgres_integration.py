@@ -6,9 +6,14 @@ Gated: they need a real Postgres with the ``vector`` extension. Set
 or unreachable. The fixture DROPs and recreates the engram tables (with a tiny
 embedding dim) so runs are deterministic — point it at a throwaway DB.
 
+**The database name must contain "test"** or ``tests/conftest.py`` aborts the run: these
+tests do not just delete rows, they leave the schema with a ``vector(8)`` embedding column
+that a real 768-dimension embedder cannot write to. The example below used to say
+``/postgres`` — a database that exists on every server, production ones included.
+
     docker run -d --rm --name engram-pg -e POSTGRES_PASSWORD=postgres \
-        -p 55432:5432 pgvector/pgvector:pg16
-    ENGRAM_TEST_DSN=postgresql://postgres:postgres@localhost:55432/postgres \
+        -e POSTGRES_DB=engram_test -p 55432:5432 pgvector/pgvector:pg16
+    ENGRAM_TEST_DSN=postgresql://postgres:postgres@localhost:55432/engram_test \
         python3 -m pytest tests/test_postgres_integration.py
 """
 

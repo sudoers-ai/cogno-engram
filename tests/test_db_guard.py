@@ -14,6 +14,7 @@ writes at all, which is worse than the row loss.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -73,3 +74,24 @@ def test_a_live_dsn_does_block_the_destructive_suite():
     r = _run("tests/test_postgres_integration.py")
     assert r.returncode != 0
     assert "refusing to run" in r.stdout
+
+
+# ── the convention the guard rests on ────────────────────────────────────────────────────
+#
+# The trigger is a collected test whose module exposes a module-level ``DSN``. That makes the
+# guard fail OPEN for a future module that reads ENGRAM_TEST_DSN some other way — it would
+# connect, DROP, and never trip the abort. Assert the convention instead of trusting it.
+
+def test_every_module_reading_the_dsn_exposes_it_as_a_module_attribute():
+    offenders = []
+    for f in sorted((_ROOT / "tests").glob("test_*.py")):
+        src = f.read_text()
+        if "ENGRAM_TEST_DSN" not in src or f.name == Path(__file__).name:
+            continue
+        if not re.search(r"^DSN\s*=", src, re.M):
+            offenders.append(f.name)
+    assert not offenders, (
+        f"{offenders} read ENGRAM_TEST_DSN but expose no module-level `DSN`, so "
+        f"pytest_collection_modifyitems in conftest.py cannot see them and would let a "
+        f"DROP TABLE run against a live database."
+    )

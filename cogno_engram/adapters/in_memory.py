@@ -84,6 +84,8 @@ class InMemoryStore:
 
     async def close_session(self, session_id: str, *, summary: str = "", scope: str = "") -> None:
         session = self._sessions.get(session_id)
+        if session is not None and scope and session.scope != scope:
+            return          # a colliding id owned by ANOTHER scope — never write its summary
         if session is not None:
             session.ended_at = _now()
             session.summary = summary

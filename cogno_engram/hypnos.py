@@ -356,7 +356,9 @@ async def consolidate_session(
     if disliked and kg is not None:
         await kg.delete_edges_by_session(kg_scope or session.scope, session.id)
     if close:
-        await store.close_session(session.id, summary=summary)
+        # scope the WRITE too: the sessions table is keyed by id alone, so without it a colliding
+        # id from another tenant would receive this scope's LLM-generated summary.
+        await store.close_session(session.id, summary=summary, scope=session.scope)
 
     logger.info("stage=hypnos tier=3 event=session_done turns=%d memories=%d disliked=%d",
                 len(turns), len(mems), disliked)

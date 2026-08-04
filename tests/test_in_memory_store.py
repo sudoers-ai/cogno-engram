@@ -244,3 +244,37 @@ async def test_purge_scope_removes_all_scope_data_and_isolates(store):
 async def test_purge_scope_rejects_blank_scope(store):
     with pytest.raises(ValueError):
         await store.purge_scope("")
+
+
+async def test_hypnos_consolidation_stays_inside_its_scope(store):
+    """The adapter honouring `scope=` is only half the fix — nothing asserted that hypnos, the
+    caller the commit was written for, actually passes it. Mutation showed both `scope=`
+    arguments could be deleted with the suite green."""
+    from cogno_engram import hypnos
+
+    sid = "collide"
+    await store.save_turn(TurnRecord(sid, "acme/u1", 0, "acme secret", "a"))
+    await store.save_turn(TurnRecord(sid, "globex/u9", 0, "globex secret", "b"))
+
+    seen = {}
+
+    class _Backend:
+        model = "stub"
+
+        async def generate(self, system, prompt):
+            seen["prompt"] = prompt
+            return "", 0, 0
+
+    await hypnos.periodic_consolidate(store=store, backend=_Backend(), scope="acme/u1",
+                                      session_id=sid)
+    assert "acme secret" in seen["prompt"]
+    assert "globex secret" not in seen["prompt"]      # the other tenant's turn never enters
+
+
+async def test_close_session_cannot_write_across_scopes(store):
+    """`sessions` is keyed by id alone, so the summary write needed the same guard as the reads."""
+    s = await store.create_session("acme/u1")
+    await store.close_session(s.id, summary="tenant A private summary", scope="globex/u9")
+    assert (await store.get_session(s.id)).summary != "tenant A private summary"
+    await store.close_session(s.id, summary="own summary", scope="acme/u1")
+    assert (await store.get_session(s.id)).summary == "own summary"

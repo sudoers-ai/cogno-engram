@@ -301,10 +301,14 @@ class PostgresStore(_PgBase):
             if scope:
                 # UPSERT: a host that only save_turn()s has no sessions row to update — insert a
                 # closed one (keyed by the same session id) so the janitor's idle scan skips it.
+                # `sessions` is keyed by id alone, so a colliding id from ANOTHER scope would take
+                # this scope's summary (the cross-scope write the read-side fix was written to
+                # stop). Guard the conflict update with the scope.
                 await conn.execute(
                     "INSERT INTO sessions (id, scope, ended_at, summary) "
                     "VALUES (%s, %s, now(), %s) "
-                    "ON CONFLICT (id) DO UPDATE SET ended_at = now(), summary = EXCLUDED.summary",
+                    "ON CONFLICT (id) DO UPDATE SET ended_at = now(), summary = EXCLUDED.summary "
+                    "WHERE sessions.scope = EXCLUDED.scope",
                     (session_id, scope, summary))
             else:
                 await conn.execute(

@@ -76,8 +76,11 @@ class InMemoryStore:
         self._sessions[session.id] = session
         return session
 
-    async def get_session(self, session_id: str) -> Optional[Session]:
-        return self._sessions.get(session_id)
+    async def get_session(self, session_id: str, *, scope: str = "") -> Optional[Session]:
+        s = self._sessions.get(session_id)
+        if s is not None and scope and s.scope != scope:
+            return None      # id collides across scopes → isolate to the requested scope
+        return s
 
     async def close_session(self, session_id: str, *, summary: str = "", scope: str = "") -> None:
         session = self._sessions.get(session_id)
@@ -149,13 +152,15 @@ class InMemoryStore:
             if turn.scope == scope and turn.session_id == session_id and turn.turn_n == turn_n:
                 turn.response = response
 
-    async def load_turns(self, session_id: str) -> list[TurnRecord]:
-        turns = [t for t in self._turns if t.session_id == session_id]
+    async def load_turns(self, session_id: str, *, scope: str = "") -> list[TurnRecord]:
+        turns = [t for t in self._turns if t.session_id == session_id
+                 and (not scope or t.scope == scope)]
         turns.sort(key=lambda t: t.turn_n)
         return turns
 
-    async def turn_count(self, session_id: str) -> int:
-        return sum(1 for t in self._turns if t.session_id == session_id)
+    async def turn_count(self, session_id: str, *, scope: str = "") -> int:
+        return sum(1 for t in self._turns if t.session_id == session_id
+                   and (not scope or t.scope == scope))
 
     # ── turn traces (own table) ──────────────────────────────────────────
     async def save_turn_trace(self, trace: TurnTrace) -> None:
@@ -168,8 +173,9 @@ class InMemoryStore:
                                 and t.turn_n == trace.turn_n)]
         self._traces.append(trace)
 
-    async def traces_for_session(self, session_id: str) -> list[TurnTrace]:
-        traces = [t for t in self._traces if t.session_id == session_id]
+    async def traces_for_session(self, session_id: str, *, scope: str = "") -> list[TurnTrace]:
+        traces = [t for t in self._traces if t.session_id == session_id
+                  and (not scope or t.scope == scope)]
         traces.sort(key=lambda t: t.turn_n)
         return traces
 

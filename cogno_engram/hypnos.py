@@ -290,7 +290,11 @@ async def periodic_consolidate(
     are persisted — the caller owns the domain judgement of what belongs in the durable graph
     (e.g. dropping volatile state like an appointment/status that a live tool read should own).
     """
-    turns = [t for t in await store.load_turns(session_id) if t.feedback != -1][-batch_n:]
+    # Scope the read: session_id is a host-derived uuid5 that can collide across scopes, and the
+    # extract below is written back into THIS scope — an un-scoped read would fold another tenant's
+    # turns into this tenant's memories.
+    turns = [t for t in await store.load_turns(session_id, scope=scope)
+             if t.feedback != -1][-batch_n:]
     if not turns:
         return []
     text = await _generate(backend, system, prompt.format(count=len(turns), transcript=_transcript(turns)))
@@ -330,7 +334,7 @@ async def consolidate_session(
     tenant), pass it so the feedback pruning hits the edges Tier 2 actually
     wrote; default is ``session.scope``.
     """
-    turns = await store.load_turns(session.id)
+    turns = await store.load_turns(session.id, scope=session.scope)   # isolate to this session's scope
     active = [t for t in turns if t.feedback != -1]
     disliked = len(turns) - len(active)
 

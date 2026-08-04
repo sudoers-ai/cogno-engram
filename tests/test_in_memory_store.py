@@ -19,6 +19,31 @@ async def test_session_and_turn_roundtrip(store):
     assert (await store.get_session(session.id)).scope == "acme/phone1"
 
 
+async def test_turn_reads_isolate_by_scope_on_id_collision(store):
+    # Security audit 2026-08-04: a session_id is a host-derived uuid5 that can COLLIDE across
+    # scopes. load_turns/turn_count/traces_for_session/get_session took only the id, so a
+    # tenant-A consolidation could read tenant-B's turns and fold them into A's memories.
+    from cogno_engram.types import TurnTrace
+    sid = "shared-session-id"                         # SAME id, two tenants
+    await store.save_turn(TurnRecord(sid, "acme/u1", 0, "acme secret"))
+    await store.save_turn(TurnRecord(sid, "globex/u9", 0, "globex secret"))
+    await store.save_turn_trace(TurnTrace(sid, "acme/u1", 0, {"ner": {}}))
+    await store.save_turn_trace(TurnTrace(sid, "globex/u9", 0, {"ner": {}}))
+
+    # scoped reads see ONLY their own scope
+    acme = await store.load_turns(sid, scope="acme/u1")
+    assert [t.user_input for t in acme] == ["acme secret"]
+    assert await store.turn_count(sid, scope="acme/u1") == 1
+    assert await store.turn_count(sid, scope="globex/u9") == 1
+    assert all(t.scope == "acme/u1" for t in await store.traces_for_session(sid, scope="acme/u1"))
+    # get_session isolates too: a session created under acme is invisible to globex's scope
+    s = await store.create_session("acme/only")
+    assert await store.get_session(s.id, scope="globex/x") is None
+    assert (await store.get_session(s.id, scope="acme/only")).id == s.id
+    # back-compat: no scope → id-only read still returns everything (unchanged callers)
+    assert await store.turn_count(sid) == 2
+
+
 async def test_save_turn_dedups_same_coordinate(store):
     # Match the Postgres ON CONFLICT (scope, session_id, turn_n) DO NOTHING: a re-saved turn
     # coordinate is a no-op, not a duplicate row (was a divergence — in-memory double-counted).

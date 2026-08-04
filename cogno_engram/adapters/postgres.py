@@ -280,11 +280,16 @@ class PostgresStore(_PgBase):
             row = await cur.fetchone()
         return Session(id=sid, scope=scope, started_at=row["started_at"])
 
-    async def get_session(self, session_id: str) -> Optional[Session]:
+    async def get_session(self, session_id: str, *, scope: str = "") -> Optional[Session]:
         async with self._conn() as conn:
-            cur = await conn.execute(
-                "SELECT id, scope, started_at, ended_at, summary FROM sessions WHERE id = %s",
-                (session_id,))
+            if scope:
+                cur = await conn.execute(
+                    "SELECT id, scope, started_at, ended_at, summary FROM sessions "
+                    "WHERE id = %s AND scope = %s", (session_id, scope))
+            else:
+                cur = await conn.execute(
+                    "SELECT id, scope, started_at, ended_at, summary FROM sessions WHERE id = %s",
+                    (session_id,))
             row = await cur.fetchone()
         if not row:
             return None
@@ -376,19 +381,29 @@ class PostgresStore(_PgBase):
                 "UPDATE turns SET response = %s WHERE scope = %s AND session_id = %s AND turn_n = %s",
                 (response, scope, session_id, turn_n))
 
-    async def load_turns(self, session_id: str) -> list[TurnRecord]:
+    async def load_turns(self, session_id: str, *, scope: str = "") -> list[TurnRecord]:
+        cols = ("SELECT scope, session_id, turn_n, user_input, response, feedback, goal, "
+                "goal_status, sentiment, domains, pii_types, created_at FROM turns ")
         async with self._conn() as conn:
-            cur = await conn.execute(
-                "SELECT scope, session_id, turn_n, user_input, response, feedback, goal, "
-                "goal_status, sentiment, domains, pii_types, created_at "
-                "FROM turns WHERE session_id = %s ORDER BY turn_n ASC", (session_id,))
+            if scope:
+                cur = await conn.execute(
+                    cols + "WHERE session_id = %s AND scope = %s ORDER BY turn_n ASC",
+                    (session_id, scope))
+            else:
+                cur = await conn.execute(
+                    cols + "WHERE session_id = %s ORDER BY turn_n ASC", (session_id,))
             rows = await cur.fetchall()
         return [self._row_to_turn(r) for r in rows]
 
-    async def turn_count(self, session_id: str) -> int:
+    async def turn_count(self, session_id: str, *, scope: str = "") -> int:
         async with self._conn() as conn:
-            cur = await conn.execute(
-                "SELECT count(*) AS c FROM turns WHERE session_id = %s", (session_id,))
+            if scope:
+                cur = await conn.execute(
+                    "SELECT count(*) AS c FROM turns WHERE session_id = %s AND scope = %s",
+                    (session_id, scope))
+            else:
+                cur = await conn.execute(
+                    "SELECT count(*) AS c FROM turns WHERE session_id = %s", (session_id,))
             row = await cur.fetchone()
         return int(row["c"])
 
@@ -402,11 +417,16 @@ class PostgresStore(_PgBase):
                 "ON CONFLICT (scope, session_id, turn_n) DO UPDATE SET trace = EXCLUDED.trace",
                 (trace.scope, trace.session_id, trace.turn_n, json.dumps(trace.trace)))
 
-    async def traces_for_session(self, session_id: str) -> list["TurnTrace"]:
+    async def traces_for_session(self, session_id: str, *, scope: str = "") -> list["TurnTrace"]:
         async with self._conn() as conn:
-            cur = await conn.execute(
-                "SELECT scope, session_id, turn_n, trace, created_at "
-                "FROM turn_traces WHERE session_id = %s ORDER BY turn_n ASC", (session_id,))
+            if scope:
+                cur = await conn.execute(
+                    "SELECT scope, session_id, turn_n, trace, created_at FROM turn_traces "
+                    "WHERE session_id = %s AND scope = %s ORDER BY turn_n ASC", (session_id, scope))
+            else:
+                cur = await conn.execute(
+                    "SELECT scope, session_id, turn_n, trace, created_at "
+                    "FROM turn_traces WHERE session_id = %s ORDER BY turn_n ASC", (session_id,))
             rows = await cur.fetchall()
         return [TurnTrace(session_id=str(r["session_id"]), scope=r["scope"], turn_n=r["turn_n"],
                           trace=r["trace"] or {}, created_at=r["created_at"]) for r in rows]

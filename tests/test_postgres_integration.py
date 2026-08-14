@@ -174,6 +174,43 @@ async def test_idle_sessions_and_close_upsert(store):
     await conn.close()
 
 
+async def test_a_session_that_GREW_after_closing_comes_back_for_consolidation(store):
+    """The SQL half of the frozen-memory fix — the in-memory adapter cannot prove this one,
+    because the `t.created_at > s.ended_at` comparison is the query.
+
+    A host that derives `session_id` from (tenant, channel, sender), as a messaging gateway
+    must so an out-of-band message lands in the contact's own thread, never mints a second
+    session for a contact. Excluding every closed session therefore froze Tier 3 at the first
+    quiet spell, permanently. Measured live (2026-08): 20 of 22, 10 of 13 and 8 of 10 turns
+    arrived after their session had been declared over.
+
+    Mutation: drop `OR t.created_at > s.ended_at` from the WHERE and this dies."""
+    scope = f"grow{uuid4().hex[:8]}/u"
+    sid = str(uuid4())
+    conn = await _connect()
+    try:
+        await store.save_turn(TurnRecord(sid, scope, 0, "oi"))
+        await conn.execute("UPDATE turns SET created_at = now() - interval '3 h' "
+                           "WHERE session_id = %s", (sid,))
+        await store.close_session(sid, summary="turno 1", scope=scope)
+        await conn.execute("UPDATE sessions SET ended_at = now() - interval '3 h' WHERE id = %s",
+                           (sid,))
+        assert sid not in [s.id for s in await store.idle_sessions(idle_seconds=1800)]
+
+        # the contact comes back later — SAME session id, because it never rotates
+        await store.save_turn(TurnRecord(sid, scope, 1, "voltei"))
+        await conn.execute("UPDATE turns SET created_at = now() - interval '45 min' "
+                           "WHERE session_id = %s AND turn_n = 1", (sid,))
+        assert sid in [s.id for s in await store.idle_sessions(idle_seconds=1800)], (
+            "turns after the close must bring the session back")
+
+        # …and re-closing quiets it again: once per new burst, not once per tick
+        await store.close_session(sid, summary="turnos 1-2", scope=scope)
+        assert sid not in [s.id for s in await store.idle_sessions(idle_seconds=1800)]
+    finally:
+        await conn.close()
+
+
 async def test_pii_masking_on_write(store):
     scope = f"t/{uuid4()}"
     s = await store.create_session(scope)

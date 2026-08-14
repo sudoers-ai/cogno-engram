@@ -113,8 +113,12 @@ class InMemoryStore:
             if lst >= cutoff:
                 continue                                   # still recently active
             sess = self._sessions.get(sid)
-            if sess is not None and sess.ended_at is not None:
-                continue                                   # already closed/consolidated
+            # Closed is not the same as FINISHED: a host whose session_id is derived from
+            # (tenant, channel, sender) reuses one session per contact forever, so turns keep
+            # arriving after a close. Skip only when nothing has happened since — see the
+            # Postgres adapter for the measured effect of getting this wrong.
+            if sess is not None and sess.ended_at is not None and lst <= sess.ended_at:
+                continue
             out.append(Session(id=sid, scope=scope, started_at=first))
         out.sort(key=lambda s: s.started_at)               # oldest-idle first
         return out[:limit]

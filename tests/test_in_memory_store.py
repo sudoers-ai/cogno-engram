@@ -132,7 +132,57 @@ async def test_close_session_upserts_and_excludes_from_idle_scan(store):
     await store.close_session("sess-x", summary="consolidated", scope="t/u")
     closed = await store.get_session("sess-x")
     assert closed is not None and closed.ended_at is not None and closed.summary == "consolidated"
-    assert await store.idle_sessions(idle_seconds=1800) == []      # not re-picked
+    assert await store.idle_sessions(idle_seconds=1800) == []      # nothing new since → skip
+
+
+async def test_a_session_that_GREW_after_closing_is_consolidated_again(store):
+    """Closed is not the same as finished.
+
+    A host that derives ``session_id`` from (tenant, channel, sender) — which a messaging
+    gateway must, so an out-of-band message lands in the contact's own thread — never mints a
+    second session for that contact. Excluding every closed session therefore froze Tier 3 at
+    whatever the conversation was during its FIRST quiet spell, forever.
+
+    Measured on a live box (2026-08): all three real conversations were frozen. 20 of 22, 10 of
+    13 and 8 of 10 turns arrived after their session had been declared over, and the narrative
+    the host injects as EARLIER CONTEXT still described turn 2 — so after a day's gap the model
+    re-opened a conversation that had long moved on.
+
+    Mutation: exclude any session with ``ended_at`` and this dies."""
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    await store.save_turn(TurnRecord("sess-g", "t/u", 0, "oi",
+                                     created_at=now - timedelta(hours=3)))
+    await store.close_session("sess-g", summary="turno 1", scope="t/u")
+    assert await store.idle_sessions(idle_seconds=1800) == []
+    # The store stamps `ended_at` with its own clock and takes no injected one, so backdate the
+    # close to when it really would have happened — otherwise the test asks whether a turn from
+    # the past arrived after a close in the present, which is not the situation being pinned.
+    closed = await store.get_session("sess-g")
+    closed.ended_at = now - timedelta(hours=3)
+
+    # the contact comes back the next day — same session id, because it never rotates
+    await store.save_turn(TurnRecord("sess-g", "t/u", 1, "voltei",
+                                     created_at=now - timedelta(minutes=45)))
+    assert [s.id for s in await store.idle_sessions(idle_seconds=1800)] == ["sess-g"], (
+        "new turns after the close must bring the session back for consolidation")
+
+    # …and once re-consolidated it goes quiet again: self-limiting, not once per tick
+    await store.close_session("sess-g", summary="turnos 1-2", scope="t/u")
+    assert await store.idle_sessions(idle_seconds=1800) == []
+
+
+async def test_a_session_still_ACTIVE_is_not_re_picked_just_for_having_closed(store):
+    """The re-pick must key on new turns, not on the mere existence of a close: a session whose
+    last turn predates its own consolidation has nothing to add, and re-reading it would spend
+    a Tier-3 LLM pass per tick, forever, on every contact who ever wrote."""
+    from datetime import datetime, timedelta, timezone
+    now = datetime.now(timezone.utc)
+    await store.save_turn(TurnRecord("sess-q", "t/u", 0, "oi",
+                                     created_at=now - timedelta(hours=5)))
+    await store.close_session("sess-q", summary="pronto", scope="t/u")
+    for _ in range(3):
+        assert await store.idle_sessions(idle_seconds=1800) == []
 
 
 async def test_idle_sessions_oldest_first_and_limit(store):

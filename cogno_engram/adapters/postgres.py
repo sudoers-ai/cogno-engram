@@ -318,14 +318,29 @@ class PostgresStore(_PgBase):
     async def idle_sessions(self, *, idle_seconds: int = 1800,
                             limit: int = 100) -> list[Session]:
         # Turn-derived (the host persists turns without a sessions row): group the turns table by
-        # session, take the last activity, and keep those idle past the cutoff and NOT already
-        # closed (LEFT JOIN sessions → row absent, or present with ended_at NULL).
+        # session, take the last activity, and keep those idle past the cutoff and not already
+        # consolidated UP TO THEIR CURRENT END.
+        #
+        # That last clause is the whole point, and its absence froze long-term memory. A closed
+        # session used to be excluded forever — but a host that derives `session_id` from
+        # (tenant, channel, sender), as a messaging gateway must so an out-of-band message lands
+        # in the contact's own thread, NEVER mints a second session for that contact. So the
+        # first idle period consolidated the conversation as it stood and every later turn was
+        # invisible to Tier 3 for good. Measured on a live box (2026-08): all three real
+        # conversations were frozen — 20 of 22, 10 of 13 and 8 of 10 turns arrived after their
+        # session had been declared over, and the narrative the host injects as EARLIER CONTEXT
+        # still described turn 2. The model then acted on a two-day-old snapshot and re-opened a
+        # conversation that had long moved on.
+        #
+        # Re-picking on `max(turn) > ended_at` is self-limiting: consolidation re-closes with a
+        # fresh `ended_at`, so a session comes back only once per new burst of turns, not once
+        # per tick.
         async with self._conn() as conn:
             cur = await conn.execute(
                 "SELECT t.session_id AS id, t.scope AS scope, "
                 "       min(t.created_at) AS started_at, max(t.created_at) AS last_activity "
                 "FROM turns t LEFT JOIN sessions s ON s.id = t.session_id "
-                "WHERE s.id IS NULL OR s.ended_at IS NULL "
+                "WHERE s.id IS NULL OR s.ended_at IS NULL OR t.created_at > s.ended_at "
                 "GROUP BY t.session_id, t.scope "
                 "HAVING max(t.created_at) < now() - make_interval(secs => %s) "
                 "ORDER BY max(t.created_at) ASC LIMIT %s",

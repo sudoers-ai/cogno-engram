@@ -91,6 +91,13 @@ class MemoryStore(Protocol):
     async def admin_turns(self, scope_prefix: str, *, limit: int = 30,
                           offset: int = 0) -> "tuple[list[TurnRecord], int]": ...
     async def admin_scopes(self, scope_prefix: str) -> list[str]: ...   # distinct scopes w/ turns
+    # The traces of a scope SUBTREE, newest-first + a total — the admin/offline read that
+    # ``traces_for_session`` (one session) cannot serve: an audit over a tenant's whole
+    # history, or a janitor pass over "everything since T". ``since`` is inclusive on
+    # ``created_at``. Same subtree semantics and pagination shape as ``admin_turns``; same
+    # caveat (not partition-pruned — a maintenance read, not a hot path).
+    async def admin_traces(self, scope_prefix: str, *, since: Optional[datetime] = None,
+                           limit: int = 1000, offset: int = 0) -> "tuple[list[TurnTrace], int]": ...
 
     # ── memories ─────────────────────────────────────────────────────────
     async def save_memory(self, memory: MemoryRecord) -> None: ...   # upsert

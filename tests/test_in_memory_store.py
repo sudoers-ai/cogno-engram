@@ -328,3 +328,35 @@ async def test_close_session_cannot_write_across_scopes(store):
     assert (await store.get_session(s.id)).summary != "tenant A private summary"
     await store.close_session(s.id, summary="own summary", scope="acme/u1")
     assert (await store.get_session(s.id)).summary == "own summary"
+
+
+@pytest.mark.asyncio
+async def test_admin_traces_reads_a_scope_subtree_newest_first_with_since_and_pages(store):
+    """The offline read `traces_for_session` cannot serve: every trace under a scope SUBTREE
+    (a tenant's whole history), newest-first, with an inclusive `since` and a total — the
+    same shape as `admin_turns`, so a caller pages the two the same way."""
+    from datetime import datetime, timedelta, timezone
+
+    from cogno_engram.types import TurnTrace
+
+    t0 = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
+    for i, (scope, sid) in enumerate([("acme/u1", "s1"), ("acme/u1", "s1"), ("acme/u2", "s2"),
+                                      ("acme", "s0"), ("acmeco/u9", "s9"), ("globex/u1", "s3")]):
+        await store.save_turn_trace(TurnTrace(sid, scope, i, {"i": i},
+                                              created_at=t0 + timedelta(hours=i)))
+
+    rows, total = await store.admin_traces("acme")
+    # the prefix itself and its descendants; "acmeco" is NOT under "acme" (subtree, not prefix)
+    assert total == 4 and [r.trace["i"] for r in rows] == [3, 2, 1, 0]
+    assert all(r.scope in ("acme", "acme/u1", "acme/u2") for r in rows)
+
+    # inclusive `since`
+    rows, total = await store.admin_traces("acme", since=t0 + timedelta(hours=2))
+    assert total == 2 and [r.trace["i"] for r in rows] == [3, 2]
+
+    # pagination keeps the total
+    rows, total = await store.admin_traces("acme", limit=1, offset=1)
+    assert total == 4 and [r.trace["i"] for r in rows] == [2]
+
+    with pytest.raises(ValueError):
+        await store.admin_traces("")

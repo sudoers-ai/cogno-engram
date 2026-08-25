@@ -547,6 +547,19 @@ class InMemoryGraph:
                  if s == scope and (node_type is None or n.node_type == node_type)]
         return nodes[:limit]
 
+    async def count_nodes(self, scope: str, *, label: Optional[str] = None) -> int:
+        """How many nodes this scope holds, or how many carry ``label`` (case-insensitively).
+
+        Case-insensitive because that is how every other node read matches: `find_node` and
+        `walk` both compare `lower(label)`, so a count that were case-SENSITIVE would answer a
+        different question from the one the caller is about to act on.
+        """
+        _require_scope(scope)
+        want = label.strip().casefold() if label is not None else None
+        return sum(1 for (s, _), n in self._nodes.items()
+                   if s == scope and (want is None
+                                      or (n.label or "").strip().casefold() == want))
+
     async def scan_nodes(self, scope: str, *, after_id: Optional[int] = None,
                          limit: int = 1000) -> list[GraphNode]:
         _require_scope(scope)

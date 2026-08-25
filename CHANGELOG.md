@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### Added
+
+- **`KnowledgeGraph.count_nodes(scope, *, label=None)`** — how many nodes a scope holds, or how
+  many carry a label, as a **query** instead of a page.
+
+  `list_nodes` is `ORDER BY id LIMIT n`: no label filter, no offset. A caller asking *"is this
+  label unique in this scope?"* over it gets the right answer only while the tenant stays smaller
+  than the page — and a homonym created past the cut is invisible. That was a live defect: the
+  host had to refuse to answer whenever the page came back full, because the alternative was
+  speaking a stranger's facts about a contact.
+
+  `lower(label)` on both sides, matching `find_node` and the `walk` seed — a case-sensitive count
+  would answer a different question from the one the caller is about to act on.
+
+  **Contract change:** `KnowledgeGraph` is `@runtime_checkable`, so a host with its own adapter
+  must add the method to keep satisfying it.
+
+
+## Unreleased
+
 ### Fixed
 
 - **A read hands back a COPY, at all four doors.** `walk()`, `get_node_context().edges` and

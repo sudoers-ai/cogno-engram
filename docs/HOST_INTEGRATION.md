@@ -74,6 +74,36 @@ await hypnos.periodic_consolidate(store, backend, scope=scope, session_id=sessio
 await hypnos.consolidate_session(store, backend, session=session, kg=kg, embedder=embedder)
 ```
 
+## Edge curation — the host owns the verdict
+
+A graph edge becomes a sentence the agent states about a person **as if it knew**. So the host
+decides what may be spoken, and engram enforces it:
+
+```python
+# an LLM extraction PROPOSES (opt-in; default is still assert, so nothing changes on upgrade)
+await hypnos.periodic_consolidate(store, backend, scope=scope, session_id=sid, kg=kg,
+                                  propose_relations=True)
+
+# the host's curation UI reads the queue and writes the verdict
+for e in await kg.pending_edges(scope):
+    ...
+await kg.set_edge_status(scope, "José", "Pedro", "PARENT_OF", "accepted")
+```
+
+Three things the host does **not** have to remember:
+
+* `walk()` returns `accepted` edges only and has **no flag** to say otherwise — a proposal is
+  also skipped by the TRAVERSAL, so it cannot decide what the walk reaches;
+* `neighbors()` and `get_node_context()` obey the same rule (an unreviewed edge still discloses
+  its endpoint, and `NodeContext` hands both fields to one caller);
+* `format_graph_context` repeats the filter at the last step before the text becomes a prompt.
+
+`rejected` is **sticky**: `upsert_edge` cannot tell a deliberate correction from the LLM
+re-emitting the same edge and defaults to `accepted`, so only `set_edge_status` reverses a human
+verdict. Re-asserting merges `attributes` and may promote a proposal, never demotes one.
+
+`pending_edges` returns **oldest first** so a bounded queue drains.
+
 ## Feedback-driven quality
 
 The host captures reactions and writes the signal; engram honours it:

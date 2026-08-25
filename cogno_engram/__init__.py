@@ -12,7 +12,9 @@ from cogno_engram.ports import (
 )
 from cogno_engram.types import (
     DEFAULT_CONFIDENCE,
-    VALID_NODE_TYPES,
+    EDGE_ACCEPTED,
+    EDGE_PROPOSED,
+    EDGE_REJECTED,
     GraphEdge,
     GraphNode,
     HybridWeights,
@@ -23,11 +25,18 @@ from cogno_engram.types import (
     SessionSummary,
     TurnRecord,
     TurnTrace,
+    VALID_EDGE_STATUS,
+    VALID_NODE_TYPES,
+    VALID_PROXIMITY_RELATIONS,
+    sanitize_edge_status,
 )
 
 __version__ = "0.1.0"
 
 __all__ = [
+    # edge curation (see types.VALID_EDGE_STATUS)
+    "EDGE_ACCEPTED", "EDGE_PROPOSED", "EDGE_REJECTED", "VALID_EDGE_STATUS",
+    "VALID_PROXIMITY_RELATIONS", "sanitize_edge_status",
     "__version__",
     # ports
     "MemoryStore", "SupportsVectorSearch", "ConversationBuffer", "KnowledgeGraph",

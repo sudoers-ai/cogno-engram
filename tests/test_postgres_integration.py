@@ -655,7 +655,8 @@ async def test_pg_an_explicit_None_attributes_does_not_poison_the_next_merge(gra
 
 
 @pytest.mark.asyncio
-async def test_admin_traces_a_scope_with_LIKE_metacharacters_does_not_leak(store):
+@pytest.mark.parametrize("meta", ["_", "%", "\\"])
+async def test_admin_traces_a_scope_with_LIKE_metacharacters_does_not_leak(store, meta):
     """O comportamento que os testes puros só conseguem provar pela FORMA.
 
     O scope é opaco: pode conter `%`, `_` e `\\`, e cada um vira curinga dentro de um `LIKE`. Sem
@@ -667,7 +668,14 @@ async def test_admin_traces_a_scope_with_LIKE_metacharacters_does_not_leak(store
     from cogno_engram.types import TurnTrace
 
     marca = uuid4().hex[:8]
-    prefixo = f"t{marca}_a"                       # `_` é curinga de UM caractere no LIKE
+    prefixo = f"t{marca}{meta}a"
+    # Os três metacaracteres do LIKE, e são exactamente três — um censo contra o banco sobre os
+    # 31 caracteres de pontuação/espaço não encontra mais nenhum. Antes só o `_` chegava ao
+    # banco: medido, uma mutação que escapasse `\\` e `_` mas NÃO `%` sobrevivia a este nível
+    # inteiro (40 verdes), porque o único caso que aqui corria não continha `%`.
+    #   `_`  puxa um caractere qualquer   →  `tXa` entra
+    #   `%`  puxa TUDO                    →  toda a tabela entra
+    #   `\\`  escapa o seguinte             →  desarma o escaping do vizinho
     intrusos = [f"t{marca}Xa/u1", f"t{marca}za/u1", f"t{marca}-a/u1"]
 
     # `turn_traces.session_id` é UUID no schema — string livre rebenta com
@@ -686,6 +694,46 @@ async def test_admin_traces_a_scope_with_LIKE_metacharacters_does_not_leak(store
         f"vazou para fora da subárvore: {sorted(voltaram - {prefixo, f'{prefixo}/filho'})}"
     )
     assert total == 2, "o total tem de respeitar a mesma fronteira que a página"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("leitor", ["admin_turns", "admin_scopes"])
+async def test_the_OTHER_subtree_readers_do_not_leak_either(store, leitor):
+    """Os irmãos do `admin_traces`, e a razão pela qual eles precisam de caso PRÓPRIO.
+
+    `_subtree_like` e `_SUBTREE` são partilhados pelos três leitores, portanto qualquer mutação
+    DENTRO do helper morre pelos testes do `admin_traces` acima — o que dava a impressão de que
+    o padrão inteiro estava coberto. Não estava: nada fixava que os irmãos continuassem a CHAMAR
+    o helper. Medido, trocar `like = self._subtree_like(scope_prefix)` por
+    `like = scope_prefix + "/%"` dentro do `admin_turns` (ou do `admin_scopes`) sobrevivia à
+    suíte inteira — 236 verdes — e devolvia isto:
+
+        admin_turns('t_a')  ANTES  ['t_a', 't_a/u1']
+        admin_turns('t_a')  DEPOIS ['tXa/u1', 'tZa/u9', 't_a', 't_a/u1']
+                                   com o `user_input` de outros tenants dentro
+
+    É a forma "conserto nascendo inerte" na sua versão mais cara: a regra vive num sítio, está
+    correcta, e nada prova que os sítios de consumo a usam. Uma regra que cada chamador pode
+    deixar de aplicar sozinho é uma regra que cada chamador esquece sozinho."""
+    marca = uuid4().hex[:8]
+    prefixo = f"t{marca}_a"                       # `_` é curinga de UM caractere no LIKE
+    intrusos = [f"t{marca}Xa/u1", f"t{marca}za/u1"]
+    meus = {prefixo, f"{prefixo}/filho"}
+
+    for i, escopo in enumerate([*meus, *intrusos]):
+        sess = await store.create_session(escopo)
+        await store.save_turn(TurnRecord(sess.id, escopo, i, f"segredo de {escopo}"))
+
+    if leitor == "admin_scopes":
+        voltaram = set(await store.admin_scopes(prefixo))
+    else:
+        rows, total = await store.admin_turns(prefixo)
+        voltaram = {r.scope for r in rows}
+        assert total == len(meus), "o total tem de respeitar a mesma fronteira que a página"
+
+    assert voltaram == meus, (
+        f"{leitor} vazou para fora da subárvore: {sorted(voltaram - meus)} — o escaping do LIKE "
+        f"vive no helper e este chamador deixou de o usar")
 
 
 @pytest.mark.asyncio

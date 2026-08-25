@@ -81,6 +81,20 @@ stops satisfying it under mypy/`isinstance` until it implements both.
 
 ### Fixed
 
+- **Os irmãos do `admin_traces` não tinham guarda nenhuma a fixar que CHAMAM o escaping.**
+  `_subtree_like`/`_SUBTREE` são partilhados por `admin_turns`, `admin_scopes` e `admin_traces`,
+  portanto qualquer mutação DENTRO do helper morria pelos casos do `admin_traces` — o que dava a
+  impressão de que o padrão estava coberto. Medido: trocar `like = self._subtree_like(prefix)`
+  por `like = prefix + "/%"` dentro do `admin_turns` **sobrevivia a 236 verdes** e devolvia
+  `['tXa/u1', 'tZa/u9', 't_a', 't_a/u1']` — com o `user_input` de outros tenants. Idem
+  `admin_scopes`. Ambas as mutações morrem agora.
+
+- **Ao nível do BANCO só um dos três metacaracteres do LIKE era exercitado.** O caso adversarial
+  de integração usava um único prefixo, contendo `_`; medido, uma mutação que escapasse `\` e `_`
+  mas não `%` sobrevivia ao ficheiro de integração inteiro (40 verdes). Passa a ser parametrizado
+  sobre `_`, `%` e `\` — e um censo contra o banco confirma que são exactamente esses três, de 31
+  caracteres de pontuação/espaço. As três mutações por metacaractere morrem.
+
 - **`admin_traces` ganha o índice que o irmão já tinha.** A leitura de subárvore filtra por escopo
   + `created_at` e ordenava sem índice nenhum — enquanto o `admin_turns`, igualmente uma leitura de
   manutenção, tem o seu (`idx_turns_scope_time`). A assimetria era o achado; o custo absoluto ainda

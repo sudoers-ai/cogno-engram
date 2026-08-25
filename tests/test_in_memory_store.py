@@ -360,3 +360,67 @@ async def test_admin_traces_reads_a_scope_subtree_newest_first_with_since_and_pa
 
     with pytest.raises(ValueError):
         await store.admin_traces("")
+
+
+# ── O escape do LIKE é PORTANTE, e não tinha um único teste ─────────────────
+# Medido: apagar o escaping de `PostgresStore._subtree_like` deixava 39 unitários + 29 de
+# integração VERDES, e produzia seis vazamentos reais entre tenants — prefixo `_` puxava todo
+# scope de um caractere e prefixo `%` puxava TUDO. O scope é opaco por contrato, então um tenant
+# com `_` ou `%` no identificador não é hipótese: é o que o contrato permite.
+
+_ADVERSARIAL = [
+    # (prefixo, scopes que NÃO podem voltar)
+    ("t_a", ["tXa/u1", "tza/u1", "t-a/u1", "t_a_b_x/u1"]),   # `_` casa QUALQUER caractere
+    ("100%", ["1000/u1", "100pct/u1", "100/u1"]),            # `%` casa QUALQUER sequência
+    ("a%b", ["aXXb/u1", "ab/u1", "axb/u1"]),                 # `%` no meio
+    ("c\\d", ["cXd/u1", "cd/u1"]),                           # a própria barra de escape
+    ("_", ["Z/u1", "Q/u9", "zz/u1"]),                        # prefixo que é SÓ o curinga
+]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prefix,decoys", _ADVERSARIAL, ids=[p for p, _ in _ADVERSARIAL])
+async def test_a_scope_with_LIKE_metacharacters_does_not_reach_the_neighbours(store, prefix, decoys):
+    """Um scope é OPACO: pode conter `%`, `_` e `\\`. Nenhum deles pode virar curinga.
+
+    O in-memory usa `startswith` e é imune por construção; o Postgres usa `LIKE` e depende do
+    escaping. É por isso que este caso vive nos dois — a concordância entre eles é a rede, e o
+    adaptador imune é o oráculo do que o outro deve devolver."""
+    from cogno_engram.types import TurnTrace
+
+    await store.save_turn_trace(TurnTrace("s-own", prefix, 0, {"quem": "dono"}))
+    await store.save_turn_trace(TurnTrace("s-kid", prefix + "/filho", 1, {"quem": "filho"}))
+    for i, d in enumerate(decoys):
+        await store.save_turn_trace(TurnTrace(f"s-x{i}", d, 2 + i, {"quem": d}))
+
+    rows, total = await store.admin_traces(prefix)
+    voltaram = {r.scope for r in rows}
+
+    assert voltaram == {prefix, prefix + "/filho"}, (
+        f"vazou para fora da subárvore de {prefix!r}: {sorted(voltaram - {prefix, prefix + '/filho'})}"
+    )
+    assert total == 2, "o total conta o que a página não mostra — tem de respeitar a mesma fronteira"
+
+
+@pytest.mark.asyncio
+async def test_the_since_window_applies_to_the_PREFIX_scope_too(store):
+    """O `since` tem de valer para a linha que está NO prefixo, não só para as descendentes.
+
+    Medido: tirar os parênteses de `_SUBTREE` no Postgres produz
+    `scope = prefix OR (scope LIKE 'prefix/%' AND created_at >= since)` — a linha do próprio
+    prefixo escapa à janela. Sobrevivia porque o teste de integração só semeava descendentes, e
+    portanto o ramo `scope = %s` nunca chegava a ter linha para ignorar a janela."""
+    from datetime import datetime, timedelta, timezone
+
+    from cogno_engram.types import TurnTrace
+
+    t0 = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
+    await store.save_turn_trace(TurnTrace("s0", "acme", 0, {"quando": "velho"}, created_at=t0))
+    await store.save_turn_trace(TurnTrace("s1", "acme/u1", 1, {"quando": "novo"},
+                                          created_at=t0 + timedelta(hours=2)))
+
+    rows, total = await store.admin_traces("acme", since=t0 + timedelta(hours=1))
+    assert [r.trace["quando"] for r in rows] == ["novo"], (
+        "a linha NO prefixo atravessou a janela do `since`"
+    )
+    assert total == 1

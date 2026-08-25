@@ -535,6 +535,18 @@ class InMemoryGraph:
                 return True
         return False
 
+    async def set_edge_audience(self, scope: str, source: str, target: str, relation: str,
+                                audience: str) -> bool:
+        """Explicit re-classification — the only way back from a migration."""
+        _require_scope(scope)
+        want = sanitize_audience(audience)
+        for e in self._edges:
+            if (e.scope == scope and e.source.lower() == source.lower()
+                    and e.target.lower() == target.lower() and e.relation == relation):
+                e.audience = want
+                return True
+        return False
+
     async def walk(self, scope: str, start_label: str, *, audience: str,
                    max_depth: int = 2) -> list[GraphEdge]:
         _require_scope(scope)

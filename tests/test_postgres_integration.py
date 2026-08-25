@@ -944,3 +944,56 @@ async def test_admin_traces_does_not_seq_scan_the_whole_table(store):
     assert "on turn_traces" in plano, f"o EXPLAIN não falou de turn_traces:\n{plano}"
     assert "Seq Scan on turn_traces" not in plano, (
         f"a leitura de subárvore varreu a tabela inteira — o plano foi:\n{plano}")
+
+# ── audience: the leak boundary, on the store that actually runs in production ──
+
+async def test_the_POSTGRES_reads_do_not_leak_one_contact_to_another(graph):
+    """The "0/9" of this feature was first measured on the IN-MEMORY adapter — the one that
+    does not run in production. The SQL is a separate implementation of the same rule, and the
+    first cut of it bound the caller's audience raw: `audience=""` (what `audience_for(None)`
+    returns before a contact registers) read as `e.audience = ''` and matched **every
+    unclassified row** — the whole legacy graph. In memory the same input said no.
+
+    A/B/staff, through the reads the turn and the dashboard actually use.
+    """
+    from cogno_engram.types import (AUDIENCE_STAFF, AUDIENCE_TENANT, AUDIENCE_UNCLASSIFIED,
+                                    audience_for)
+
+    scope = f"aud-{uuid4().hex[:8]}"
+    A, B = audience_for("aaa"), audience_for("bbb")
+    for label in ("Ana", "Maria", "Bruno", "Carlos", "Clinica", "Unimed"):
+        await graph.upsert_node(GraphNode(scope, label, "PERSON"))
+    await graph.upsert_edge(GraphEdge(scope, "Ana", "Maria", "SPOUSE_OF", audience=A))
+    await graph.upsert_edge(GraphEdge(scope, "Bruno", "Carlos", "PARENT_OF", audience=B))
+    await graph.upsert_edge(GraphEdge(scope, "Clinica", "Unimed", "ACCEPTS",
+                                      audience=AUDIENCE_TENANT))
+    await graph.upsert_edge(GraphEdge(scope, "Ana", "Carlos", "FRIEND_OF"))   # unclassified
+
+    async def _reads(who):
+        return {
+            "walk": await graph.walk(scope, "Bruno", audience=who, max_depth=3),
+            "neighbors": await graph.neighbors(scope, "Bruno", audience=who),
+            "node_context": await graph.get_node_context(scope, "Bruno", audience=who),
+            "list_nodes": await graph.list_nodes(scope, audience=who, limit=100),
+            "find_node": await graph.find_node(scope, "Carlos", audience=who),
+            "count_nodes": await graph.count_nodes(scope, audience=who),
+            "scan_nodes": await graph.scan_nodes(scope, audience=who, limit=100),
+            "pending": await graph.pending_edges(scope, audience=who, limit=100),
+        }
+
+    for who, name in ((A, "A"), (AUDIENCE_UNCLASSIFIED, "no-identity")):
+        got = await _reads(who)
+        for read, value in got.items():
+            assert "PARENT_OF" not in repr(value), f"{read} leaked B's relation to {name}"
+            assert "Carlos" not in repr(value), f"{read} leaked B's node to {name}"
+        # ...and the unclassified edge is staff-only, for BOTH of them
+        assert "FRIEND_OF" not in repr(got["walk"])
+
+    staff = await _reads(AUDIENCE_STAFF)
+    assert "PARENT_OF" in repr(staff["walk"]), "the filter blinded staff — that is deletion"
+    assert "Carlos" in repr(staff["list_nodes"])
+
+    # the owner still hears its own life, and everyone hears a tenant fact
+    assert "Maria" in repr(await graph.walk(scope, "Ana", audience=A, max_depth=2))
+    for who in (A, B):
+        assert "ACCEPTS" in repr(await graph.walk(scope, "Clinica", audience=who, max_depth=2))

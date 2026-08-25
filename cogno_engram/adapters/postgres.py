@@ -250,6 +250,12 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
          "ALTER TABLE knowledge_edges ADD COLUMN IF NOT EXISTS attributes jsonb NOT NULL DEFAULT '{}'"),
         ("status",
          "ALTER TABLE knowledge_edges ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'accepted'"),
+        # The DEFAULT backfills every existing edge as UNCLASSIFIED, not as `tenant`: staff keeps
+        # seeing them and no contact does. An upgrade must not hand a contact rows nobody has
+        # classified — `maintenance.classify_edge_audience` is the deliberate act that assigns
+        # owners, and until it runs the safe answer is "staff only".
+        ("audience",
+         "ALTER TABLE knowledge_edges ADD COLUMN IF NOT EXISTS audience text NOT NULL DEFAULT ''"),
     ):
         cur = await conn.execute(
             "SELECT 1 FROM information_schema.columns "
@@ -310,10 +316,13 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
         "CREATE INDEX IF NOT EXISTS idx_nodes_embedding ON knowledge_nodes "
         "USING hnsw (embedding vector_cosine_ops)",
         "CREATE INDEX IF NOT EXISTS idx_edges_session ON knowledge_edges (scope, source_session)",
-        # every contact-scoped read filters on it
+        # Every contact-scoped read filters on it. The column is added by the migration block
+        # ABOVE — a first cut put the ALTER here, after this line, so on a database that
+        # predates the column the index was built over a column that did not exist yet and
+        # `ensure_schema` died with `UndefinedColumn`. The unit suite cannot see that: in
+        # memory there is no DDL to order. The integration test for an existing database can,
+        # and did.
         "CREATE INDEX IF NOT EXISTS idx_edges_audience ON knowledge_edges (scope, audience)",
-        # existing deployments: the column is added before the index that needs it
-        "ALTER TABLE knowledge_edges ADD COLUMN IF NOT EXISTS audience text NOT NULL DEFAULT ''",
         "CREATE INDEX IF NOT EXISTS idx_edges_source ON knowledge_edges (source_id)",
         "CREATE INDEX IF NOT EXISTS idx_edges_target ON knowledge_edges (target_id)",
     ]
@@ -787,15 +796,23 @@ class PostgresStore(_PgBase):
 # a rename cannot leave a string literal behind. These are our own values, never user input.
 #
 # EDGE: staff sees everything; anyone sees a tenant fact; an identity sees its own.
-_EDGE_VISIBLE = (f"(%s = '{AUDIENCE_STAFF}' OR e.audience = '{AUDIENCE_TENANT}' "
-                 f"OR e.audience = %s)")
+# NOTE the `%s <> ''`, and it is a LEAK if it is missing. `audience_for(None)` returns `""` —
+# which is what a contact with no identity yet (pre-registration) produces — and binding that
+# raw makes `e.audience = %s` read `e.audience = ''`: TRUE for every UNCLASSIFIED row, i.e. all
+# the legacy edges the migration has not reached. The in-memory adapter said False for the same
+# input (`audience_can_read("", "")`), so the two stores disagreed in the direction that leaks.
+# `tests/test_audience_parity.py` now pins them against the one pure rule.
+_EDGE_VISIBLE = (f"(%s = '{AUDIENCE_STAFF}' "
+                 f"OR e.audience = '{AUDIENCE_TENANT}' "
+                 f"OR (%s <> '' AND e.audience = %s))")
 # NODE: DERIVED — visible when some visible edge touches it. Staff short-circuits BEFORE the
 # EXISTS, because an orphan node (no edges at all) must still be visible to staff; deriving it
 # for staff too would hide every node `ingest_entities` created before any relation existed.
 _NODE_VISIBLE = (f"""(%s = '{AUDIENCE_STAFF}' OR EXISTS (
         SELECT 1 FROM knowledge_edges e
         WHERE (e.source_id = n.id OR e.target_id = n.id) AND e.scope = n.scope
-          AND (e.audience = '{AUDIENCE_TENANT}' OR e.audience = %s)))""")
+          AND (e.audience = '{AUDIENCE_TENANT}'
+               OR (%s <> '' AND e.audience = %s))))""")
 
 
 def _edge_from_row(scope: str, row: Any) -> GraphEdge:
@@ -904,7 +921,7 @@ class PostgresKnowledgeGraph(_PgBase):
                 "n.updated_at FROM knowledge_nodes n "
                 "WHERE n.scope = %s AND lower(n.label) = lower(%s) "
                 f"AND {_NODE_VISIBLE} LIMIT 1",
-                (scope, label, audience, audience))
+                (scope, label, audience, audience, audience))
             row = await cur.fetchone()
         if not row:
             return None
@@ -921,7 +938,7 @@ class PostgresKnowledgeGraph(_PgBase):
                 "FROM knowledge_nodes n WHERE n.scope = %s AND n.embedding IS NOT NULL "
                 f"AND {_NODE_VISIBLE} "
                 "ORDER BY n.embedding <=> %s::vector LIMIT %s",
-                (scope, audience, audience, _vec(embedding), limit))
+                (scope, audience, audience, audience, _vec(embedding), limit))
             rows = await cur.fetchall()
         return [GraphNode(scope=r["scope"], label=r["label"], node_type=r["node_type"],
                           attributes=r["attributes"], id=r["id"]) for r in rows]
@@ -968,7 +985,7 @@ class PostgresKnowledgeGraph(_PgBase):
                 JOIN knowledge_nodes sn ON sn.id = e.source_id
                 JOIN knowledge_nodes tn ON tn.id = e.target_id
                 """,
-                (scope, start_label, scope, audience, audience, max_depth))
+                (scope, start_label, scope, audience, audience, audience, max_depth))
             rows = await cur.fetchall()
         return [_edge_from_row(scope, r) for r in rows]
 
@@ -992,7 +1009,7 @@ class PostgresKnowledgeGraph(_PgBase):
                    -- review found the two disagreeing and the disagreement was invisible.
                    ORDER BY e.created_at ASC, e.id ASC
                    LIMIT %s""",
-                (scope, EDGE_PROPOSED, audience, audience, limit))
+                (scope, EDGE_PROPOSED, audience, audience, audience, limit))
             rows = await cur.fetchall()
         return [_edge_from_row(scope, r) for r in rows]
 
@@ -1009,6 +1026,20 @@ class PostgresKnowledgeGraph(_PgBase):
                 (require_edge_status(status), scope, source, target, relation))
         return bool(cur.rowcount)
 
+    async def set_edge_audience(self, scope: str, source: str, target: str, relation: str,
+                                audience: str) -> bool:
+        """Explicit re-classification — the only way back from a migration."""
+        _require_scope(scope)
+        async with self._conn() as conn:
+            cur = await conn.execute(
+                """UPDATE knowledge_edges e SET audience = %s
+                   FROM knowledge_nodes sn, knowledge_nodes tn
+                   WHERE e.source_id = sn.id AND e.target_id = tn.id
+                     AND e.scope = %s AND lower(sn.label) = lower(%s)
+                     AND lower(tn.label) = lower(%s) AND e.relation = %s""",
+                (sanitize_audience(audience), scope, source, target, relation))
+        return bool(cur.rowcount)
+
     async def neighbors(self, scope: str, label: str, *, audience: str) -> list[GraphNode]:
         _require_scope(scope)
         async with self._conn() as conn:
@@ -1021,7 +1052,7 @@ class PostgresKnowledgeGraph(_PgBase):
                    WHERE n.scope = %s AND lower(n.label) = lower(%s)
                      -- an unreviewed edge still DISCLOSES its endpoint; see the in-memory twin
                      AND e.status = 'accepted'
-                     AND {_EDGE_VISIBLE}""", (scope, label, audience, audience))
+                     AND {_EDGE_VISIBLE}""", (scope, label, audience, audience, audience))
             rows = await cur.fetchall()
         return [GraphNode(scope=r["scope"], label=r["label"], node_type=r["node_type"],
                           attributes=r["attributes"], id=r["id"]) for r in rows]
@@ -1047,7 +1078,7 @@ class PostgresKnowledgeGraph(_PgBase):
                f"AND {_NODE_VISIBLE}")
         # two, and in this order: `_NODE_VISIBLE` carries `%s` twice (the staff
         # short-circuit, then the identity match) and sits immediately after `scope`.
-        params: list = [scope, audience, audience]
+        params: list = [scope, audience, audience, audience]
         if node_type is not None:
             sql += " AND n.node_type = %s"
             params.append(node_type)
@@ -1074,7 +1105,7 @@ class PostgresKnowledgeGraph(_PgBase):
                f"AND {_NODE_VISIBLE}")
         # two, and in this order: `_NODE_VISIBLE` carries `%s` twice (the staff
         # short-circuit, then the identity match) and sits immediately after `scope`.
-        params: list = [scope, audience, audience]
+        params: list = [scope, audience, audience, audience]
         if label is not None:
             sql += " AND lower(n.label) = lower(%s)"
             params.append(label.strip())
@@ -1092,7 +1123,7 @@ class PostgresKnowledgeGraph(_PgBase):
                f"AND {_NODE_VISIBLE}")
         # two, and in this order: `_NODE_VISIBLE` carries `%s` twice (the staff
         # short-circuit, then the identity match) and sits immediately after `scope`.
-        params: list = [scope, audience, audience]
+        params: list = [scope, audience, audience, audience]
         if after_id is not None:
             sql += " AND n.id > %s"
             params.append(after_id)

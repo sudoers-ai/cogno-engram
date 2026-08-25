@@ -111,7 +111,7 @@ Migrating them is a deliberate act on live data. It is **reversible** — `set_e
 second run finds nothing left to demote.
 
 ```python
-from cogno_engram import VALID_PROXIMITY_RELATIONS
+from cogno_engram import AUDIENCE_STAFF, VALID_PROXIMITY_RELATIONS
 from cogno_engram.types import EDGE_PROPOSED
 
 async def demote_extracted_proximity(kg, scope: str, *, dry_run: bool = True) -> int:
@@ -124,12 +124,14 @@ async def demote_extracted_proximity(kg, scope: str, *, dry_run: bool = True) ->
     seen, demoted = set(), 0
     after = None
     while True:
-        nodes = await kg.scan_nodes(scope, after_id=after, limit=500)
+        nodes = await kg.scan_nodes(scope, audience=AUDIENCE_STAFF,
+                                    after_id=after, limit=500)
         if not nodes:
             break
         after = nodes[-1].id
         for node in nodes:
-            for e in await kg.walk(scope, node.label, max_depth=1):
+            for e in await kg.walk(scope, node.label,
+                                   audience=AUDIENCE_STAFF, max_depth=1):
                 key = (e.source, e.target, e.relation)
                 if key in seen:
                     continue                    # a walk reaches an edge from both endpoints

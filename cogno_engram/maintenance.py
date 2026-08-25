@@ -13,8 +13,6 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from dataclasses import replace
-
 from cogno_engram.types import (
     AUDIENCE_STAFF,
     AUDIENCE_TENANT,
@@ -25,7 +23,6 @@ from cogno_engram.ports import KnowledgeGraph, MemoryStore
 from cogno_engram.types import MemoryRecord
 
 logger = logging.getLogger("cogno_engram.maintenance")
-
 
 async def prune_memories(
     store: MemoryStore,
@@ -50,7 +47,6 @@ async def prune_memories(
     logger.info("stage=maintenance event=prune_memories scope=%s removed=%d category=%s",
                 scope, deleted, category or "*")
     return deleted
-
 
 async def reembed_memories(
     store: MemoryStore,
@@ -98,7 +94,6 @@ async def reembed_memories(
     logger.info("stage=maintenance event=reembed scope=%s reprocessed=%d", scope, count)
     return count
 
-
 async def reembed_knowledge_nodes(
     kg: KnowledgeGraph,
     embedder: Any,
@@ -144,7 +139,6 @@ async def reembed_knowledge_nodes(
     logger.info("stage=maintenance event=reembed_nodes scope=%s reprocessed=%d", scope, count)
     return count
 
-
 async def _embed_all(embedder: Any, texts: "list[str]") -> "list[list[float]]":
     """Embed a list, preferring the embedder's batch path.
 
@@ -157,7 +151,6 @@ async def _embed_all(embedder: Any, texts: "list[str]") -> "list[list[float]]":
     if batch_fn is not None:
         return list(await batch_fn(texts))
     return [await embedder.embed(t) for t in texts]
-
 
 async def prune_orphan_nodes(kg: KnowledgeGraph, scope: str, *, limit: int = 1000) -> int:
     """Delete knowledge nodes with no incident edges. Returns the number deleted.
@@ -207,22 +200,32 @@ async def classify_edge_audience(
     """
     seen: set[tuple[str, str, str]] = set()
     counts = {"tenant": 0, "identity": 0, "unresolved": 0}
+    # `walk` returns ACCEPTED only, so a proposal written before the column would stay `''` and,
+    # once a human accepted it, be invisible to the very contact it is about. `pending_edges`
+    # closes that. REJECTED edges are deliberately left alone: nothing ever speaks them, and
+    # classifying a verdict nobody reads is work with no reader.
+    edges = list(await kg.pending_edges(scope, audience=AUDIENCE_STAFF, limit=100_000))
     for node in await kg.list_nodes(scope, audience=AUDIENCE_STAFF, limit=100_000):
-        for e in await kg.walk(scope, node.label, audience=AUDIENCE_STAFF, max_depth=1):
-            key = (e.source, e.target, e.relation)
-            if key in seen or sanitize_audience(e.audience):
-                continue                     # a walk reaches an edge from both endpoints
-            seen.add(key)
-            stamp = (e.source_session or "").strip()
-            if not stamp:
-                want = AUDIENCE_TENANT
-                counts["tenant"] += 1
-            else:
-                who = str(identity_of_session(stamp) or "") if identity_of_session else ""
-                want = audience_for(who) if who else ""
-                counts["identity" if want else "unresolved"] += 1
-            if want and not dry_run:
-                await kg.upsert_edge(replace(e, audience=want))
+        edges.extend(await kg.walk(scope, node.label, audience=AUDIENCE_STAFF, max_depth=1))
+    for e in edges:
+        key = (e.source, e.target, e.relation)
+        if key in seen or sanitize_audience(e.audience):
+            continue                     # a walk reaches an edge from both endpoints
+        seen.add(key)
+        stamp = (e.source_session or "").strip()
+        if not stamp:
+            want = AUDIENCE_TENANT
+            counts["tenant"] += 1
+        else:
+            who = str(identity_of_session(stamp) or "") if identity_of_session else ""
+            want = audience_for(who) if who else ""
+            counts["identity" if want else "unresolved"] += 1
+        if want and not dry_run:
+            # `set_edge_audience`, not `upsert_edge`: the latter is narrow-never-widen, so
+            # it cannot write `tenant` over `''` — and that promotion is the widest step
+            # this function takes. The explicit setter is also what makes the migration
+            # REVERSIBLE, which is the property the deploy note rests on.
+            await kg.set_edge_audience(scope, e.source, e.target, e.relation, want)
     logger.info("stage=maintenance event=classify_audience scope=%s dry_run=%s %s",
                 scope, dry_run, counts)
     return counts

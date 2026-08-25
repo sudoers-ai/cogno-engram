@@ -114,10 +114,17 @@ def test_every_audience_read_on_the_PORT_is_covered_here():
     listed above would leave this suite passing while covering less. Enumerated from the
     Protocol, not from memory."""
     covered = set(_reads(InMemoryGraph()))
+    # KEYWORD-ONLY `audience` is the mark of a READ: that is the design ("required keyword on
+    # every read that can return contact data"). `set_edge_audience` takes it POSITIONALLY
+    # because it is a write — it does not filter, it assigns — and this test caught the
+    # difference the moment that method landed, which is what it is for.
     on_port = {
         name for name, fn in inspect.getmembers(KnowledgeGraph, inspect.isfunction)
-        if "audience" in inspect.signature(fn).parameters
+        if inspect.signature(fn).parameters.get("audience", None) is not None
+        and inspect.signature(fn).parameters["audience"].kind
+        is inspect.Parameter.KEYWORD_ONLY
     }
+    assert on_port, "the enumeration found nothing — it would pass by covering zero reads"
     assert on_port <= covered, f"unprobed reads: {sorted(on_port - covered)}"
 
 

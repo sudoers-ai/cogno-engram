@@ -251,3 +251,42 @@ async def test_final_prune_honours_kg_scope():
     backend = ScriptedBackend([_mem_json()])
     await hypnos.consolidate_session(store, backend, session=session, kg=kg, kg_scope="acme")
     assert await kg.walk("acme", "A", max_depth=1) == []
+
+
+# ── Tier 2 proposals (opt-in) ─────────────────────────────────────────────
+
+def _one_edge_backend():
+    return ScriptedBackend([
+        _mem_json(fact=["o José tem um cachorro"]),
+        json.dumps({"nodes": [{"label": "José", "type": "PERSON"},
+                              {"label": "Rex", "type": "ANIMAL"}],
+                    "edges": [{"source": "José", "target": "Rex",
+                               "relation": "OWNS_PET", "confidence": 0.9}]}),
+    ])
+
+
+async def test_tier2_still_asserts_by_default():
+    """The default is load-bearing and is NOT the safest-sounding one. Flipping it would, on the
+    next deploy, silently empty the graph block of every host already running — with nothing in
+    the logs saying why. A host that has somewhere to review edges opts in."""
+    store, kg, scope, sid = InMemoryStore(), InMemoryGraph(), "acme/p", "s1"
+    await _seed(store, scope, sid, [TurnRecord(sid, scope, 1, "o cachorro do José é o Rex")])
+    await hypnos.periodic_consolidate(store, _one_edge_backend(), scope=scope, session_id=sid, kg=kg)
+
+    assert [e.relation for e in await kg.walk(scope, "José")] == ["OWNS_PET"]
+    assert await kg.pending_edges(scope) == []
+
+
+async def test_tier2_can_PROPOSE_instead_and_then_nothing_is_spoken_until_a_human_says_so():
+    store, kg, scope, sid = InMemoryStore(), InMemoryGraph(), "acme/p", "s1"
+    await _seed(store, scope, sid, [TurnRecord(sid, scope, 1, "o cachorro do José é o Rex")])
+    await hypnos.periodic_consolidate(store, _one_edge_backend(), scope=scope, session_id=sid,
+                                      kg=kg, propose_relations=True)
+
+    assert await kg.walk(scope, "José") == []                       # not in the prompt…
+    queued = await kg.pending_edges(scope)
+    assert [e.relation for e in queued] == ["OWNS_PET"]              # …waiting on a person
+    assert queued[0].source_session == sid                           # still prunable by session
+
+    await kg.set_edge_status(scope, "José", "Rex", "OWNS_PET", "accepted")
+    assert [e.relation for e in await kg.walk(scope, "José")] == ["OWNS_PET"]

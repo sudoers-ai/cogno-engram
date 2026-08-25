@@ -116,6 +116,51 @@ class GraphNode:
     updated_at: Optional[datetime] = None
 
 
+# ── Edge curation ──────────────────────────────────────────────────────────
+#
+# Who ASSERTED an edge decides whether it may be spoken. A host (or a staff member typing into
+# an admin page) asserts; an LLM extraction PROPOSES. The difference matters because a graph
+# edge becomes a sentence the agent says about a person as if it knew — "your son Pedro" is
+# either a kindness or an invention, and nothing downstream can tell which.
+EDGE_ACCEPTED = "accepted"
+EDGE_PROPOSED = "proposed"
+EDGE_REJECTED = "rejected"
+VALID_EDGE_STATUS: frozenset[str] = frozenset({EDGE_ACCEPTED, EDGE_PROPOSED, EDGE_REJECTED})
+
+# Relations that describe a PERSON's close world, as opposed to the open-vocabulary relations
+# an extraction invents about a domain. Closed so a curation UI can label them, so a walk can
+# ask for them by name, and so "has a kid" / "is father of" / "PARENT" do not become three
+# facts about one child. Not enforced on write — an open relation is still a valid edge; this
+# is the set the proximity feature knows how to render and review.
+VALID_PROXIMITY_RELATIONS: frozenset[str] = frozenset({
+    "PARENT_OF", "CHILD_OF", "SPOUSE_OF", "SIBLING_OF", "FRIEND_OF",
+    "PET_OF", "OWNS_PET", "NICKNAME_OF", "SUPPORTS", "WORKS_AT",
+    "STUDIES_AT", "LIVES_IN", "BORN_IN", "CELEBRATES", "PREFERS",
+})
+
+
+def sanitize_edge_status(raw: object) -> str:
+    """Any input → a valid status. PURE, never raises. **Absent and garbled are not the same.**
+
+    * absent (``None``/``""``) → ``accepted``. That is the back-compatible reading: an edge
+      written before this field existed, or by a caller that says nothing, keeps reaching the
+      prompt exactly as it did.
+    * a valid status → itself.
+    * anything else → ``proposed``, and this is the half a review had to point out. Folding a
+      typo into ``accepted`` **inverts the caller's intent in the one direction the feature
+      exists to prevent**: ``status="propsed"`` means someone meant to hold the edge for review,
+      and it walked straight into the prompt as an assertion instead. An unreadable intent is
+      held, not asserted — the cost of guessing wrong that way is a queue entry.
+    """
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return EDGE_ACCEPTED
+    try:
+        text = str(raw).strip().lower()
+    except Exception:                       # noqa: BLE001 — a hostile __str__ is data
+        return EDGE_PROPOSED
+    return text if text in VALID_EDGE_STATUS else EDGE_PROPOSED
+
+
 @dataclass
 class GraphEdge:
     scope: str
@@ -125,6 +170,29 @@ class GraphEdge:
     confidence: float = 1.0
     # The session that asserted this edge — the key for feedback-driven pruning.
     source_session: str = ""
+    # Free-form detail the relation alone cannot carry: "Pedro" is a CHILD_OF edge, but
+    # ``{"age": 8, "note": "joga futebol no sábado"}`` is what makes the agent sound like it
+    # remembers rather than like it queried a database.
+    attributes: dict = field(default_factory=dict)
+    # Curation state. ``accepted`` edges are the only ones a walk returns — see the port.
+    status: str = EDGE_ACCEPTED
+
+    def __post_init__(self) -> None:
+        """One normalisation, both stores.
+
+        It used to live on the Postgres write path only, so the two adapters disagreed on any
+        non-canonical value: ``status="Accepted"`` walked fine out of Postgres and, in memory,
+        was invisible to ``walk()`` **and** absent from ``pending_edges()`` — an edge in a black
+        hole, un-renderable and un-reviewable, with no error anywhere. Normalising in the type
+        means neither store can be the one that gets it right.
+
+        ``attributes`` is coerced here for the same reason: ``None`` is accepted in memory and
+        becomes ``'null'::jsonb`` in Postgres, where the NEXT upsert's ``||`` merge fails on
+        concatenating an object with a scalar — a divergence that only surfaces in production.
+        """
+        self.status = sanitize_edge_status(self.status)
+        if not isinstance(self.attributes, dict):
+            self.attributes = {}
 
 
 @dataclass

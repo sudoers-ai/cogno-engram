@@ -32,6 +32,9 @@ import psycopg
 from psycopg.rows import dict_row
 
 from cogno_engram.types import (
+    EDGE_ACCEPTED,
+    EDGE_PROPOSED,
+    sanitize_edge_status,
     GraphEdge,
     GraphNode,
     HybridWeights,
@@ -199,16 +202,31 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
             relation       text NOT NULL,
             confidence     real NOT NULL DEFAULT 1.0,
             source_session text NOT NULL DEFAULT '',
+            attributes     jsonb NOT NULL DEFAULT '{}',
+            status         text NOT NULL DEFAULT 'accepted',
             created_at     timestamptz NOT NULL DEFAULT now(),
             UNIQUE (source_id, target_id, relation)
         )
         """
     )
+    # ── migration for databases created before edge curation ──────────────
+    # `CREATE TABLE IF NOT EXISTS` above is a NO-OP against a live table, so a deployment that
+    # already has a graph would get the new code and none of the columns. Additive and
+    # idempotent: the DEFAULT backfills every existing edge as `accepted`, which is what it
+    # was — nothing a host already asserted becomes unreviewed overnight.
+    for alter in (
+        "ALTER TABLE knowledge_edges ADD COLUMN IF NOT EXISTS attributes jsonb NOT NULL DEFAULT '{}'",
+        "ALTER TABLE knowledge_edges ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'accepted'",
+    ):
+        await conn.execute(alter)
+
     # ── indexes (see engram-blueprint indexing strategy) ──
     stmts = [
         # Case-insensitive node identity (matches the in-memory adapter's dedup).
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_nodes_scope_label_type "
         "ON knowledge_nodes (scope, lower(label), node_type)",
+        # The curation queue reads one status within one scope; the prompt walk reads the other.
+        "CREATE INDEX IF NOT EXISTS idx_edges_scope_status ON knowledge_edges (scope, status)",
         "CREATE INDEX IF NOT EXISTS idx_sessions_scope_time ON sessions (scope, started_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_turns_scope_time ON turns (scope, created_at DESC, id DESC)",
         "CREATE INDEX IF NOT EXISTS idx_turns_session ON turns (session_id, turn_n)",
@@ -661,6 +679,16 @@ class PostgresStore(_PgBase):
                 await conn.execute("SELECT pg_advisory_unlock(%s)", (lock_id,))
 
 
+def _edge_from_row(scope: str, row: Any) -> GraphEdge:
+    """One place turns a row into an edge. Written when the third read path appeared: three
+    hand-built constructors is how one of them silently stops carrying a new column."""
+    return GraphEdge(scope=scope, source=row["source"], target=row["target"],
+                     relation=row["relation"], confidence=row["confidence"],
+                     source_session=row["source_session"],
+                     attributes=row.get("attributes") or {},
+                     status=row.get("status") or EDGE_ACCEPTED)
+
+
 class PostgresKnowledgeGraph(_PgBase):
     """Reference ``KnowledgeGraph`` — typed nodes + edges + recursive-CTE walk.
 
@@ -715,12 +743,23 @@ class PostgresKnowledgeGraph(_PgBase):
             tgt = await self._resolve_node_id(conn, edge.scope, edge.target)
             await conn.execute(
                 """INSERT INTO knowledge_edges
-                   (scope, source_id, target_id, relation, confidence, source_session)
-                   VALUES (%s, %s, %s, %s, %s, %s)
+                   (scope, source_id, target_id, relation, confidence, source_session,
+                    attributes, status)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
                    ON CONFLICT (source_id, target_id, relation) DO UPDATE SET
                        confidence     = GREATEST(knowledge_edges.confidence, EXCLUDED.confidence),
-                       source_session = EXCLUDED.source_session""",
-                (edge.scope, src, tgt, edge.relation, edge.confidence, edge.source_session))
+                       source_session = EXCLUDED.source_session,
+                       -- merge, never replace: a re-extraction must not wipe what a human typed
+                       attributes     = knowledge_edges.attributes || EXCLUDED.attributes,
+                       -- a re-assertion PROMOTES a proposal and never demotes a verdict;
+                       -- `rejected` is sticky on purpose (see the in-memory twin: this path
+                       -- cannot tell a deliberate correction from the LLM re-emitting the same
+                       -- edge, so `set_edge_status` is the only way back)
+                       status         = CASE WHEN knowledge_edges.status = 'proposed'
+                                             THEN EXCLUDED.status ELSE knowledge_edges.status END""",
+                (edge.scope, src, tgt, edge.relation, edge.confidence, edge.source_session,
+                 json.dumps(edge.attributes or {}, default=str),
+                 sanitize_edge_status(edge.status)))
 
     async def find_node(self, scope: str, label: str) -> Optional[GraphNode]:
         _require_scope(scope)
@@ -772,11 +811,13 @@ class PostgresKnowledgeGraph(_PgBase):
                         FROM knowledge_edges e
                         WHERE (e.source_id = w.node_id OR e.target_id = w.node_id)
                           AND e.scope = %s
+                          -- an unreviewed edge must not decide what the walk can REACH either
+                          AND e.status = 'accepted'
                     ) nxt ON true
                     WHERE w.depth < %s AND NOT (nxt.node_id = ANY(w.path))
                 )
                 SELECT DISTINCT e.id, sn.label AS source, tn.label AS target,
-                       e.relation, e.confidence, e.source_session
+                       e.relation, e.confidence, e.source_session, e.attributes, e.status
                 FROM walk w
                 JOIN knowledge_edges e ON e.id = w.edge_id
                 JOIN knowledge_nodes sn ON sn.id = e.source_id
@@ -784,9 +825,41 @@ class PostgresKnowledgeGraph(_PgBase):
                 """,
                 (scope, start_label, scope, max_depth))
             rows = await cur.fetchall()
-        return [GraphEdge(scope=scope, source=r["source"], target=r["target"],
-                          relation=r["relation"], confidence=r["confidence"],
-                          source_session=r["source_session"]) for r in rows]
+        return [_edge_from_row(scope, r) for r in rows]
+
+    async def pending_edges(self, scope: str, *, limit: int = 100) -> list[GraphEdge]:
+        _require_scope(scope)
+        async with self._conn() as conn:
+            cur = await conn.execute(
+                """SELECT sn.label AS source, tn.label AS target, e.relation, e.confidence,
+                          e.source_session, e.attributes, e.status
+                   FROM knowledge_edges e
+                   JOIN knowledge_nodes sn ON sn.id = e.source_id
+                   JOIN knowledge_nodes tn ON tn.id = e.target_id
+                   WHERE e.scope = %s AND e.status = %s
+                   -- OLDEST first, and the direction is the point: with a `limit` and no
+                   -- cursor, newest-first makes the oldest proposals — the ones a curator most
+                   -- needs to clear — permanently unreachable, and the queue never drains. The
+                   -- in-memory adapter returns insertion order, which is the same thing; a
+                   -- review found the two disagreeing and the disagreement was invisible.
+                   ORDER BY e.created_at ASC, e.id ASC
+                   LIMIT %s""",
+                (scope, EDGE_PROPOSED, limit))
+            rows = await cur.fetchall()
+        return [_edge_from_row(scope, r) for r in rows]
+
+    async def set_edge_status(self, scope: str, source: str, target: str, relation: str,
+                              status: str) -> bool:
+        _require_scope(scope)
+        async with self._conn() as conn:
+            cur = await conn.execute(
+                """UPDATE knowledge_edges e SET status = %s
+                   FROM knowledge_nodes sn, knowledge_nodes tn
+                   WHERE e.source_id = sn.id AND e.target_id = tn.id
+                     AND e.scope = %s AND lower(sn.label) = lower(%s)
+                     AND lower(tn.label) = lower(%s) AND e.relation = %s""",
+                (sanitize_edge_status(status), scope, source, target, relation))
+        return bool(cur.rowcount)
 
     async def neighbors(self, scope: str, label: str) -> list[GraphNode]:
         _require_scope(scope)
@@ -797,7 +870,9 @@ class PostgresKnowledgeGraph(_PgBase):
                    JOIN knowledge_edges e ON (e.source_id = n.id OR e.target_id = n.id)
                    JOIN knowledge_nodes nn
                      ON nn.id = CASE WHEN e.source_id = n.id THEN e.target_id ELSE e.source_id END
-                   WHERE n.scope = %s AND lower(n.label) = lower(%s)""", (scope, label))
+                   WHERE n.scope = %s AND lower(n.label) = lower(%s)
+                     -- an unreviewed edge still DISCLOSES its endpoint; see the in-memory twin
+                     AND e.status = 'accepted'""", (scope, label))
             rows = await cur.fetchall()
         return [GraphNode(scope=r["scope"], label=r["label"], node_type=r["node_type"],
                           attributes=r["attributes"], id=r["id"]) for r in rows]

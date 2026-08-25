@@ -25,6 +25,7 @@ from uuid import uuid4
 import pytest
 
 psycopg = pytest.importorskip("psycopg")
+from psycopg.rows import dict_row  # noqa: E402
 
 from cogno_engram.adapters.postgres import (  # noqa: E402
     PostgresKnowledgeGraph,
@@ -461,3 +462,170 @@ async def test_hash_partitioning_roundtrip():
     await store.save_memory(MemoryRecord(scope, "fact", "x", embedding=[1.0] + [0.0] * (EMB_DIM - 1)))
     out = await store.load_memories(scope, query=RetrievalQuery(text="x"))
     assert out and out[0].content == "x"
+
+
+# ── edge curation: the two adapters must agree ────────────────────────────
+#
+# Every behaviour below is pinned against the in-memory adapter in `test_edge_curation.py`.
+# Repeated here because the invariant lives in two implementations — an in-Python `continue`
+# and a SQL predicate inside a recursive CTE — and "the prompt never carries an unreviewed
+# claim about a person" is not a guarantee one of them may hold alone.
+
+async def test_pg_walk_excludes_a_proposal_and_the_hop_behind_it(graph):
+    scope = "tenant:acme|identity:jose"
+    await graph.upsert_edge(GraphEdge(scope, "José", "Rex", "OWNS_PET", status="proposed"))
+    await graph.upsert_edge(GraphEdge(scope, "Rex", "Pastor Alemão", "BREED"))
+
+    assert await graph.walk(scope, "José", max_depth=3) == []
+
+    assert await graph.set_edge_status(scope, "José", "Rex", "OWNS_PET", "accepted")
+    reached = {e.target for e in await graph.walk(scope, "José", max_depth=3)}
+    assert reached == {"Rex", "Pastor Alemão"}
+
+
+async def test_pg_queue_holds_only_proposals_and_carries_the_detail(graph):
+    scope = "tenant:acme|identity:jose"
+    await graph.upsert_edge(GraphEdge(scope, "José", "Pedro", "PARENT_OF",
+                                      attributes={"age": 8}))
+    await graph.upsert_edge(GraphEdge(scope, "José", "Rex", "OWNS_PET",
+                                      attributes={"note": "vira-lata caramelo"},
+                                      status="proposed"))
+
+    queued = await graph.pending_edges(scope)
+    assert [e.target for e in queued] == ["Rex"]
+    assert queued[0].attributes == {"note": "vira-lata caramelo"}   # the jsonb round-trips
+
+
+async def test_pg_reassertion_merges_and_promotes_but_never_demotes(graph):
+    scope = "tenant:acme|identity:jose"
+    await graph.upsert_edge(GraphEdge(scope, "José", "Pedro", "PARENT_OF",
+                                      attributes={"note": "joga futebol"}, status="proposed"))
+    # a human asserts the same edge: merge the detail, promote the status
+    await graph.upsert_edge(GraphEdge(scope, "José", "Pedro", "PARENT_OF",
+                                      attributes={"age": 8}))
+    edge = (await graph.walk(scope, "José"))[0]
+    assert edge.attributes == {"note": "joga futebol", "age": 8} and edge.status == "accepted"
+
+    # the next extraction proposes it again — a verdict does not expire on its own
+    await graph.upsert_edge(GraphEdge(scope, "José", "Pedro", "PARENT_OF", status="proposed"))
+    assert (await graph.walk(scope, "José"))[0].status == "accepted"
+    assert await graph.pending_edges(scope) == []
+
+
+async def test_pg_verdict_on_an_absent_edge_is_reported(graph):
+    scope = "tenant:acme|identity:jose"
+    assert await graph.set_edge_status(scope, "José", "Ninguém", "OWNS_PET", "accepted") is False
+
+
+async def test_an_existing_database_GETS_the_new_columns_and_keeps_its_edges(pg):
+    """The half that only breaks in production, and only once.
+
+    Takes ``pg`` — which it does not otherwise need — because that fixture is what carries the
+    module's skip. Without it this test never reaches the skip path: with ``ENGRAM_TEST_DSN``
+    unset, ``psycopg.connect("")`` falls back to libpq's own defaults (``PGHOST``/``PGDATABASE``,
+    then the OS user's database) and the FIRST statement below is ``DROP SCHEMA public CASCADE``.
+    A review caught it; on a box with a local Postgres it would have connected. `conftest`'s
+    2026-08-04 guard does not cover this path — it returns early precisely when the DSN is empty,
+    on the reasoning that "those modules skip on their own", which this test did not.
+
+    `CREATE TABLE IF NOT EXISTS` is a NO-OP against a live table, so without the `ALTER TABLE`
+    statements the new code would ship to a deployment that already has a graph and find the
+    columns missing — a 500 on the first walk. And the backfill direction is load-bearing: the
+    DEFAULT is `accepted`, so an edge the host asserted before curation existed keeps being
+    spoken. Backfilling to `proposed` would mute every existing graph until someone reviewed it
+    one by one, which is the same outage wearing a policy's clothes.
+
+    Manages its own connection and schema: the shared fixture creates the CURRENT tables, which
+    is precisely the state this test must not start from.
+    """
+    # Belt AND braces: the fixture already skips, and this refuses to aim a DROP at whatever
+    # libpq would pick. A destructive test may not depend on one guard.
+    assert DSN, "refusing to run a schema-dropping test without an explicit ENGRAM_TEST_DSN"
+
+    old_schema = """
+        DROP SCHEMA public CASCADE; CREATE SCHEMA public;
+        CREATE EXTENSION IF NOT EXISTS vector;
+        CREATE TABLE knowledge_nodes (
+            id bigserial PRIMARY KEY, scope text NOT NULL, label text NOT NULL,
+            node_type text NOT NULL DEFAULT 'CONCEPT', attributes jsonb NOT NULL DEFAULT '{}',
+            embedding vector(8), created_at timestamptz DEFAULT now(),
+            updated_at timestamptz DEFAULT now());
+        CREATE UNIQUE INDEX uq_nodes_scope_label_type
+            ON knowledge_nodes (scope, lower(label), node_type);
+        CREATE TABLE knowledge_edges (
+            id bigserial PRIMARY KEY, scope text NOT NULL,
+            source_id bigint NOT NULL REFERENCES knowledge_nodes(id) ON DELETE CASCADE,
+            target_id bigint NOT NULL REFERENCES knowledge_nodes(id) ON DELETE CASCADE,
+            relation text NOT NULL, confidence real NOT NULL DEFAULT 1.0,
+            source_session text NOT NULL DEFAULT '', created_at timestamptz DEFAULT now(),
+            UNIQUE (source_id, target_id, relation));
+        INSERT INTO knowledge_nodes (scope, label) VALUES ('t:mig', 'Jose'), ('t:mig', 'Pedro');
+        INSERT INTO knowledge_edges (scope, source_id, target_id, relation)
+            VALUES ('t:mig', 1, 2, 'PARENT_OF');
+    """
+
+    async def columns(conn) -> set:
+        cur = await conn.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name = 'knowledge_edges'")
+        return {r["column_name"] for r in await cur.fetchall()}
+
+    async with await psycopg.AsyncConnection.connect(
+            pg, row_factory=dict_row, autocommit=True) as conn:
+        await conn.execute(old_schema)
+        assert not {"attributes", "status"} & await columns(conn)     # the pre-curation world
+
+        await ensure_schema(conn, embedding_dim=EMB_DIM)
+        assert {"attributes", "status"} <= await columns(conn)
+
+        cur = await conn.execute("SELECT status, attributes FROM knowledge_edges")
+        row = await cur.fetchone()
+        assert row["status"] == "accepted" and row["attributes"] == {}
+
+    # ...and it is still spoken
+    kg = PostgresKnowledgeGraph(dsn=pg)
+    assert [(e.relation, e.status) for e in await kg.walk("t:mig", "Jose")] == \
+        [("PARENT_OF", "accepted")]
+
+
+async def test_pg_a_proposal_leaks_through_neither_neighbors_nor_node_context(graph):
+    """Both were unfiltered — `neighbors` in both adapters, `get_node_context` in the in-memory
+    one only. `NodeContext` hands edges and neighbors to the same caller, so filtering one and
+    not the other leaks the association through the other field."""
+    scope = "tenant:acme|identity:jose"
+    await graph.upsert_edge(GraphEdge(scope, "José", "Pedro", "PARENT_OF", status="proposed"))
+
+    assert await graph.neighbors(scope, "José") == []
+    ctx = await graph.get_node_context(scope, "José")
+    assert ctx is not None and ctx.edges == [] and ctx.neighbors == []
+
+
+async def test_pg_queue_drains_oldest_first(graph):
+    """The two adapters disagreed on ordering and the disagreement was invisible: newest-first
+    plus a `limit` makes the oldest proposals permanently unreachable."""
+    scope = "tenant:acme|identity:jose"
+    for i in range(5):
+        await graph.upsert_edge(GraphEdge(scope, "José", f"Contato {i}", "FRIEND_OF",
+                                          status="proposed"))
+    assert [e.target for e in await graph.pending_edges(scope, limit=2)] == \
+        ["Contato 0", "Contato 1"]
+
+
+async def test_pg_a_value_json_cannot_serialise_does_not_take_the_turn_down(graph):
+    """A host stamping a `datetime`/`UUID` wrote fine in memory and raised `TypeError` here —
+    a divergence that only surfaces in production."""
+    from datetime import datetime
+    scope = "tenant:acme|identity:jose"
+    await graph.upsert_edge(GraphEdge(scope, "José", "Pedro", "PARENT_OF",
+                                      attributes={"since": datetime(2020, 1, 1)}))
+    edge = (await graph.walk(scope, "José"))[0]
+    assert "2020-01-01" in str(edge.attributes["since"])
+
+
+async def test_pg_an_explicit_None_attributes_does_not_poison_the_next_merge(graph):
+    """`json.dumps(None)` → `'null'::jsonb` passes NOT NULL, and then the NEXT upsert's `||`
+    fails on concatenating an object with a scalar."""
+    scope = "tenant:acme|identity:jose"
+    await graph.upsert_edge(GraphEdge(scope, "José", "Pedro", "PARENT_OF", attributes=None))
+    await graph.upsert_edge(GraphEdge(scope, "José", "Pedro", "PARENT_OF", attributes={"age": 8}))
+    assert (await graph.walk(scope, "José"))[0].attributes == {"age": 8}

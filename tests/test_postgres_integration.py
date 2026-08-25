@@ -670,10 +670,14 @@ async def test_admin_traces_a_scope_with_LIKE_metacharacters_does_not_leak(store
     prefixo = f"t{marca}_a"                       # `_` é curinga de UM caractere no LIKE
     intrusos = [f"t{marca}Xa/u1", f"t{marca}za/u1", f"t{marca}-a/u1"]
 
-    await store.save_turn_trace(TurnTrace("s-own", prefixo, 0, {"quem": "dono"}))
-    await store.save_turn_trace(TurnTrace("s-kid", f"{prefixo}/filho", 1, {"quem": "filho"}))
+    # `turn_traces.session_id` é UUID no schema — string livre rebenta com
+    # InvalidTextRepresentation. O in-memory aceita qualquer string, e foi por isso que a
+    # primeira versão passou 196 verdes sem nunca tocar o banco.
+    await store.save_turn_trace(TurnTrace(str(uuid4()), prefixo, 0, {"quem": "dono"}))
+    await store.save_turn_trace(TurnTrace(str(uuid4()), f"{prefixo}/filho", 1,
+                                          {"quem": "filho"}))
     for i, alheio in enumerate(intrusos):
-        await store.save_turn_trace(TurnTrace(f"s-x{i}", alheio, 2 + i, {"quem": alheio}))
+        await store.save_turn_trace(TurnTrace(str(uuid4()), alheio, 2 + i, {"quem": alheio}))
 
     rows, total = await store.admin_traces(prefixo)
     voltaram = {r.scope for r in rows}
@@ -697,8 +701,9 @@ async def test_admin_traces_the_since_window_applies_to_the_PREFIX_row_too(store
 
     tenant = f"t{uuid4().hex[:8]}"
     t0 = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
-    await store.save_turn_trace(TurnTrace("s0", tenant, 0, {"quando": "velho"}, created_at=t0))
-    await store.save_turn_trace(TurnTrace("s1", f"{tenant}/u1", 1, {"quando": "novo"},
+    await store.save_turn_trace(TurnTrace(str(uuid4()), tenant, 0, {"quando": "velho"},
+                                          created_at=t0))
+    await store.save_turn_trace(TurnTrace(str(uuid4()), f"{tenant}/u1", 1, {"quando": "novo"},
                                           created_at=t0 + timedelta(hours=2)))
 
     rows, total = await store.admin_traces(tenant, since=t0 + timedelta(hours=1))

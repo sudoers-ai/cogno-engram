@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- `MemoryStore.admin_traces(scope_prefix, *, since=None, limit=1000, offset=0)` — the
+  turn traces of a scope SUBTREE, newest-first, with an inclusive `since` and a total.
+  `traces_for_session` reads one session; an audit over a tenant's whole history (or a
+  janitor pass over "everything since T") had to enumerate sessions through the
+  300-row `admin_turns` window. Same subtree semantics and pagination shape as
+  `admin_turns`; implemented on the Postgres and in-memory adapters. **Contract change:**
+  a third-party `MemoryStore` adapter must add the method to satisfy the Protocol.
+- `PostgresStore.save_turn_trace` now honours `TurnTrace.created_at` when set (the
+  in-memory adapter always did); absent, the column default stamps the row as before.
+  A backfilled or imported trace no longer reads as "now", so a `since` window over it
+  means what it says.
+
 ## 0.1.1 — 2026-08-02
 
 Maintenance ops for an embedding-model switch.

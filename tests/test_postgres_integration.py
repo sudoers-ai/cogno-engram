@@ -117,6 +117,29 @@ async def test_turn_trace_jsonb_roundtrip_and_upsert(store):
     assert len(got) == 1 and got[0].trace["ner"]["intent"] == "SOCIAL"
 
 
+async def test_admin_traces_subtree_since_and_pagination(store):
+    """Mirror of the in-memory contract on the real adapter: subtree (not prefix) match,
+    newest-first, inclusive ``since``, total independent of the page."""
+    from datetime import datetime, timedelta, timezone
+
+    from cogno_engram.types import TurnTrace
+
+    tenant = f"t{uuid4().hex[:8]}"
+    t0 = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
+    sids = [str(uuid4()) for _ in range(4)]
+    for i, (scope, sid) in enumerate([(f"{tenant}/u1", sids[0]), (f"{tenant}/u1", sids[0]),
+                                      (f"{tenant}/u2", sids[1]), (f"{tenant}x/u9", sids[2]),
+                                      (f"other/{tenant}", sids[3])]):
+        await store.save_turn_trace(TurnTrace(sid, scope, i, {"i": i},
+                                              created_at=t0 + timedelta(hours=i)))
+    rows, total = await store.admin_traces(tenant)
+    assert total == 3 and [r.trace["i"] for r in rows] == [2, 1, 0]
+    rows, total = await store.admin_traces(tenant, since=t0 + timedelta(hours=1))
+    assert total == 2 and [r.trace["i"] for r in rows] == [2, 1]
+    rows, total = await store.admin_traces(tenant, limit=1, offset=2)
+    assert total == 3 and [r.trace["i"] for r in rows] == [0]
+
+
 async def test_admin_turns_subtree_pagination_and_scopes(store):
     # a unique tenant prefix so the assertion is isolated from other tests' rows
     tenant = f"adm{uuid4().hex[:8]}"

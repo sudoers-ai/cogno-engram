@@ -431,10 +431,16 @@ class PostgresStore(_PgBase):
         _require_scope(trace.scope)
         async with self._conn() as conn:
             await conn.execute(
-                "INSERT INTO turn_traces (scope, session_id, turn_n, trace) "
-                "VALUES (%s, %s, %s, %s::jsonb) "
+                # ``created_at`` is honoured when the caller sets it (a backfill, an import,
+                # a test seeding history); absent, the column default stamps the row. The
+                # in-memory adapter always did this — the Postgres one silently dropped it,
+                # which made every imported trace "now" and any time-window read over them a
+                # lie.
+                "INSERT INTO turn_traces (scope, session_id, turn_n, trace, created_at) "
+                "VALUES (%s, %s, %s, %s::jsonb, COALESCE(%s, now())) "
                 "ON CONFLICT (scope, session_id, turn_n) DO UPDATE SET trace = EXCLUDED.trace",
-                (trace.scope, trace.session_id, trace.turn_n, json.dumps(trace.trace)))
+                (trace.scope, trace.session_id, trace.turn_n, json.dumps(trace.trace),
+                 trace.created_at))
 
     async def traces_for_session(self, session_id: str, *, scope: str = "") -> list["TurnTrace"]:
         async with self._conn() as conn:
@@ -506,6 +512,26 @@ class PostgresStore(_PgBase):
                 (scope_prefix, like))
             rows = await cur.fetchall()
         return [r["scope"] for r in rows]
+
+    async def admin_traces(self, scope_prefix: str, *, since: Optional[datetime] = None,
+                           limit: int = 1000, offset: int = 0) -> "tuple[list[TurnTrace], int]":
+        _require_scope(scope_prefix)
+        like = self._subtree_like(scope_prefix)
+        where = f"{self._SUBTREE}" + (" AND created_at >= %s" if since is not None else "")
+        params: tuple = (scope_prefix, like) + ((since,) if since is not None else ())
+        async with self._conn() as conn:
+            cur = await conn.execute(
+                "SELECT scope, session_id, turn_n, trace, created_at FROM turn_traces "
+                f"WHERE {where} ORDER BY created_at DESC, session_id DESC, turn_n DESC "
+                "LIMIT %s OFFSET %s", params + (limit, offset))
+            rows = await cur.fetchall()
+            ccur = await conn.execute(
+                f"SELECT count(*) AS c FROM turn_traces WHERE {where}", params)
+            crow = await ccur.fetchone()
+        total = int(crow["c"]) if crow else 0
+        return ([TurnTrace(session_id=str(r["session_id"]), scope=r["scope"], turn_n=r["turn_n"],
+                           trace=r["trace"] or {}, created_at=r["created_at"]) for r in rows],
+                total)
 
     @staticmethod
     def _row_to_turn(r: dict) -> TurnRecord:

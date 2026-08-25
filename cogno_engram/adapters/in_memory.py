@@ -219,6 +219,14 @@ class InMemoryStore:
         _require_scope(scope_prefix)
         return sorted({t.scope for t in self._turns if self._under(t.scope, scope_prefix)})
 
+    async def admin_traces(self, scope_prefix: str, *, since: Optional[datetime] = None,
+                           limit: int = 1000, offset: int = 0) -> "tuple[list[TurnTrace], int]":
+        _require_scope(scope_prefix)
+        rows = [t for t in self._traces if self._under(t.scope, scope_prefix)
+                and (since is None or (t.created_at or _now()) >= since)]
+        rows.sort(key=lambda t: (t.created_at or _now(), t.session_id, t.turn_n), reverse=True)
+        return rows[offset:offset + limit], len(rows)
+
     # ── memories ─────────────────────────────────────────────────────────
     async def save_memory(self, memory: MemoryRecord) -> None:
         _require_scope(memory.scope)

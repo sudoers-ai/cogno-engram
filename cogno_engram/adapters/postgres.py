@@ -34,6 +34,7 @@ from psycopg.rows import dict_row
 from cogno_engram.types import (
     EDGE_ACCEPTED,
     EDGE_PROPOSED,
+    require_edge_status,
     sanitize_edge_status,
     GraphEdge,
     GraphNode,
@@ -214,11 +215,24 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
     # already has a graph would get the new code and none of the columns. Additive and
     # idempotent: the DEFAULT backfills every existing edge as `accepted`, which is what it
     # was — nothing a host already asserted becomes unreviewed overnight.
-    for alter in (
-        "ALTER TABLE knowledge_edges ADD COLUMN IF NOT EXISTS attributes jsonb NOT NULL DEFAULT '{}'",
-        "ALTER TABLE knowledge_edges ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'accepted'",
+    # Asked BEFORE altering: `ADD COLUMN IF NOT EXISTS` is a no-op when the column is there, but
+    # it still takes an ACCESS EXCLUSIVE lock on `knowledge_edges` — so several workers booting
+    # against a live graph queue every reader behind a statement that changes nothing. The
+    # catalogue read is cheap and takes no lock.
+    # Existence asked per column with a bare `SELECT 1`, whose ROW is truthy whatever row
+    # factory the caller configured — `ensure_schema` runs on a plain connection here and on a
+    # `dict_row` one elsewhere, and reading a column by NAME crashed on the tuple shape.
+    for column, ddl in (
+        ("attributes",
+         "ALTER TABLE knowledge_edges ADD COLUMN IF NOT EXISTS attributes jsonb NOT NULL DEFAULT '{}'"),
+        ("status",
+         "ALTER TABLE knowledge_edges ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'accepted'"),
     ):
-        await conn.execute(alter)
+        cur = await conn.execute(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name = 'knowledge_edges' AND column_name = %s", (column,))
+        if await cur.fetchone() is None:
+            await conn.execute(ddl)
 
     # ── indexes (see engram-blueprint indexing strategy) ──
     stmts = [
@@ -749,8 +763,16 @@ class PostgresKnowledgeGraph(_PgBase):
                    ON CONFLICT (source_id, target_id, relation) DO UPDATE SET
                        confidence     = GREATEST(knowledge_edges.confidence, EXCLUDED.confidence),
                        source_session = EXCLUDED.source_session,
-                       -- merge, never replace: a re-extraction must not wipe what a human typed
-                       attributes     = knowledge_edges.attributes || EXCLUDED.attributes,
+                       -- merge, never replace: a re-extraction must not wipe what a human
+                       -- typed. And a PROPOSAL cannot modify a VERDICT in any field: the gate
+                       -- covered `status` alone while attributes merged straight through, and
+                       -- `_detail` renders attributes into the prompt — a caller that marked
+                       -- the whole edge unreviewed had its relation held and its free text
+                       -- SPOKEN. Reviewed means reviewed as it stood.
+                       attributes     = CASE
+                           WHEN knowledge_edges.status = 'accepted' AND EXCLUDED.status = 'proposed'
+                           THEN knowledge_edges.attributes
+                           ELSE knowledge_edges.attributes || EXCLUDED.attributes END,
                        -- a re-assertion PROMOTES a proposal and never demotes a verdict;
                        -- `rejected` is sticky on purpose (see the in-memory twin: this path
                        -- cannot tell a deliberate correction from the LLM re-emitting the same
@@ -829,6 +851,8 @@ class PostgresKnowledgeGraph(_PgBase):
 
     async def pending_edges(self, scope: str, *, limit: int = 100) -> list[GraphEdge]:
         _require_scope(scope)
+        if limit <= 0:          # a negative LIMIT raises here and truncated in memory; agree
+            return []
         async with self._conn() as conn:
             cur = await conn.execute(
                 """SELECT sn.label AS source, tn.label AS target, e.relation, e.confidence,
@@ -858,7 +882,7 @@ class PostgresKnowledgeGraph(_PgBase):
                    WHERE e.source_id = sn.id AND e.target_id = tn.id
                      AND e.scope = %s AND lower(sn.label) = lower(%s)
                      AND lower(tn.label) = lower(%s) AND e.relation = %s""",
-                (sanitize_edge_status(status), scope, source, target, relation))
+                (require_edge_status(status), scope, source, target, relation))
         return bool(cur.rowcount)
 
     async def neighbors(self, scope: str, label: str) -> list[GraphNode]:

@@ -256,3 +256,86 @@ async def test_a_rejected_edge_is_NOT_resurrected_by_the_next_extraction(kg):
 
     assert await kg.set_edge_status(SCOPE, "José", "Pedro", "PARENT_OF", EDGE_ACCEPTED)
     assert [e.target for e in await kg.walk(SCOPE, "José")] == ["Pedro"]
+
+
+# ── the two ways a verification found to break the invariant ──────────────
+
+@pytest.mark.parametrize("not_a_verdict", [None, "", "   ", "acepted", "sim", 3, ["accepted"]])
+async def test_a_MISSING_verdict_does_not_publish_the_edge(kg, not_a_verdict):
+    """The inversion a review measured: a TYPO'd verdict was safely held as `proposed`, while a
+    MISSING one published the unreviewed edge — and returned `True`, so the curation UI showed
+    success.
+
+    `sanitize_edge_status` answers a STORAGE question (an edge with no status predates the
+    field, so `accepted` is back-compat). `set_edge_status` answers a VERDICT question, where
+    there is no legacy caller and "absent" means nobody decided. Reusing one for the other is
+    what put an unreviewed claim in the prompt."""
+    await kg.upsert_edge(edge("José", "Pedro", "PARENT_OF", status=EDGE_PROPOSED))
+    with pytest.raises(ValueError, match="not a verdict"):
+        await kg.set_edge_status(SCOPE, "José", "Pedro", "PARENT_OF", not_a_verdict)
+    assert await kg.walk(SCOPE, "José") == []
+    assert [e.target for e in await kg.pending_edges(SCOPE)] == ["Pedro"]
+
+
+async def test_a_PROPOSAL_cannot_modify_a_VERDICT_in_any_field(kg):
+    """The gate covered `status` and not `attributes` — and `_detail` renders attributes into
+    the prompt. Measured: a human asserts the relation, the next pass proposes the same edge
+    carrying `{"note": "expelled from school for cheating"}`; the status correctly stays
+    accepted and the queue stays empty, and the prompt says the note.
+
+    Reviewed means reviewed AS IT STOOD. A proposal with something to add needs its own turn
+    through the queue."""
+    await kg.upsert_edge(edge("José", "Pedro", "PARENT_OF", attributes={"age": 8}))
+    await kg.upsert_edge(edge("José", "Pedro", "PARENT_OF", status=EDGE_PROPOSED,
+                              attributes={"note": "expulso da escola por cola"}))
+
+    spoken = format_graph_context(await kg.walk(SCOPE, "José"))
+    assert "expulso" not in spoken and "age: 8" in spoken
+    assert await kg.pending_edges(SCOPE) == []      # ...and it did not sneak into the queue
+
+
+async def test_the_queue_hands_out_COPIES_not_the_stored_edge(kg):
+    """Postgres builds fresh rows; this returned live references, so a curation UI that edited a
+    queue item published the edge in one store and did nothing in the other — the two
+    disagreeing on exactly the invariant this feature is."""
+    await kg.upsert_edge(edge("José", "Pedro", "PARENT_OF", status=EDGE_PROPOSED))
+    queued = (await kg.pending_edges(SCOPE))[0]
+    queued.status = EDGE_ACCEPTED               # a UI editing what it was handed
+    assert await kg.walk(SCOPE, "José") == []   # ...changes nothing until it says so
+
+
+async def test_a_non_positive_limit_means_EMPTY_in_both_stores(kg):
+    """Postgres raises on a negative LIMIT and this truncated. A curator paginating with
+    `limit = cap - shown` hits zero eventually."""
+    await kg.upsert_edge(edge("José", "Pedro", "PARENT_OF", status=EDGE_PROPOSED))
+    assert await kg.pending_edges(SCOPE, limit=0) == []
+    assert await kg.pending_edges(SCOPE, limit=-1) == []
+
+
+def test_the_curation_vocabulary_is_reachable_from_the_PACKAGE_ROOT():
+    """The CHANGELOG advertises these as additions and every test above imports them from
+    `cogno_engram.types` — so the package-root export could be missing and the suite would stay
+    green over a symbol no host can import. Advertised-but-unreachable, with nothing to catch it."""
+    import cogno_engram
+
+    for name in ("EDGE_ACCEPTED", "EDGE_PROPOSED", "EDGE_REJECTED", "VALID_EDGE_STATUS",
+                 "VALID_PROXIMITY_RELATIONS", "sanitize_edge_status", "require_edge_status"):
+        assert hasattr(cogno_engram, name), f"{name} não é importável da raiz do pacote"
+        assert name in cogno_engram.__all__, f"{name} fora do __all__"
+
+
+async def test_a_proposal_still_creates_its_ENDPOINT_NODES_and_that_is_a_known_bound(kg):
+    """Stated rather than fixed, because the bound is narrower than it looks.
+
+    A proposed edge auto-creates both endpoints (parity with Postgres, so a sloppy extraction
+    never dangles) and NODES carry no curation state — so `list_nodes`/`find_node` disclose the
+    label of a person named only by an unreviewed edge. The PROMPT is not affected: every path
+    that reaches a prompt goes through `walk`, which is filtered at the source, at the traversal
+    and again at the formatter. What is exposed is the ADMIN surface, to a curator who is about
+    to read the proposal anyway.
+
+    Pinned so the next reader finds a decision instead of a surprise; closing it properly means
+    giving nodes a status of their own, which is a bigger change than this one."""
+    await kg.upsert_edge(edge("José", "Amante Secreta", "FRIEND_OF", status=EDGE_PROPOSED))
+    assert {n.label for n in await kg.list_nodes(SCOPE)} == {"José", "Amante Secreta"}
+    assert format_graph_context(await kg.walk(SCOPE, "José")) == ""      # never spoken

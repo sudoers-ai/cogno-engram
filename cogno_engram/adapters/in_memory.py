@@ -16,10 +16,12 @@ from datetime import datetime, timedelta, timezone
 from typing import AsyncIterator, Optional
 from uuid import uuid4
 
+from dataclasses import replace
+
 from cogno_engram.types import (
     EDGE_ACCEPTED,
     EDGE_PROPOSED,
-    sanitize_edge_status,
+    require_edge_status,
     GraphEdge,
     GraphNode,
     HybridWeights,
@@ -390,6 +392,15 @@ class InMemoryGraph:
             if (existing.scope == edge.scope and existing.source.lower() == edge.source.lower()
                     and existing.target.lower() == edge.target.lower()
                     and existing.relation == edge.relation):
+                if existing.status == EDGE_ACCEPTED and edge.status == EDGE_PROPOSED:
+                    # A PROPOSAL cannot modify a VERDICT — in any field, not just `status`.
+                    # The gate used to cover `status` alone while `attributes` merged straight
+                    # through, and `_detail` puts attributes in the prompt: a caller that marked
+                    # the whole edge unreviewed had its relation held and its free text SPOKEN
+                    # ("Pedro (note: expelled from school for cheating)"). Reviewed means
+                    # reviewed as it stood; a proposal with something to add needs its own turn
+                    # through the queue.
+                    return
                 existing.confidence = edge.confidence
                 existing.source_session = edge.source_session
                 # Merge, never replace: the LLM that re-proposes an edge must not wipe the
@@ -423,15 +434,22 @@ class InMemoryGraph:
         return [n for _, n in scored[:limit]]
 
     async def pending_edges(self, scope: str, *, limit: int = 100) -> list[GraphEdge]:
-        """Oldest first — see the Postgres adapter for why the two must agree on this."""
+        """Oldest first — see the Postgres adapter for why the two must agree on this.
+
+        COPIES, not the stored objects. Postgres builds fresh rows and this returned live
+        references, so a curation UI that edited a queue item published the edge here and did
+        nothing there — the two stores disagreeing on exactly the invariant this feature is.
+        """
         _require_scope(scope)
-        return [e for e in self._edges
+        if limit <= 0:                  # Postgres raises on a negative LIMIT; agree on empty
+            return []
+        return [replace(e) for e in self._edges
                 if e.scope == scope and e.status == EDGE_PROPOSED][:limit]
 
     async def set_edge_status(self, scope: str, source: str, target: str, relation: str,
                               status: str) -> bool:
         _require_scope(scope)
-        want = sanitize_edge_status(status)
+        want = require_edge_status(status)
         for e in self._edges:
             if (e.scope == scope and e.source.lower() == source.lower()
                     and e.target.lower() == target.lower() and e.relation == relation):

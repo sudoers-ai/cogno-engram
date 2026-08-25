@@ -226,3 +226,25 @@ class NodeContext:
     node: GraphNode
     edges: list[GraphEdge] = field(default_factory=list)
     neighbors: list[GraphNode] = field(default_factory=list)
+
+
+def require_edge_status(raw: object) -> str:
+    """A VERDICT, validated — raises on anything that is not one. Not the same question as
+    :func:`sanitize_edge_status`, and a review had to point out that reusing it was wrong.
+
+    ``sanitize_edge_status`` answers a STORAGE question: an edge arriving with no status was
+    written before the field existed, so ``accepted`` is the back-compatible reading. Here there
+    is no legacy caller: ``set_edge_status`` exists only to record a decision a human made, and
+    "absent" means **no decision was submitted**.
+
+    Borrowing the storage default inverted the safety: a TYPO'd verdict (``"acepted"``) was
+    safely held as ``proposed``, while a MISSING one published the unreviewed edge — and the
+    call returned ``True``, so the curation UI showed success. Measured in both adapters.
+    """
+    text = str(raw).strip().lower() if raw is not None else ""
+    if text not in VALID_EDGE_STATUS:
+        raise ValueError(
+            f"not a verdict: {raw!r}. Expected one of {sorted(VALID_EDGE_STATUS)}. "
+            f"A missing or unreadable verdict is a caller bug, and defaulting it would publish "
+            f"an unreviewed edge — the one thing this field exists to prevent.")
+    return text

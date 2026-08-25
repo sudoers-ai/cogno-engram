@@ -43,8 +43,10 @@
 - `rejected` is sticky — `set_edge_status` is the only way back (`upsert_edge` cannot tell a
   deliberate correction from a re-extraction).
 
-Callers that never set `status` are unaffected: the default is `accepted` and every existing
-walk returns what it returned before.
+Callers that never set `status` are unaffected **in data**: the default is `accepted` and every
+existing walk returns what it returned before. The **contract** does change — `KnowledgeGraph` is
+`@runtime_checkable` and gained `pending_edges`/`set_edge_status`, so a host with its own adapter
+stops satisfying it under mypy/`isinstance` until it implements both.
 
 
 ## 0.1.1 — 2026-08-02

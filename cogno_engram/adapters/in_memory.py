@@ -18,6 +18,7 @@ from uuid import uuid4
 
 from dataclasses import replace
 
+
 from cogno_engram.types import (
     EDGE_ACCEPTED,
     EDGE_PROPOSED,
@@ -32,6 +33,22 @@ from cogno_engram.types import (
     TurnRecord,
     TurnTrace,
 )
+
+
+def _detached(edge: "GraphEdge") -> "GraphEdge":
+    """A caller-safe copy of a stored edge.
+
+    Every read used to hand back the STORED object, so a caller that touched what it was given
+    changed what the prompt says — and Postgres, which builds fresh rows, did not. A review
+    measured `walk(...)[0].attributes["note"] = "LEAKED"` rendering into the in-memory block and
+    not into the Postgres one: same code, two prompts, on the one invariant this module is.
+
+    `dataclasses.replace` alone is not enough: it is SHALLOW, so the copy shares its
+    `attributes` dict with the store and a mutation of that dict still lands. The dict is
+    rebuilt here for the same reason the object is.
+    """
+    return replace(edge, attributes=dict(edge.attributes or {}))
+
 
 
 def _now() -> datetime:
@@ -427,7 +444,7 @@ class InMemoryGraph:
                 if existing.status == EDGE_PROPOSED:
                     existing.status = edge.status
                 return
-        self._edges.append(edge)
+        self._edges.append(_detached(edge))   # never alias the caller's object
 
     async def find_node(self, scope: str, label: str) -> Optional[GraphNode]:
         _require_scope(scope)
@@ -451,7 +468,7 @@ class InMemoryGraph:
         _require_scope(scope)
         if limit <= 0:                  # Postgres raises on a negative LIMIT; agree on empty
             return []
-        return [replace(e) for e in self._edges
+        return [_detached(e) for e in self._edges
                 if e.scope == scope and e.status == EDGE_PROPOSED][:limit]
 
     async def set_edge_status(self, scope: str, source: str, target: str, relation: str,
@@ -491,7 +508,7 @@ class InMemoryGraph:
                     continue
                 if id(edge) not in seen_edges:
                     seen_edges.add(id(edge))
-                    result.append(edge)
+                    result.append(_detached(edge))
                 if nxt.lower() not in visited:
                     visited.add(nxt.lower())
                     frontier.append((nxt.lower(), depth + 1))
@@ -518,7 +535,7 @@ class InMemoryGraph:
         node = self._nodes.get((scope, label.lower()))
         if node is None:
             return None
-        edges = [e for e in self._edges
+        edges = [_detached(e) for e in self._edges
                  if e.scope == scope and e.status == EDGE_ACCEPTED
                  and label.lower() in (e.source.lower(), e.target.lower())]
         return NodeContext(node=node, edges=edges, neighbors=await self.neighbors(scope, label))

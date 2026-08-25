@@ -44,27 +44,17 @@
   `DELETE ... WHERE source_session = ''` lê-se como inteiramente normal num log. Os dois
   adaptadores passam a recusar (`ValueError`) em vez de devolver 0 — um id vazio ali é bug do
   chamador, e engolir esconde o bug fingindo que a poda correu.
-
-
 - **`KnowledgeGraph.count_nodes(scope, *, label=None)`** — how many nodes a scope holds, or how
   many carry a label, as a **query** instead of a page.
-
   `list_nodes` is `ORDER BY id LIMIT n`: no label filter, no offset. A caller asking *"is this
   label unique in this scope?"* over it gets the right answer only while the tenant stays smaller
   than the page — and a homonym created past the cut is invisible. That was a live defect: the
   host had to refuse to answer whenever the page came back full, because the alternative was
   speaking a stranger's facts about a contact.
-
   `lower(label)` on both sides, matching `find_node` and the `walk` seed — a case-sensitive count
   would answer a different question from the one the caller is about to act on.
-
   **Contract change:** `KnowledgeGraph` is `@runtime_checkable`, so a host with its own adapter
   must add the method to keep satisfying it.
-
-
-## Unreleased
-
-### Fixed
 
 - **A read hands back a COPY, at all four doors.** `walk()`, `get_node_context().edges` and
   `upsert_edge` (which stored the CALLER's object) returned live references into the in-memory
@@ -78,6 +68,16 @@
 
 
 ### Added
+
+- **`propose_relations` aceita um PREDICADO** (`(source, target, relation) -> bool`), não só um
+  booleano. "Rever tudo ou não rever nada" é a granularidade errada para o que a opção protege:
+  as arestas que viram uma frase sobre uma PESSOA ("sua esposa Maria") são uma classe pequena e
+  nomeável; as outras ("a clínica aceita Unimed") são factos de domínio que um walk deve
+  continuar a afirmar. O tudo-ou-nada obriga um host a escolher entre falar alegações não
+  revistas sobre a família de alguém e perder o bloco de conhecimento inteiro — e o primeiro
+  host a encontrar essa escolha tomou a primeira opção sem reparar, durante meses, em produção.
+  Mesma forma e mesma costura do `edge_filter`. Um predicado que LEVANTA devolve `proposed`,
+  nunca `accepted`: uma aresta que ninguém conseguiu classificar espera por um humano.
 
 - `MemoryStore.admin_traces(scope_prefix, *, since=None, limit=1000, offset=0)` — the
   turn traces of a scope SUBTREE, newest-first, with an inclusive `since` and a total.

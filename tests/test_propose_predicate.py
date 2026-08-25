@@ -86,3 +86,51 @@ async def test_proximity_waits_for_a_human_while_the_domain_edge_is_spoken():
 async def test_the_bool_still_applies_to_EVERY_edge(flag, expected):
     got = await _run(flag)
     assert set(got.values()) == {expected}, got
+
+
+# ── a wrong predicate is a WIRING error, refused loudly ──────────────────────
+
+def test_a_predicate_of_the_wrong_ARITY_is_refused_at_wiring_time():
+    """`lambda r: ...` is the natural mistake — the docs talk about relations — and left to the
+    per-edge guard it raises on EVERY edge, is swallowed, and stamps everything `proposed`. The
+    host's graph block then empties silently: the very regression the opt-in default exists to
+    prevent, arriving through the option meant to avoid it."""
+    with pytest.raises(TypeError, match="source, target, relation"):
+        _status_rule(lambda relation: True)
+
+
+def test_an_ASYNC_predicate_is_refused_too():
+    """A coroutine function is `callable`, so the call returns a coroutine object — always
+    truthy — and every edge becomes `proposed`, with a `RuntimeWarning` as the only clue."""
+    async def _is_proximity_async(s, t, r):
+        return True
+
+    with pytest.raises(TypeError, match="sync predicate"):
+        _status_rule(_is_proximity_async)
+
+
+@pytest.mark.parametrize("ok", [
+    lambda s, t, r: True,
+    lambda *a: True,
+    lambda s, t, r, extra=None: True,
+])
+def test_shapes_that_DO_work_are_not_refused(ok):
+    """The positive control: the arity check must not reject a legitimate predicate."""
+    assert _status_rule(ok)("a", "b", "SPOUSE_OF") == EDGE_PROPOSED
+
+
+def test_a_callable_whose_signature_cannot_be_READ_is_allowed_through(monkeypatch):
+    """Some C callables expose no signature. Refusing those would break a legitimate caller for
+    the checker's convenience, so they fall through to the per-edge guard instead."""
+    import inspect as _inspect
+
+    import cogno_engram.hypnos as hypnos
+
+    def _no_signature(_obj):
+        raise ValueError("no signature for builtin")
+
+    monkeypatch.setattr(hypnos.inspect, "signature", _no_signature)
+    monkeypatch.setattr(hypnos.inspect, "iscoroutinefunction",
+                        _inspect.iscoroutinefunction)
+    rule = _status_rule(lambda s, t, r: True)          # shape is fine; it just cannot be read
+    assert rule("a", "b", "SPOUSE_OF") == EDGE_PROPOSED

@@ -85,7 +85,13 @@ await hypnos.periodic_consolidate(store, backend, scope=scope, session_id=sid, k
                                   # bool, or a predicate per relation: hold the ones that
                                   # become a sentence about a PERSON, keep domain facts
                                   # `accepted` so the staff block stays populated.
-                                  propose_relations=lambda s, t, r: r in PROXIMITY)
+                                  # NOTE the `.upper()`: the predicate receives the relation
+                                  # as the MODEL emitted it, unnormalised. Comparing it raw
+                                  # makes `spouse_of` miss the set, and a miss stamps the edge
+                                  # `accepted` — failing OPEN, on exactly the class this is
+                                  # meant to hold back.
+                                  propose_relations=lambda s, t, r: (
+                                      (r or "").upper() in VALID_PROXIMITY_RELATIONS))
 
 # the host's curation UI reads the queue and writes the verdict
 for e in await kg.pending_edges(scope):

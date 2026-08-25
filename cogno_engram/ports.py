@@ -177,7 +177,11 @@ class KnowledgeGraph(Protocol):
     async def scan_nodes(self, scope: str, *, after_id: Optional[int] = None,
                          limit: int = 1000) -> list[GraphNode]: ...
     async def delete_node(self, scope: str, label: str) -> bool: ...
-    # Feedback-driven pruning: drop every edge a (disliked) session asserted.
+    # Feedback-driven pruning: drop every edge a (disliked) session asserted. Returns the rows
+    # removed, and RAISES ``ValueError`` on a blank ``session_id``: a blank is not a wildcard —
+    # it matches every edge whose ``source_session`` is empty, which is exactly the class
+    # nothing automated writes (the notes a human or an admin API put there). An adapter that
+    # skips this check keeps that hazard verbatim.
     async def delete_edges_by_session(self, scope: str, session_id: str) -> int: ...
     # Right-to-be-forgotten: hard-delete EVERY node + edge for a scope (the graph half of the
     # host's scope offboarding; pair with ``MemoryStore.purge_scope``). Returns rows removed.

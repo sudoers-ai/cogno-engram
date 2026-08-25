@@ -26,6 +26,7 @@ the embedder as ``await embedder.embed(text) -> list[float]``.
 
 from __future__ import annotations
 
+import inspect
 import json
 import logging
 from typing import TYPE_CHECKING, Any, Callable, Optional, Union
@@ -219,7 +220,8 @@ async def _extract_relations(kg: KnowledgeGraph, backend: Any, *, scope: str, se
                              turns: list[TurnRecord], embedder: Any,
                              system: str, prompt: str,
                              edge_filter: Optional[Callable[[str, str, str], bool]] = None,
-                             status: str = EDGE_ACCEPTED) -> int:
+                             status: "Union[str, Callable[[str, str, str], str]]" =
+                             EDGE_ACCEPTED) -> int:
     """LLM relation extraction → upsert nodes + edges (source_session tagged).
 
     ``edge_filter(source, target, relation) -> bool`` (optional) vetoes edges before upsert
@@ -268,7 +270,23 @@ async def _extract_relations(kg: KnowledgeGraph, backend: Any, *, scope: str, se
 
 # ── Tier 2 — periodic (LLM) ───────────────────────────────────────────────────
 
-def _status_rule(propose: "Union[bool, Callable[[str, str, str], bool]]"):
+def _accepts_three(params: "Any") -> bool:
+    """Can this signature take three positional arguments?"""
+    kinds = [p.kind for p in params.values()]
+    if any(k is inspect.Parameter.VAR_POSITIONAL for k in kinds):
+        return True
+    positional = [k for k in kinds if k in (inspect.Parameter.POSITIONAL_ONLY,
+                                            inspect.Parameter.POSITIONAL_OR_KEYWORD)]
+    required = [p for p in params.values()
+                if p.kind in (inspect.Parameter.POSITIONAL_ONLY,
+                              inspect.Parameter.POSITIONAL_OR_KEYWORD)
+                and p.default is inspect.Parameter.empty]
+    return len(positional) >= 3 and len(required) <= 3
+
+
+def _status_rule(
+    propose: "Union[bool, Callable[[str, str, str], bool]]",
+) -> "Union[str, Callable[[str, str, str], str]]":
     """`propose_relations` (bool or predicate) → what `_extract_relations` should stamp.
 
     A bool keeps the original meaning exactly (every edge the same), so nothing changes for a
@@ -277,6 +295,23 @@ def _status_rule(propose: "Union[bool, Callable[[str, str, str], bool]]"):
     """
     if not callable(propose):
         return EDGE_PROPOSED if propose else EDGE_ACCEPTED
+
+    # Validate the callable ONCE, here, and refuse it loudly. Both mistakes below are silent
+    # and identical in effect if left to the per-edge guard: every edge becomes `proposed`,
+    # so the host's graph block quietly EMPTIES — which is the regression the opt-in default
+    # exists to prevent, arriving through the option meant to avoid it. A wrong predicate is a
+    # programming error at wiring time; it must not be discovered as a slow leak in prod.
+    if inspect.iscoroutinefunction(propose):
+        raise TypeError("propose_relations must be a sync predicate: a coroutine function is "
+                        "callable, so every edge would be judged on a truthy coroutine object")
+    try:
+        params = inspect.signature(propose).parameters
+    except (TypeError, ValueError):      # builtins/C callables expose no signature
+        params = None
+    if params is not None and not _accepts_three(params):
+        raise TypeError("propose_relations must take (source, target, relation); got "
+                        f"{tuple(params)} — a wrong arity would raise on every edge and hold "
+                        "the whole graph for review")
 
     def _decide(source: str, target: str, relation: str) -> str:
         # A predicate that raises yields `proposed`, never `accepted`: an edge nobody could
@@ -341,6 +376,15 @@ async def periodic_consolidate(
     choice took the first option without noticing. The predicate lets proximity wait for a human
     while domain relations stay ``accepted``. Same shape and same seam as ``edge_filter``, which
     already decides per relation what is worth persisting at all.
+
+    **Turning it on does NOT reach rows that are already there.** ``upsert_edge`` only ever
+    PROMOTES a status (a review nobody would redo must not expire), so an edge already stamped
+    ``accepted`` stays ``accepted`` when the next extraction re-emits it. A host that flips this
+    on believing its existing proximity edges now wait for a human is wrong, and wrong in the
+    direction that matters: it keeps speaking every one of them. Migrating them is a deliberate
+    act — walk the affected nodes and ``set_edge_status(..., "proposed")`` — and there is no
+    enumeration shortcut, because ``pending_edges`` lists proposals, which is precisely what
+    these are not.
     """
     # Scope the read: session_id is a host-derived uuid5 that can collide across scopes, and the
     # extract below is written back into THIS scope — an un-scoped read would fold another tenant's
@@ -407,7 +451,16 @@ async def consolidate_session(
                             f"Domains: {', '.join(domains) or 'general'}. Memories: {len(mems)}.")
 
     if disliked and kg is not None:
-        await kg.delete_edges_by_session(kg_scope or session.scope, session.id)
+        # The prune now REFUSES a blank session id (a blank is not a wildcard). Catch it here:
+        # by this line the LLM pass has run and the memories are saved, and `close_session` is
+        # still ahead — so letting it out would leave the session OPEN and the janitor would
+        # re-consolidate it every tick, duplicating memories. The guard exists to protect the
+        # human-written edges, and it still does; what it must not do is split this write.
+        try:
+            await kg.delete_edges_by_session(kg_scope or session.scope, session.id)
+        except ValueError:
+            logger.warning("stage=hypnos tier=3 event=prune_skipped reason=blank_session_id "
+                           "scope=%s — feedback pruning needs a real session id", session.scope)
     if close:
         # scope the WRITE too: the sessions table is keyed by id alone, so without it a colliding
         # id from another tenant would receive this scope's LLM-generated summary.

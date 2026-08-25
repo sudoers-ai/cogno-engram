@@ -258,7 +258,42 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
         # The curation queue reads one status within one scope; the prompt walk reads the other.
         "CREATE INDEX IF NOT EXISTS idx_edges_scope_status ON knowledge_edges (scope, status)",
         "CREATE INDEX IF NOT EXISTS idx_sessions_scope_time ON sessions (scope, started_at DESC)",
-        "CREATE INDEX IF NOT EXISTS idx_turns_scope_time ON turns (scope, created_at DESC, id DESC)",
+        # `admin_turns` e `admin_scopes` lêem uma SUBÁRVORE de escopo — `scope = %s OR scope
+        # LIKE 'prefixo/%%'` — e o índice que aqui estava era btree COMUM. Pelo mesmo argumento
+        # do `idx_turn_traces_scope_time`: num collation que não seja C (esta base é
+        # `en_US.utf8`) um btree comum NÃO serve o ramo do LIKE, e o planeador nem o considera.
+        # Isto era portanto o MESMO defeito que o índice dos traços corrigiu — e este ficheiro
+        # citava-o como o irmão que "já tinha" o índice, o que estava ao contrário.
+        #
+        # SUBSTITUI em vez de acrescentar, e a escolha é medida. 200k linhas, tenant a ~10% da
+        # tabela, medianas de 7-9 corridas (a leitura de amostra única mente aqui: uma corrida
+        # dizia que o custo de escrita caía 13%, nove dizem que não se distingue):
+        #
+        #     .                       tamanho   escrita 20k          subárvore
+        #     btree comum (o antigo)   24 MB    121 ms (117-142)     Seq Scan     18-24 ms
+        #     os DOIS índices          34 MB    152 ms (133-165)     Bitmap Heap  10 ms
+        #     só text_pattern_ops      24 MB    115 ms (103-163)     Bitmap Heap   8-12 ms
+        #
+        # Manter os dois custaria +10 MB e ~26% de escrita na tabela mais quente do schema, para
+        # nada: o `text_pattern_ops` serve TAMBÉM o ramo `=` (está em `pg_amop`) e mantém o
+        # Index Scan ordenado da consulta de igualdade+ordenação (`scope = %s ... ORDER BY
+        # created_at DESC, id DESC`, medido 0,087 vs 0,094 ms). A ordem de saída do
+        # `admin_scopes` é IDÊNTICA nas duas — o `ORDER BY scope` usa o collation da coluna,
+        # não a opclass do índice.
+        #
+        # O NOME MUDA de propósito. `CREATE INDEX IF NOT EXISTS` com o nome antigo e definição
+        # nova é um NO-OP silencioso: o nome existe, nada acontece, e o conserto subiria inerte
+        # em toda a instalação existente. Nome novo + `DROP` do antigo é idempotente nos dois
+        # sentidos (e um rollback de versão recria o antigo sozinho).
+        "CREATE INDEX IF NOT EXISTS idx_turns_scope_pattern "
+        "ON turns (scope text_pattern_ops, created_at DESC, id DESC)",
+        # Depois do CREATE, nunca antes: se o processo morrer entre os dois, a instalação fica
+        # com os dois índices (lenta a escrever, correcta a ler) e não sem nenhum. Dito aqui
+        # porque NENHUM teste o guarda e isso não é esquecimento — medido, trocar a ordem
+        # sobrevive à suíte, e sobrevive com razão: as duas ordens dão o mesmo estado final numa
+        # passagem que termina. O que as separa é só a janela de falha a meio, que um teste não
+        # simula sem matar o processo.
+        "DROP INDEX IF EXISTS idx_turns_scope_time",
         "CREATE INDEX IF NOT EXISTS idx_turns_session ON turns (session_id, turn_n)",
         "CREATE INDEX IF NOT EXISTS idx_turn_traces_session ON turn_traces (session_id, turn_n)",
         # `admin_traces` lê uma SUBÁRVORE de escopo ordenada por tempo. O ramo `scope = %s` já
@@ -276,11 +311,10 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
         #     btree comum             Parallel Seq Scan   13,0 ms   ← o índice nem é considerado
         #     text_pattern_ops        Bitmap Heap Scan     0,21 ms
         #
-        # ATENÇÃO ao irmão citado como modelo: `idx_turns_scope_time` é btree COMUM, logo pelo
-        # mesmo argumento não serve o ramo do LIKE do `admin_turns` nem do `admin_scopes`.
-        # Medido a 200k COM esse índice presente, ambos dão `Parallel Seq Scan on turns`. Este
-        # commit fecha um terço do padrão; os outros dois ficam nomeados aqui em vez de
-        # implícitos — corrigi-los mexe numa tabela mais quente e merece medição própria.
+        # O padrão tem TRÊS consumidores e os três estão fechados: este, e o `admin_turns` /
+        # `admin_scopes` pelo `idx_turns_scope_pattern` acima. O irmão que este comentário
+        # nomeava — `idx_turns_scope_time`, btree comum — foi APOSENTADO por ter exactamente
+        # este defeito; não o procure, já não existe.
         #
         # `created_at` no segundo lugar GANHA o seu lugar, e a medição contraria a leitura de
         # amostra única (uma corrida dizia "empate"; sete dizem outra coisa). Subárvore gorda

@@ -539,6 +539,189 @@ async def test_the_subtree_index_reaches_every_PARTITION():
         f"particionada, essas partições ficam sem ele e a suíte não notaria")
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("leitor", ["admin_turns", "admin_scopes"])
+async def test_the_turns_subtree_readers_do_not_seq_scan(store, leitor):
+    """Os dois irmãos que o índice dos traços deixou para trás.
+
+    `idx_turns_scope_time` era btree COMUM, e este ficheiro citava-o como o irmão que "já tinha"
+    o índice — ao contrário: pelo mesmo argumento, num collation que não seja `C` um btree comum
+    não serve `LIKE 'prefixo/%'`. Medido a 200k COM esse índice presente, ambos os leitores davam
+    `Parallel Seq Scan on turns`.
+
+    Como no teste gémeo do `turn_traces`: o SQL é CAPTURADO do próprio método, não copiado à mão
+    (uma garantia sobre uma consulta que ninguém emite não é garantia), e a asserção é a ausência
+    de `Seq Scan` e não o nome do índice (o nome falha sob collation `C`, onde a UNIQUE já serve
+    ambos os ramos e não há varrimento nenhum)."""
+    import contextlib
+
+    marca = uuid4().hex[:8]
+    # muitos escopos, um alvo raro: é a forma da produção, e a única em que um índice ganha
+    for i in range(2000):
+        escopo = f"{marca}{i % 400:03d}/u{i % 7}"
+        sess = await store.create_session(escopo)
+        await store.save_turn(TurnRecord(sess.id, escopo, i % 30, f"in{i}", f"out{i}"))
+
+    emitido: "list[tuple]" = []
+
+    class _Espiao:
+        """Regista o SQL e delega o resto — `__getattr__`, não uma lista de métodos à mão."""
+
+        def __init__(self, conn):
+            self._conn = conn
+
+        def __getattr__(self, nome):
+            return getattr(self._conn, nome)
+
+        async def execute(self, sql, params=None, *a, **kw):
+            emitido.append((sql, params))
+            return await self._conn.execute(sql, params, *a, **kw)
+
+    real = store._conn                                             # type: ignore[attr-defined]
+
+    @contextlib.asynccontextmanager
+    async def _espiado():
+        async with real() as c:
+            yield _Espiao(c)
+
+    store._conn = _espiado                                         # type: ignore[attr-defined]
+    try:
+        if leitor == "admin_scopes":
+            await store.admin_scopes(f"{marca}007")
+        else:
+            await store.admin_turns(f"{marca}007")
+    finally:
+        store._conn = real                                         # type: ignore[attr-defined]
+
+    sql, params = emitido[0]
+    assert "FROM turns" in sql, f"não capturei a consulta de {leitor}: {sql!r}"
+
+    async with real() as conn:
+        await conn.execute("ANALYZE turns")
+        async with conn.cursor() as cur:
+            await cur.execute("EXPLAIN " + sql, params)
+            plano = "\n".join(
+                (r["QUERY PLAN"] if isinstance(r, dict) else r[0])
+                for r in await cur.fetchall())
+
+    # Não-vacuidade primeiro: uma asserção NEGATIVA sobre uma string passa trivialmente se a
+    # string vier vazia. Igual ao gémeo do `turn_traces`.
+    assert "on turns" in plano, f"o EXPLAIN não falou de turns:\n{plano}"
+    assert "Seq Scan on turns" not in plano, (
+        f"{leitor} varreu a tabela inteira — o plano foi:\n{plano}")
+
+
+@pytest.mark.asyncio
+async def test_the_OLD_turns_index_is_gone_and_the_new_one_is_there():
+    """A migração, e é a metade que quase subiu inerte.
+
+    `CREATE INDEX IF NOT EXISTS idx_turns_scope_time` com definição NOVA e nome ANTIGO é um
+    no-op silencioso — o nome existe, nada acontece, e o conserto ficaria a não fazer nada em
+    toda a instalação já criada, com a suíte verde porque um banco de teste nasce do zero. Por
+    isso o nome mudou e o antigo é derrubado.
+
+    Este teste corre `ensure_schema` DUAS vezes sobre um banco que já tinha o índice antigo — que
+    é o estado real de qualquer instalação existente — e afirma os dois lados: o novo está lá com
+    a opclass de padrão, e o antigo saiu. A segunda passagem prova a idempotência."""
+    if not await _pg_available():
+        pytest.skip("set ENGRAM_TEST_DSN to run")
+    conn = await psycopg.AsyncConnection.connect(DSN, autocommit=True)
+    for tbl in ("knowledge_edges", "knowledge_nodes", "turn_traces", "memories", "turns",
+                "sessions"):
+        await conn.execute(f"DROP TABLE IF EXISTS {tbl} CASCADE")
+    await ensure_schema(conn, embedding_dim=EMB_DIM)
+
+    # o estado de uma instalação ANTIGA: recria à mão o índice que este commit aposenta
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_turns_scope_time "
+        "ON turns (scope, created_at DESC, id DESC)")
+
+    for _ in range(2):                                     # idempotência: correr duas vezes
+        await ensure_schema(conn, embedding_dim=EMB_DIM)
+
+    cur = await conn.execute(
+        "SELECT x.indexrelid::regclass::text, o.opcname FROM pg_index x "
+        "  JOIN pg_class t ON t.oid = x.indrelid "
+        "  JOIN pg_opclass o ON o.oid = x.indclass[0] "
+        "WHERE t.relname = 'turns'")
+    indices = {nome: opc for nome, opc in await cur.fetchall()}
+    await conn.close()
+
+    assert "idx_turns_scope_time" not in indices, (
+        "o índice antigo (btree comum) sobreviveu — a instalação fica a pagar escrita por um "
+        "índice que o novo supersede em todas as formas medidas")
+    assert indices.get("idx_turns_scope_pattern") in ("text_pattern_ops", "varchar_pattern_ops"), (
+        f"o índice novo não está lá, ou não tem a opclass de padrão: {indices}")
+
+
+async def test_the_turns_subtree_index_reaches_every_PARTITION():
+    """O mesmo para `turns` — e aqui pesa mais do que nos traços.
+
+    `turns` é uma das DUAS tabelas que o `partition_by_scope` activa (a outra é `memories`); os
+    traços não são particionados de todo. Portanto em produção o índice desta correcção vive
+    inteiramente nas filhas, e um índice declarado no pai que não chegue lá deixa TODA a
+    instalação sem ele, com a suíte verde porque o modo não particionado é o que os testes
+    exercitam por omissão.
+
+    A segunda metade é o `DROP` do índice antigo, que nesta correcção é o que faz o novo valer a
+    pena: um `DROP INDEX` do pai tem de levar as filhas consigo, senão cada partição fica a pagar
+    escrita por um índice que o novo supersede.
+
+    Asserção de DDL, pela mesma razão do teste gémeo acima: uma asserção de plano exigiria linhas
+    suficientes para CADA partição passar o limiar de Seq Scan."""
+    if not await _pg_available():
+        pytest.skip("set ENGRAM_TEST_DSN to run")
+    conn = await psycopg.AsyncConnection.connect(DSN, autocommit=True)
+    for tbl in ("knowledge_edges", "knowledge_nodes", "turn_traces", "memories", "turns",
+                "sessions"):
+        await conn.execute(f"DROP TABLE IF EXISTS {tbl} CASCADE")
+    await ensure_schema(conn, embedding_dim=EMB_DIM, partition_by_scope=True, partitions=4)
+
+    # O estado de uma instalação PARTICIONADA já existente — e sem isto a asserção do índice
+    # antigo era VÁCUA: numa base nova ele nunca chega a existir, portanto tirar o `DROP` do
+    # `ensure_schema` não mudava nada aqui e a mutação sobrevivia (medido). Criá-lo à mão é o que
+    # torna a segunda metade deste teste capaz de falhar.
+    await conn.execute("CREATE INDEX IF NOT EXISTS idx_turns_scope_time "
+                       "ON turns (scope, created_at DESC, id DESC)")
+    for _ in range(2):                                     # e a idempotência, como no gémeo
+        await ensure_schema(conn, embedding_dim=EMB_DIM, partition_by_scope=True, partitions=4)
+
+    cur = await conn.execute(
+        "SELECT c.relname FROM pg_inherits i "
+        "  JOIN pg_class p ON p.oid = i.inhparent "
+        "  JOIN pg_class c ON c.oid = i.inhrelid "
+        "WHERE p.relname = 'turns' ORDER BY c.relname")
+    filhas = [r[0] for r in await cur.fetchall()]
+    assert len(filhas) == 4, f"esperava 4 partições de turns, achei {filhas}"
+
+    sem_padrao = []
+    for filha in filhas:
+        c = await conn.execute(
+            "SELECT count(*) FROM pg_index x "
+            "  JOIN pg_class t ON t.oid = x.indrelid "
+            "  JOIN pg_opclass o ON o.oid = x.indclass[0] "
+            "WHERE t.relname = %s AND o.opcname IN ('text_pattern_ops', 'varchar_pattern_ops')",
+            (filha,))
+        if (await c.fetchone())[0] == 0:
+            sem_padrao.append(filha)
+    # e o antigo não pode ter sobrevivido em partição nenhuma — é o `DROP` que faz o índice
+    # novo valer a pena, e em modo particionado ele tem de levar as 4 filhas consigo
+    c = await conn.execute(
+        "SELECT x.indexrelid::regclass::text FROM pg_index x "
+        "  JOIN pg_class t ON t.oid = x.indrelid "
+        "WHERE t.relname LIKE %s AND x.indexrelid::regclass::text LIKE %s",
+        ("turns%", "%scope_time%"))
+    com_antigo = [r[0] for r in await c.fetchall()]
+    await conn.close()
+
+    assert not sem_padrao, (
+        f"o índice novo não chegou a {sem_padrao} — em produção, que corre particionada, essas "
+        f"partições varrem a tabela inteira e a suíte não notaria")
+    assert not com_antigo, (
+        f"o índice antigo sobreviveu em {com_antigo} — cada partição paga escrita por um índice "
+        f"que o novo supersede em todas as formas medidas")
+
+
 # ── edge curation: the two adapters must agree ────────────────────────────
 #
 # Every behaviour below is pinned against the in-memory adapter in `test_edge_curation.py`.

@@ -113,6 +113,30 @@ stops satisfying it under mypy/`isinstance` until it implements both.
   teste. É por isso, deliberadamente, uma asserção de DDL: prova que o índice EXISTE em cada
   partição, não que o planeador o escolhe lá (tecto dito na docstring).
 
+- **O irmão `idx_turns_scope_time` tinha o MESMO defeito que o índice dos traços corrigiu.** Ele
+  era btree COMUM, e num collation que não seja `C` um btree comum não serve `LIKE 'prefixo/%'` —
+  portanto `admin_turns` e `admin_scopes` varriam a tabela inteira, COM o índice presente. Este
+  ficheiro chegou a citá-lo como o irmão que "já tinha" o índice; estava ao contrário.
+
+  **Substitui em vez de acrescentar, e a escolha é medida** — 200k linhas, tenant a ~10% da
+  tabela, medianas de 7–9 corridas por célula:
+
+  | índice | tamanho | escrita 20k | subárvore |
+  |---|---|---|---|
+  | btree comum (o antigo) | 24 MB | 121 ms (117–142) | **Seq Scan**, 18–24 ms |
+  | os DOIS | 34 MB | 152 ms (133–165) | Bitmap Heap, 10 ms |
+  | só `text_pattern_ops` | 24 MB | 115 ms (103–163) | Bitmap Heap, 8–12 ms |
+
+  Manter os dois custaria +10 MB e ~26% de escrita na tabela mais quente do schema, para nada: o
+  `text_pattern_ops` serve TAMBÉM o ramo `=` e mantém o Index Scan ordenado da consulta de
+  igualdade+ordenação (0,087 vs 0,094 ms). A ordem de saída do `admin_scopes` é idêntica — o
+  `ORDER BY scope` usa o collation da coluna, não a opclass do índice.
+
+  **O nome muda de propósito:** `CREATE INDEX IF NOT EXISTS` com o nome antigo e definição nova é
+  um no-op SILENCIOSO, e o conserto subiria inerte em toda a instalação existente. Nome novo
+  (`idx_turns_scope_pattern`) + `DROP` do antigo, nesta ordem — se o processo morrer entre os
+  dois, fica-se com dois índices (lento a escrever, correcto a ler) e não com nenhum.
+
 - **Os irmãos do `admin_traces` não tinham guarda nenhuma a fixar que CHAMAM o escaping.**
   `_subtree_like`/`_SUBTREE` são partilhados por `admin_turns`, `admin_scopes` e `admin_traces`,
   portanto qualquer mutação DENTRO do helper morria pelos casos do `admin_traces` — o que dava a

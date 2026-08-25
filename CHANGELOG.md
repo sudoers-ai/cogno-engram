@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Fixed
+
+- **A read hands back a COPY, at all four doors.** `walk()`, `get_node_context().edges` and
+  `upsert_edge` (which stored the CALLER's object) returned live references into the in-memory
+  store, so a caller that touched what it was given changed what the prompt says — while
+  Postgres, which builds fresh rows, did not. Measured side by side:
+  `walk(...)[0].attributes["note"] = "LEAKED"` rendered into the in-memory block and not into
+  the Postgres one. Same code, two prompts, on the invariant the curation feature is.
+
+  The copy is also deep enough to matter: `dataclasses.replace` alone shares the `attributes`
+  dict with the store, and that dict is what `format_graph_context` renders.
+
+
 ### Added
 
 - `MemoryStore.admin_traces(scope_prefix, *, since=None, limit=1000, offset=0)` — the

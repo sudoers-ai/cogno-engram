@@ -12,7 +12,7 @@ from __future__ import annotations
 import pytest
 
 from cogno_engram.adapters.in_memory import InMemoryGraph
-from cogno_engram.types import GraphNode
+from cogno_engram.types import AUDIENCE_STAFF, GraphNode
 
 SCOPE = "tenant:acme"
 
@@ -27,17 +27,17 @@ async def test_it_counts_the_scope(kg):
         await kg.upsert_node(GraphNode(SCOPE, label, "PERSON"))
     await kg.upsert_node(GraphNode("tenant:other", "José", "PERSON"))
 
-    assert await kg.count_nodes(SCOPE) == 3          # the other tenant is not ours
-    assert await kg.count_nodes("tenant:other") == 1
+    assert await kg.count_nodes(SCOPE, audience=AUDIENCE_STAFF) == 3          # the other tenant is not ours
+    assert await kg.count_nodes("tenant:other", audience=AUDIENCE_STAFF) == 1
 
 
 async def test_it_counts_a_LABEL_case_insensitively(kg):
     """`find_node` and the `walk` seed both compare `lower(label)`, so a case-SENSITIVE count
     would answer a different question from the one the caller is about to act on."""
     await kg.upsert_node(GraphNode(SCOPE, "José", "PERSON"))
-    assert await kg.count_nodes(SCOPE, label="JOSÉ") == 1
-    assert await kg.count_nodes(SCOPE, label="  josé  ") == 1
-    assert await kg.count_nodes(SCOPE, label="Maria") == 0
+    assert await kg.count_nodes(SCOPE, label="JOSÉ", audience=AUDIENCE_STAFF) == 1
+    assert await kg.count_nodes(SCOPE, label="  josé  ", audience=AUDIENCE_STAFF) == 1
+    assert await kg.count_nodes(SCOPE, label="Maria", audience=AUDIENCE_STAFF) == 0
 
 
 async def test_it_answers_beyond_any_page(kg):
@@ -47,14 +47,14 @@ async def test_it_answers_beyond_any_page(kg):
         await kg.upsert_node(GraphNode(SCOPE, f"Contato {i}", "PERSON"))
     await kg.upsert_node(GraphNode(SCOPE, "Maria", "PERSON"))
 
-    assert await kg.count_nodes(SCOPE) == 601
-    assert await kg.count_nodes(SCOPE, label="Maria") == 1
-    assert len(await kg.list_nodes(SCOPE, limit=500)) == 500       # the page, for contrast
+    assert await kg.count_nodes(SCOPE, audience=AUDIENCE_STAFF) == 601
+    assert await kg.count_nodes(SCOPE, label="Maria", audience=AUDIENCE_STAFF) == 1
+    assert len(await kg.list_nodes(SCOPE, limit=500, audience=AUDIENCE_STAFF)) == 500       # the page, for contrast
 
 
 async def test_an_empty_scope_counts_zero_not_an_error(kg):
-    assert await kg.count_nodes(SCOPE) == 0
-    assert await kg.count_nodes(SCOPE, label="ninguém") == 0
+    assert await kg.count_nodes(SCOPE, audience=AUDIENCE_STAFF) == 0
+    assert await kg.count_nodes(SCOPE, label="ninguém", audience=AUDIENCE_STAFF) == 0
 
 
 async def test_the_DOUBLE_collapses_a_homonym_the_real_store_keeps():
@@ -74,7 +74,7 @@ async def test_the_DOUBLE_collapses_a_homonym_the_real_store_keeps():
     await kg.upsert_node(GraphNode(SCOPE, "José", "PERSON"))
     await kg.upsert_node(GraphNode(SCOPE, "José", "CONCEPT"))
 
-    assert await kg.count_nodes(SCOPE, label="José") == 1, (
+    assert await kg.count_nodes(SCOPE, label="José", audience=AUDIENCE_STAFF) == 1, (
         "the double now keeps both node types — Postgres always did. If this is the fix, delete "
         "this test and the note in the docstring above; the host's uniqueness guard gets more "
         "accurate, not less.")

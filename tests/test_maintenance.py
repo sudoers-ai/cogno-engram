@@ -3,7 +3,7 @@
 from datetime import datetime, timedelta, timezone
 
 from cogno_engram import maintenance
-from cogno_engram.types import GraphEdge, GraphNode, MemoryRecord
+from cogno_engram.types import AUDIENCE_STAFF, GraphEdge, GraphNode, MemoryRecord
 
 NOW = datetime(2026, 6, 17, tzinfo=timezone.utc)
 
@@ -94,8 +94,8 @@ async def test_prune_orphan_nodes(graph):
     await graph.upsert_node(GraphNode("s", "Orphan", "CONCEPT"))     # no edges
     n = await maintenance.prune_orphan_nodes(graph, "s")
     assert n == 1
-    assert await graph.find_node("s", "Orphan") is None
-    assert await graph.find_node("s", "Connected") is not None
+    assert await graph.find_node("s", "Orphan", audience=AUDIENCE_STAFF) is None
+    assert await graph.find_node("s", "Connected", audience=AUDIENCE_STAFF) is not None
 
 
 # ── batch preference + knowledge-node re-embedding ────────────────────────
@@ -137,7 +137,7 @@ async def test_reembed_knowledge_nodes(graph):
     emb = _BatchEmbedder()
     assert await maintenance.reembed_knowledge_nodes(graph, emb, "s") == 2
     assert emb.batch_calls == 1
-    for node in await graph.list_nodes("s"):
+    for node in await graph.list_nodes("s", audience=AUDIENCE_STAFF):
         assert node.embedding is not None
 
 
@@ -146,7 +146,7 @@ async def test_reembed_knowledge_nodes_walks_past_one_page(graph):
     for i in range(25):
         await graph.upsert_node(GraphNode("s", f"concept {i}", "CONCEPT"))
     assert await maintenance.reembed_knowledge_nodes(graph, _BatchEmbedder(), "s", batch=10) == 25
-    assert all(n.embedding is not None for n in await graph.list_nodes("s", limit=100))
+    assert all(n.embedding is not None for n in await graph.list_nodes("s", limit=100, audience=AUDIENCE_STAFF))
 
 
 async def test_reembed_knowledge_nodes_is_idempotent(graph):
@@ -154,14 +154,14 @@ async def test_reembed_knowledge_nodes_is_idempotent(graph):
     await graph.upsert_node(GraphNode("s", "Ada Lovelace", "PERSON"))
     await maintenance.reembed_knowledge_nodes(graph, _Embedder(), "s")
     await maintenance.reembed_knowledge_nodes(graph, _Embedder(), "s")
-    assert len(await graph.list_nodes("s")) == 1
+    assert len(await graph.list_nodes("s", audience=AUDIENCE_STAFF)) == 1
 
 
 async def test_reembed_knowledge_nodes_scope_isolation(graph):
     await graph.upsert_node(GraphNode("s", "mine", "CONCEPT"))
     await graph.upsert_node(GraphNode("other", "theirs", "CONCEPT"))
     assert await maintenance.reembed_knowledge_nodes(graph, _Embedder(), "s") == 1
-    [untouched] = await graph.list_nodes("other")
+    [untouched] = await graph.list_nodes("other", audience=AUDIENCE_STAFF)
     assert untouched.embedding is None                        # a switch never crosses scopes
 
 

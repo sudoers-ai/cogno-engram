@@ -4,6 +4,37 @@
 
 ### Added
 
+- **`audience` na ARESTA: o tenant vê tudo, um identity só a sua vida.** Decisão de produto de
+  2026-08-25. A coluna vai na aresta e isso é forçado, não preferido: `knowledge_nodes` é único
+  em `(scope, lower(label), node_type)`, logo o nó "Maria" é UMA linha para o tenant inteiro —
+  dois contactos que mencionem uma Maria partilham-na, e não há "a Maria do José" para marcar.
+  A ARESTA é que é dele. Visibilidade de nó é DERIVADA: um nó é visível quando alguma aresta
+  que o leitor pode ver lhe toca; um nó órfão é só de staff.
+
+  Valores: `''` **não classificada** (staff sim, contacto não), `tenant` (facto de negócio, todos),
+  `identity:<id>` (a vida de um contacto). Produzidos só por `audience_for`/`sanitize_audience`.
+  **O default é fail-CLOSED para o contacto**: um escritor que se esqueça custa um bloco em
+  falta — visível, chato, seguro — e nunca uma fuga. Dois discriminadores neste código nasceram
+  permissivos (`status` a `accepted`, `source_session` vazio) e ambos tiveram de ser desfeitos
+  depois de já terem falado.
+
+  **`audience` é keyword OBRIGATÓRIO** nas nove leituras que podem devolver dado de contacto.
+  Com um opcional, esquecer devolve TUDO e a falha é silenciosa; obrigatório, esquecer é
+  `TypeError` na chamada. Medido: ao pôr o keyword, **72 chamadas** na suíte deste repo
+  falharam, as 72 por falta do argumento — nenhuma mudança silenciosa de comportamento.
+
+- **`KnowledgeGraph.has_edges(scope, label)`** — o predicado de órfão, sem audiência e sem
+  status, de propósito. O chamador é o `prune_orphan_nodes`, que APAGA: ali uma leitura
+  filtrada não estreita o que se vê, alarga o que se destrói — um nó cujas arestas são todas de
+  outro contacto pareceria solto e seria removido. A pergunta "aponta alguma coisa para este
+  nó" não tem audiência. Achado em revisão, antes de entrar.
+
+- **`maintenance.classify_edge_audience`** — a migração das arestas antigas. Carimbo vazio →
+  `tenant` (só staff/admin/KB escreve sem sessão); carimbo cheio → a vida desse contacto, com o
+  mapa sessão→identity injectado pelo host. Sessão irrecuperável fica `''`: staff continua a
+  ver, nenhum contacto vê, e é um "não sei" honesto em vez de um dono errado. `dry_run=True`
+  primeiro, idempotente, e testada verbatim.
+
 - **`propose_relations` aceita um PREDICADO** (`(source, target, relation) -> bool`), não só um
   booleano. "Rever tudo ou não rever nada" é a granularidade errada para o que a opção protege:
   as arestas que viram uma frase sobre uma PESSOA ("sua esposa Maria") são uma classe pequena e

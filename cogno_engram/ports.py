@@ -148,34 +148,71 @@ class ConversationBuffer(Protocol):
 
 @runtime_checkable
 class KnowledgeGraph(Protocol):
-    """Associative memory: typed nodes + directed, confidence-weighted edges."""
+    """Associative memory: typed nodes + directed, confidence-weighted edges.
+
+    **Every read that can return contact data takes ``audience`` as a REQUIRED keyword.** It is
+    required, not defaulted, and that is the whole design: "tenant sees everything; an identity
+    sees only its own life; they do not mix". With an optional argument, forgetting it returns
+    EVERYTHING — the failure would be silent and would be a leak. Required, forgetting it is a
+    `TypeError` at the call, which is a test that writes itself.
+
+    Pass ``AUDIENCE_STAFF`` for a tenant/staff read and ``audience_for(identity_id)`` for a
+    read inside one contact's turn. Nobody hand-writes the string.
+
+    The filter lives on the EDGE (``knowledge_nodes`` is unique on
+    ``(scope, lower(label), node_type)``, so the node "Maria" is one row for the whole tenant —
+    there is no "José's Maria" to mark). Node visibility is DERIVED: a node is visible when some
+    edge this reader may see touches it; an orphan node is staff-only.
+    """
 
     async def upsert_node(self, node: GraphNode) -> int: ...
     async def upsert_edge(self, edge: GraphEdge) -> None: ...
-    async def find_node(self, scope: str, label: str) -> Optional[GraphNode]: ...
+    async def find_node(self, scope: str, label: str, *,
+                        audience: str) -> Optional[GraphNode]: ...
     async def find_nodes_by_embedding(self, scope: str, embedding: list[float],
-                                      *, limit: int = 5) -> list[GraphNode]: ...
+                                      *, audience: str,
+                                      limit: int = 5) -> list[GraphNode]: ...
     # Returns ACCEPTED edges only, and deliberately has no flag to say otherwise: a walk feeds
     # the prompt, and "show me the unreviewed ones too" is a curation question, not a retrieval
     # one. A keyword that could turn the filter off is a keyword someone eventually passes.
-    async def walk(self, scope: str, start_label: str, *, max_depth: int = 2) -> list[GraphEdge]: ...
+    async def walk(self, scope: str, start_label: str, *, audience: str,
+                   max_depth: int = 2) -> list[GraphEdge]: ...
     # Curation (see ``types.VALID_EDGE_STATUS``): what is waiting for a human, and the verdict.
-    async def pending_edges(self, scope: str, *, limit: int = 100) -> list[GraphEdge]: ...
+    async def pending_edges(self, scope: str, *, audience: str,
+                            limit: int = 100) -> list[GraphEdge]: ...
     async def set_edge_status(self, scope: str, source: str, target: str, relation: str,
                               status: str) -> bool: ...
-    async def neighbors(self, scope: str, label: str) -> list[GraphNode]: ...
-    async def get_node_context(self, scope: str, label: str) -> Optional[NodeContext]: ...
-    async def list_nodes(self, scope: str, *, node_type: Optional[str] = None,
+    # The way BACK. `upsert_edge` is narrow-never-widen, so re-writing cannot undo a
+    # classification — and `classify_edge_audience` promotes `''` to `tenant`, the widest step
+    # there is. Without an explicit setter that migration would be irreversible.
+    async def set_edge_audience(self, scope: str, source: str, target: str, relation: str,
+                                audience: str) -> bool: ...
+
+    async def neighbors(self, scope: str, label: str, *,
+                        audience: str) -> list[GraphNode]: ...
+    async def get_node_context(self, scope: str, label: str, *,
+                               audience: str) -> Optional[NodeContext]: ...
+    async def list_nodes(self, scope: str, *, audience: str,
+                         node_type: Optional[str] = None,
                          limit: int = 100) -> list[GraphNode]: ...
     # How many nodes carry a label, as a QUERY. `list_nodes` is a page (`ORDER BY id LIMIT n`,
     # no label filter, no offset), so a caller asking "is this label unique?" over it gets the
     # right answer only while the tenant stays smaller than the page — and a homonym created
     # past the cut is simply invisible. That is a live defect the host had to work around by
     # refusing to answer whenever the page came back full.
-    async def count_nodes(self, scope: str, *, label: Optional[str] = None) -> int: ...
+    async def count_nodes(self, scope: str, *, audience: str,
+                          label: Optional[str] = None) -> int: ...
     # The graph half of the maintenance walk — see ``MemoryStore.scan_memories``.
-    async def scan_nodes(self, scope: str, *, after_id: Optional[int] = None,
+    async def scan_nodes(self, scope: str, *, audience: str,
+                         after_id: Optional[int] = None,
                          limit: int = 1000) -> list[GraphNode]: ...
+    # ORPHAN PREDICATE — every edge, ANY audience, any status, deliberately. It takes no
+    # `audience` and that is the point: the caller is `prune_orphan_nodes`, which DELETES, and
+    # a filtered read there does not narrow what is seen, it widens what is destroyed — a node
+    # whose edges all belong to another contact would look unattached and be removed. The
+    # question "does anything point at this node" has no audience.
+    async def has_edges(self, scope: str, label: str) -> bool: ...
+
     async def delete_node(self, scope: str, label: str) -> bool: ...
     # Feedback-driven pruning: drop every edge a (disliked) session asserted. Returns the rows
     # removed, and RAISES ``ValueError`` on a blank ``session_id``: a blank is not a wildcard —

@@ -33,6 +33,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional, Union
 
 from cogno_engram.ports import KnowledgeGraph, MemoryStore
 from cogno_engram.types import (
+    AUDIENCE_UNCLASSIFIED,
     EDGE_ACCEPTED,
     EDGE_PROPOSED,
     DEFAULT_CONFIDENCE,
@@ -221,7 +222,8 @@ async def _extract_relations(kg: KnowledgeGraph, backend: Any, *, scope: str, se
                              system: str, prompt: str,
                              edge_filter: Optional[Callable[[str, str, str], bool]] = None,
                              status: "Union[str, Callable[[str, str, str], str]]" =
-                             EDGE_ACCEPTED) -> int:
+                             EDGE_ACCEPTED,
+                             audience: str = AUDIENCE_UNCLASSIFIED) -> int:
     """LLM relation extraction → upsert nodes + edges (source_session tagged).
 
     ``edge_filter(source, target, relation) -> bool`` (optional) vetoes edges before upsert
@@ -263,7 +265,7 @@ async def _extract_relations(kg: KnowledgeGraph, backend: Any, *, scope: str, se
         # guard would be a branch the public path can never reach.
         st = status(src, tgt, rel) if callable(status) else status
         await kg.upsert_edge(GraphEdge(scope, src, tgt, rel, conf, source_session=session_id,
-                                          status=st))
+                                          status=st, audience=audience))
         edges += 1
     return edges
 
@@ -354,6 +356,7 @@ async def periodic_consolidate(
     relation_prompt: str = DEFAULT_RELATION_PROMPT,
     edge_filter: Optional[Callable[[str, str, str], bool]] = None,
     propose_relations: "Union[bool, Callable[[str, str, str], bool]]" = False,
+    audience: str = AUDIENCE_UNCLASSIFIED,
 ) -> list[MemoryRecord]:
     """Tier 2 — periodic LLM extraction over the last ``batch_n`` (non-disliked) turns.
 
@@ -374,6 +377,13 @@ async def periodic_consolidate(
     invention — which argues for review; but flipping the default would, on the next deploy,
     silently empty the graph block of every host already running, with nothing in the logs
     saying why. The host that has somewhere to review them turns it on.
+
+    ``audience`` is stamped on every edge this extraction writes — the CONTACT whose
+    conversation it came from, as ``audience_for(identity)``. It defaults to unclassified, and
+    that default is a real cost, not a formality: an edge written without it is visible to staff
+    and to NOBODY else, so a host that does not pass one gives the contact a graph that never
+    mentions their own life. The default is still the safe direction (a missing declaration must
+    not become a tenant-wide fact), and the host is the only layer that knows whose turn it is.
 
     **It also takes a PREDICATE** — ``propose_relations(source, target, relation) -> bool`` —
     because "review everything or review nothing" is the wrong granularity for the thing being
@@ -409,7 +419,8 @@ async def periodic_consolidate(
                                  turns=turns, embedder=embedder,
                                  system=relation_system, prompt=relation_prompt,
                                  edge_filter=edge_filter,
-                                 status=_status_rule(propose_relations))
+                                 status=_status_rule(propose_relations),
+                                 audience=audience)
     logger.info("stage=hypnos tier=2 event=periodic_done turns=%d extracted=%d",
                 len(turns), len(mems))
     return mems

@@ -20,6 +20,9 @@ from dataclasses import replace
 
 
 from cogno_engram.types import (
+    AUDIENCE_STAFF,
+    audience_can_read,
+    sanitize_audience,
     EDGE_ACCEPTED,
     EDGE_PROPOSED,
     require_edge_status,
@@ -402,6 +405,27 @@ class InMemoryGraph:
         self._edges: list[GraphEdge] = []
         self._next_id = 1
 
+    # ── audience ────────────────────────────────────────────────────────────
+    #
+    # "Tenant sees everything; an identity sees only its own life. They do not mix."
+    # The filter is on the EDGE (see `types.audience_can_read` for why the node cannot carry
+    # it), and node visibility is DERIVED: a node is visible to a reader if some edge that
+    # reader may see touches it. An orphan node — one no visible edge reaches — is staff-only,
+    # which is right: a bare label is the weakest thing the graph holds and belongs to nobody.
+
+    def _readable(self, scope: str, audience: str) -> "list[GraphEdge]":
+        return [e for e in self._edges
+                if e.scope == scope and audience_can_read(audience, e.audience)]
+
+    def _visible_labels(self, scope: str, audience: str) -> "set[str]":
+        if audience == AUDIENCE_STAFF:
+            return {lbl for (sc, lbl) in self._nodes if sc == scope}
+        out: set[str] = set()
+        for e in self._readable(scope, audience):
+            out.add(e.source.lower())
+            out.add(e.target.lower())
+        return out
+
     async def upsert_node(self, node: GraphNode) -> int:
         _require_scope(node.scope)
         key = (node.scope, node.label.lower())
@@ -444,6 +468,13 @@ class InMemoryGraph:
                     return
                 existing.confidence = edge.confidence
                 existing.source_session = edge.source_session
+                # Audience may be NARROWED but never widened — the same shape as `status`, and
+                # the direction that cannot leak: an edge already private to someone stays
+                # private even when a later writer forgets to declare one. The Postgres twin
+                # does this in its `ON CONFLICT`, and the two adapters diverging on a write is
+                # exactly how an edge ends up visible in one store and not the other.
+                if not existing.audience:
+                    existing.audience = sanitize_audience(edge.audience)
                 # Merge, never replace: the LLM that re-proposes an edge must not wipe the
                 # detail a human typed. (Key-level: the LLM CAN overwrite a value for a key it
                 # also emits — what is protected is the keys it omits.)
@@ -462,19 +493,25 @@ class InMemoryGraph:
                 return
         self._edges.append(_detached(edge))   # never alias the caller's object
 
-    async def find_node(self, scope: str, label: str) -> Optional[GraphNode]:
+    async def find_node(self, scope: str, label: str, *,
+                        audience: str) -> Optional[GraphNode]:
         _require_scope(scope)
+        if label.lower() not in self._visible_labels(scope, audience):
+            return None
         return self._nodes.get((scope, label.lower()))
 
     async def find_nodes_by_embedding(self, scope: str, embedding: list[float],
-                                      *, limit: int = 5) -> list[GraphNode]:
+                                      *, audience: str, limit: int = 5) -> list[GraphNode]:
         _require_scope(scope)
+        visible = self._visible_labels(scope, audience)
         scored = [(_cosine(embedding, n.embedding), n)
-                  for n in self._nodes.values() if n.scope == scope and n.embedding]
+                  for n in self._nodes.values()
+                  if n.scope == scope and n.embedding and n.label.lower() in visible]
         scored.sort(key=lambda pair: pair[0], reverse=True)
         return [n for _, n in scored[:limit]]
 
-    async def pending_edges(self, scope: str, *, limit: int = 100) -> list[GraphEdge]:
+    async def pending_edges(self, scope: str, *, audience: str,
+                            limit: int = 100) -> list[GraphEdge]:
         """Oldest first — see the Postgres adapter for why the two must agree on this.
 
         COPIES, not the stored objects. Postgres builds fresh rows and this returned live
@@ -484,8 +521,8 @@ class InMemoryGraph:
         _require_scope(scope)
         if limit <= 0:                  # Postgres raises on a negative LIMIT; agree on empty
             return []
-        return [_detached(e) for e in self._edges
-                if e.scope == scope and e.status == EDGE_PROPOSED][:limit]
+        return [_detached(e) for e in self._readable(scope, audience)
+                if e.status == EDGE_PROPOSED][:limit]
 
     async def set_edge_status(self, scope: str, source: str, target: str, relation: str,
                               status: str) -> bool:
@@ -498,8 +535,22 @@ class InMemoryGraph:
                 return True
         return False
 
-    async def walk(self, scope: str, start_label: str, *, max_depth: int = 2) -> list[GraphEdge]:
+    async def set_edge_audience(self, scope: str, source: str, target: str, relation: str,
+                                audience: str) -> bool:
+        """Explicit re-classification — the only way back from a migration."""
         _require_scope(scope)
+        want = sanitize_audience(audience)
+        for e in self._edges:
+            if (e.scope == scope and e.source.lower() == source.lower()
+                    and e.target.lower() == target.lower() and e.relation == relation):
+                e.audience = want
+                return True
+        return False
+
+    async def walk(self, scope: str, start_label: str, *, audience: str,
+                   max_depth: int = 2) -> list[GraphEdge]:
+        _require_scope(scope)
+        readable = self._readable(scope, audience)
         result: list[GraphEdge] = []
         seen_edges: set[int] = set()
         visited = {start_label.lower()}
@@ -508,9 +559,7 @@ class InMemoryGraph:
             label, depth = frontier.pop(0)
             if depth >= max_depth:
                 continue
-            for edge in self._edges:
-                if edge.scope != scope:
-                    continue
+            for edge in readable:
                 if edge.status != EDGE_ACCEPTED:
                     # Skipped, not merely unreturned: an unreviewed edge must not decide what
                     # the walk can REACH either. Returning it later while letting it route the
@@ -530,11 +579,11 @@ class InMemoryGraph:
                     frontier.append((nxt.lower(), depth + 1))
         return result
 
-    async def neighbors(self, scope: str, label: str) -> list[GraphNode]:
+    async def neighbors(self, scope: str, label: str, *, audience: str) -> list[GraphNode]:
         _require_scope(scope)
         labels: set[str] = set()
-        for edge in self._edges:
-            if edge.scope != scope or edge.status != EDGE_ACCEPTED:
+        for edge in self._readable(scope, audience):
+            if edge.status != EDGE_ACCEPTED:
                 # An unreviewed edge still DISCLOSES its endpoint. The relation label is gone,
                 # but "this person is connected to José" is exactly the unverified claim the
                 # feature holds back — and `NodeContext` hands edges and neighbors to the same
@@ -546,24 +595,30 @@ class InMemoryGraph:
                 labels.add(edge.source.lower())
         return [n for (s, lbl), n in self._nodes.items() if s == scope and lbl in labels]
 
-    async def get_node_context(self, scope: str, label: str) -> Optional[NodeContext]:
+    async def get_node_context(self, scope: str, label: str, *,
+                               audience: str) -> Optional[NodeContext]:
         _require_scope(scope)
         node = self._nodes.get((scope, label.lower()))
-        if node is None:
+        if node is None or label.lower() not in self._visible_labels(scope, audience):
             return None
-        edges = [_detached(e) for e in self._edges
-                 if e.scope == scope and e.status == EDGE_ACCEPTED
+        edges = [_detached(e) for e in self._readable(scope, audience)
+                 if e.status == EDGE_ACCEPTED
                  and label.lower() in (e.source.lower(), e.target.lower())]
-        return NodeContext(node=node, edges=edges, neighbors=await self.neighbors(scope, label))
+        return NodeContext(node=node, edges=edges,
+                           neighbors=await self.neighbors(scope, label, audience=audience))
 
-    async def list_nodes(self, scope: str, *, node_type: Optional[str] = None,
+    async def list_nodes(self, scope: str, *, audience: str,
+                         node_type: Optional[str] = None,
                          limit: int = 100) -> list[GraphNode]:
         _require_scope(scope)
-        nodes = [n for (s, _), n in self._nodes.items()
-                 if s == scope and (node_type is None or n.node_type == node_type)]
+        visible = self._visible_labels(scope, audience)
+        nodes = [n for (s, lbl), n in self._nodes.items()
+                 if s == scope and lbl in visible
+                 and (node_type is None or n.node_type == node_type)]
         return nodes[:limit]
 
-    async def count_nodes(self, scope: str, *, label: Optional[str] = None) -> int:
+    async def count_nodes(self, scope: str, *, audience: str,
+                          label: Optional[str] = None) -> int:
         """How many nodes this scope holds, or how many carry ``label`` (case-insensitively).
 
         Case-insensitive because that is how every other node read matches: `find_node` and
@@ -572,18 +627,30 @@ class InMemoryGraph:
         """
         _require_scope(scope)
         want = label.strip().casefold() if label is not None else None
-        return sum(1 for (s, _), n in self._nodes.items()
-                   if s == scope and (want is None
-                                      or (n.label or "").strip().casefold() == want))
+        visible = self._visible_labels(scope, audience)
+        return sum(1 for (s, lbl), n in self._nodes.items()
+                   if s == scope and lbl in visible
+                   and (want is None
+                        or (n.label or "").strip().casefold() == want))
 
-    async def scan_nodes(self, scope: str, *, after_id: Optional[int] = None,
+    async def scan_nodes(self, scope: str, *, audience: str,
+                         after_id: Optional[int] = None,
                          limit: int = 1000) -> list[GraphNode]:
         _require_scope(scope)
-        nodes = sorted((n for (s, _), n in self._nodes.items() if s == scope),
+        visible = self._visible_labels(scope, audience)
+        nodes = sorted((n for (s, lbl), n in self._nodes.items()
+                        if s == scope and lbl in visible),
                        key=lambda n: n.id or 0)
         if after_id is not None:
             nodes = [n for n in nodes if (n.id or 0) > after_id]
         return nodes[:limit]
+
+    async def has_edges(self, scope: str, label: str) -> bool:
+        """Every edge, any audience, any status — see the port for why it takes no audience."""
+        _require_scope(scope)
+        want = label.lower()
+        return any(e.scope == scope and want in (e.source.lower(), e.target.lower())
+                   for e in self._edges)
 
     async def delete_node(self, scope: str, label: str) -> bool:
         _require_scope(scope)

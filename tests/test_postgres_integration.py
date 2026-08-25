@@ -711,3 +711,39 @@ async def test_admin_traces_the_since_window_applies_to_the_PREFIX_row_too(store
         "a linha NO prefixo atravessou a janela do `since`"
     )
     assert total == 1
+
+
+# ── count_nodes: the query the uniqueness question needed ─────────────────
+
+async def test_pg_count_nodes_answers_beyond_the_page(graph):
+    """`list_nodes` is `ORDER BY id LIMIT n` with no label filter — the host had to refuse to
+    answer whenever that page came back full, because a homonym past the cut is invisible."""
+    scope = f"t/{uuid4()}"
+    for i in range(120):
+        await graph.upsert_node(GraphNode(scope, f"Contato {i}", "PERSON"))
+    await graph.upsert_node(GraphNode(scope, "Maria", "PERSON"))
+
+    assert await graph.count_nodes(scope) == 121
+    assert await graph.count_nodes(scope, label="maria") == 1        # case-insensitive
+    assert len(await graph.list_nodes(scope, limit=50)) == 50        # the page, for contrast
+
+
+async def test_pg_count_nodes_SEES_the_homonym_the_double_collapses(graph):
+    """The case the whole feature exists for, and the one the in-memory double gets wrong.
+
+    The unique index is `(scope, lower(label), node_type)`, so `José/PERSON` and `José/CONCEPT`
+    are two rows — and `walk` seeds on the LABEL, so it expands from both. A Tier-2 extraction
+    creating "José" as a CONCEPT while the contact is a PERSON is exactly how a tenant gets
+    there. See `test_count_nodes.py::test_the_DOUBLE_collapses_a_homonym_the_real_store_keeps`."""
+    scope = f"t/{uuid4()}"
+    await graph.upsert_node(GraphNode(scope, "José", "PERSON"))
+    await graph.upsert_node(GraphNode(scope, "José", "CONCEPT"))
+
+    assert await graph.count_nodes(scope, label="José") == 2
+
+
+async def test_pg_count_nodes_scopes_and_zeroes(graph):
+    mine, theirs = f"t/{uuid4()}", f"t/{uuid4()}"
+    await graph.upsert_node(GraphNode(theirs, "José", "PERSON"))
+    assert await graph.count_nodes(mine) == 0
+    assert await graph.count_nodes(mine, label="José") == 0

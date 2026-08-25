@@ -956,6 +956,24 @@ class PostgresKnowledgeGraph(_PgBase):
                           created_at=r["created_at"], updated_at=r["updated_at"])
                 for r in rows]
 
+    async def count_nodes(self, scope: str, *, label: Optional[str] = None) -> int:
+        """How many nodes this scope holds, or how many carry ``label``.
+
+        `lower(label)` on both sides, matching `find_node` and the `walk` seed — the unique index
+        `uq_nodes_scope_label_type` is on `(scope, lower(label), node_type)`, so this is the
+        expression the planner already has an index for.
+        """
+        _require_scope(scope)
+        sql = "SELECT count(*) AS n FROM knowledge_nodes WHERE scope = %s"
+        params: list = [scope]
+        if label is not None:
+            sql += " AND lower(label) = lower(%s)"
+            params.append(label.strip())
+        async with self._conn() as conn:
+            cur = await conn.execute(sql, params)
+            row = await cur.fetchone()
+        return int(row["n"] if isinstance(row, dict) else row[0])
+
     async def scan_nodes(self, scope: str, *, after_id: Optional[int] = None,
                          limit: int = 1000) -> list[GraphNode]:
         _require_scope(scope)

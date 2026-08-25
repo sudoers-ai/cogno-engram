@@ -104,6 +104,11 @@ verdict. Re-asserting merges `attributes` and may promote a proposal, never demo
 
 `pending_edges` returns **oldest first** so a bounded queue drains.
 
+`count_nodes(scope, label=…)` answers "how many nodes carry this label" without paging. A host
+anchoring anything on a node — *"this is the contact's own node"* — needs it: `walk` seeds on
+`lower(label)` and `knowledge_nodes` has no unique constraint on `(scope, label)` alone, so a
+label can name more than one node and the walk will expand from all of them.
+
 ## Feedback-driven quality
 
 The host captures reactions and writes the signal; engram honours it:

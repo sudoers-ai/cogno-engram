@@ -652,3 +652,62 @@ async def test_pg_an_explicit_None_attributes_does_not_poison_the_next_merge(gra
     await graph.upsert_edge(GraphEdge(scope, "José", "Pedro", "PARENT_OF", attributes=None))
     await graph.upsert_edge(GraphEdge(scope, "José", "Pedro", "PARENT_OF", attributes={"age": 8}))
     assert (await graph.walk(scope, "José"))[0].attributes == {"age": 8}
+
+
+@pytest.mark.asyncio
+async def test_admin_traces_a_scope_with_LIKE_metacharacters_does_not_leak(store):
+    """O comportamento que os testes puros só conseguem provar pela FORMA.
+
+    O scope é opaco: pode conter `%`, `_` e `\\`, e cada um vira curinga dentro de um `LIKE`. Sem
+    o escaping, prefixo `_` puxa todo scope de um caractere e prefixo `%` puxa TUDO — e o que
+    volta aqui é o traço COMPLETO do turno de outro tenant.
+
+    Este caso corre contra Postgres a sério; `tests/test_subtree_escaping.py` cobre o mesmo pelo
+    padrão, sem banco, para a rede existir também na máquina de quem desenvolve."""
+    from cogno_engram.types import TurnTrace
+
+    marca = uuid4().hex[:8]
+    prefixo = f"t{marca}_a"                       # `_` é curinga de UM caractere no LIKE
+    intrusos = [f"t{marca}Xa/u1", f"t{marca}za/u1", f"t{marca}-a/u1"]
+
+    # `turn_traces.session_id` é UUID no schema — string livre rebenta com
+    # InvalidTextRepresentation. O in-memory aceita qualquer string, e foi por isso que a
+    # primeira versão passou 196 verdes sem nunca tocar o banco.
+    await store.save_turn_trace(TurnTrace(str(uuid4()), prefixo, 0, {"quem": "dono"}))
+    await store.save_turn_trace(TurnTrace(str(uuid4()), f"{prefixo}/filho", 1,
+                                          {"quem": "filho"}))
+    for i, alheio in enumerate(intrusos):
+        await store.save_turn_trace(TurnTrace(str(uuid4()), alheio, 2 + i, {"quem": alheio}))
+
+    rows, total = await store.admin_traces(prefixo)
+    voltaram = {r.scope for r in rows}
+
+    assert voltaram == {prefixo, f"{prefixo}/filho"}, (
+        f"vazou para fora da subárvore: {sorted(voltaram - {prefixo, f'{prefixo}/filho'})}"
+    )
+    assert total == 2, "o total tem de respeitar a mesma fronteira que a página"
+
+
+@pytest.mark.asyncio
+async def test_admin_traces_the_since_window_applies_to_the_PREFIX_row_too(store):
+    """O `since` tem de valer para a linha que está NO prefixo, não só para as descendentes.
+
+    O teste vizinho semeia apenas descendentes, então o ramo `scope = %s` nunca chega a ter linha
+    — e a mutação que tira os parênteses do `_SUBTREE` (fazendo o `AND created_at >= %s` ligar-se
+    só ao ramo do LIKE) passava despercebida. É preciso semear o PRÓPRIO prefixo."""
+    from datetime import datetime, timedelta, timezone
+
+    from cogno_engram.types import TurnTrace
+
+    tenant = f"t{uuid4().hex[:8]}"
+    t0 = datetime(2026, 8, 20, 12, 0, tzinfo=timezone.utc)
+    await store.save_turn_trace(TurnTrace(str(uuid4()), tenant, 0, {"quando": "velho"},
+                                          created_at=t0))
+    await store.save_turn_trace(TurnTrace(str(uuid4()), f"{tenant}/u1", 1, {"quando": "novo"},
+                                          created_at=t0 + timedelta(hours=2)))
+
+    rows, total = await store.admin_traces(tenant, since=t0 + timedelta(hours=1))
+    assert [r.trace["quando"] for r in rows] == ["novo"], (
+        "a linha NO prefixo atravessou a janela do `since`"
+    )
+    assert total == 1

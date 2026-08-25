@@ -261,20 +261,39 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
         "CREATE INDEX IF NOT EXISTS idx_turns_scope_time ON turns (scope, created_at DESC, id DESC)",
         "CREATE INDEX IF NOT EXISTS idx_turns_session ON turns (session_id, turn_n)",
         "CREATE INDEX IF NOT EXISTS idx_turn_traces_session ON turn_traces (session_id, turn_n)",
-        # `admin_traces` lê uma SUBÁRVORE de escopo ordenada por tempo, e não tinha índice
-        # nenhum que a servisse — enquanto o `admin_turns` irmão, igualmente uma leitura de
-        # manutenção, tem o seu. A assimetria era o achado; o custo absoluto ainda não.
+        # `admin_traces` lê uma SUBÁRVORE de escopo ordenada por tempo. O ramo `scope = %s` já
+        # era servido pela UNIQUE `(scope, session_id, turn_n)`; o que NÃO tinha índice era o
+        # ramo do LIKE — e é por isso que o `BitmapOr` do plano usa os dois. (A primeira versão
+        # deste comentário dizia "não tinha índice nenhum que a servisse" e contradizia-se seis
+        # linhas abaixo.)
         #
-        # `text_pattern_ops` NÃO é decoração, e é a parte que uma correcção "óbvia" erra: a
-        # base corre em `en_US.utf8`, e num collation que não seja C um btree COMUM não serve
-        # `LIKE 'prefixo/%'`. Medido em 200k linhas, um tenant a 0,025% da tabela:
+        # `text_pattern_ops` NÃO é decoração, e é a parte que uma correcção "óbvia" erra: num
+        # collation que não seja C — esta base é `en_US.utf8` — um btree COMUM não serve
+        # `LIKE 'prefixo/%'`, e o planeador nem o considera. Medido em 200k linhas, um tenant a
+        # 0,025% da tabela:
         #
         #     sem índice              Parallel Seq Scan   12,8 ms
         #     btree comum             Parallel Seq Scan   13,0 ms   ← o índice nem é considerado
         #     text_pattern_ops        Bitmap Heap Scan     0,21 ms
         #
-        # O ramo `scope = %s` já era servido pela UNIQUE `(scope, session_id, turn_n)`; o que
-        # faltava era o ramo do LIKE, e é por isso que o `BitmapOr` do plano usa os dois.
+        # ATENÇÃO ao irmão citado como modelo: `idx_turns_scope_time` é btree COMUM, logo pelo
+        # mesmo argumento não serve o ramo do LIKE do `admin_turns` nem do `admin_scopes`.
+        # Medido a 200k COM esse índice presente, ambos dão `Parallel Seq Scan on turns`. Este
+        # commit fecha um terço do padrão; os outros dois ficam nomeados aqui em vez de
+        # implícitos — corrigi-los mexe numa tabela mais quente e merece medição própria.
+        #
+        # `created_at` no segundo lugar GANHA o seu lugar, e a medição contraria a leitura de
+        # amostra única (uma corrida dizia "empate"; sete dizem outra coisa). Subárvore gorda
+        # (20k linhas) com `since` selectivo, medianas de 7 corridas:
+        #
+        #     (scope)                 mediana 10,97 ms   índice 2208 kB
+        #     (scope, created_at)     mediana  4,84 ms   índice 7560 kB   ← 2,3× mais rápido
+        #
+        # Custo: 3,4× o tamanho do índice e ~10% em insert (92,0 → 101,5 ms por 20k). Aceite.
+        #
+        # O `DESC`, esse, NUNCA é lido: um `BitmapOr` não preserva ordem de índice, e todos os
+        # planos acabam num `Sort  Sort Key: created_at DESC` explícito. Fica por consistência
+        # de forma com os irmãos, não por desempenho — DESC e ASC medem igual.
         "CREATE INDEX IF NOT EXISTS idx_turn_traces_scope_time "
         "ON turn_traces (scope text_pattern_ops, created_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_memories_scope_time ON memories (scope, created_at DESC)",

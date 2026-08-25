@@ -747,3 +747,46 @@ async def test_pg_count_nodes_scopes_and_zeroes(graph):
     await graph.upsert_node(GraphNode(theirs, "José", "PERSON"))
     assert await graph.count_nodes(mine) == 0
     assert await graph.count_nodes(mine, label="José") == 0
+
+
+@pytest.mark.asyncio
+async def test_admin_traces_does_not_seq_scan_the_whole_table(store):
+    """O índice da subárvore existe E é USADO — medido pelo plano, não pela DDL.
+
+    Um teste que só afirmasse "a DDL contém o CREATE INDEX" passaria com um índice que o
+    planeador nunca escolhe, que foi exactamente o que aconteceu com a correcção "óbvia": num
+    collation que não seja C (esta base é `en_US.utf8`), um btree COMUM não serve
+    `LIKE 'prefixo/%'`, e o plano continua Seq Scan com o índice criado ao lado. Só
+    `text_pattern_ops` o torna elegível.
+
+    Por isso a asserção é sobre o PLANO. É mais frágil que uma asserção de DDL — uma tabela
+    pequena de mais faz o planeador preferir Seq Scan por ser genuinamente mais barato —, e é
+    por isso que este teste semeia o suficiente para a escolha deixar de ser trivial."""
+    from datetime import datetime, timedelta, timezone
+
+    from cogno_engram.types import TurnTrace
+
+    marca = uuid4().hex[:8]
+    t0 = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    # muitos escopos, um alvo raro: é a forma da produção, e a única em que um índice ganha
+    for i in range(2000):
+        await store.save_turn_trace(TurnTrace(str(uuid4()), f"{marca}{i % 400:03d}/u{i % 7}",
+                                              i % 30, {"i": i},
+                                              created_at=t0 + timedelta(minutes=i)))
+
+    async with store._conn() as conn:                              # type: ignore[attr-defined]
+        await conn.execute("ANALYZE turn_traces")
+        async with conn.cursor() as cur:
+            await cur.execute(
+                "EXPLAIN SELECT session_id, scope, turn_n, trace, created_at FROM turn_traces "
+                "WHERE (scope = %s OR scope LIKE %s ESCAPE '\\') AND created_at >= %s "
+                "ORDER BY created_at DESC LIMIT 30",
+                (f"{marca}007", f"{marca}007/%", t0))
+            # a conexão usa row_factory de dict — a coluna do EXPLAIN chama-se "QUERY PLAN"
+            plano = "\n".join(
+                (r["QUERY PLAN"] if isinstance(r, dict) else r[0])
+                for r in await cur.fetchall())
+
+    assert "idx_turn_traces_scope_time" in plano, (
+        f"o índice da subárvore não foi usado — o plano foi:\n{plano}"
+    )

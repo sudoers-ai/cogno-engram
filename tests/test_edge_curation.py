@@ -306,10 +306,16 @@ async def test_the_queue_hands_out_COPIES_not_the_stored_edge(kg):
 
 async def test_a_non_positive_limit_means_EMPTY_in_both_stores(kg):
     """Postgres raises on a negative LIMIT and this truncated. A curator paginating with
-    `limit = cap - shown` hits zero eventually."""
-    await kg.upsert_edge(edge("José", "Pedro", "PARENT_OF", status=EDGE_PROPOSED))
+    `limit = cap - shown` hits zero eventually.
+
+    TWO proposals, and that is the whole test: with one, `["a"][:-1]` is already `[]` and the
+    assertion passed with the guard deleted — measured. A guard whose absence looks identical
+    is not guarded, it is coincidence."""
+    for target in ("Pedro", "Rex"):
+        await kg.upsert_edge(edge("José", target, "FRIEND_OF", status=EDGE_PROPOSED))
     assert await kg.pending_edges(SCOPE, limit=0) == []
     assert await kg.pending_edges(SCOPE, limit=-1) == []
+    assert len(await kg.pending_edges(SCOPE, limit=1)) == 1      # ...and a real one still works
 
 
 def test_the_curation_vocabulary_is_reachable_from_the_PACKAGE_ROOT():
@@ -339,3 +345,36 @@ async def test_a_proposal_still_creates_its_ENDPOINT_NODES_and_that_is_a_known_b
     await kg.upsert_edge(edge("José", "Amante Secreta", "FRIEND_OF", status=EDGE_PROPOSED))
     assert {n.label for n in await kg.list_nodes(SCOPE)} == {"José", "Amante Secreta"}
     assert format_graph_context(await kg.walk(SCOPE, "José")) == ""      # never spoken
+
+
+# ── what a read hands out is a COPY ───────────────────────────────────────
+
+async def test_no_read_hands_out_the_stored_edge(kg):
+    """Every read used to return the STORED object, so a caller that touched what it was given
+    changed what the prompt says — and Postgres, which builds fresh rows, did not. A review
+    measured `walk(...)[0].attributes["note"] = "LEAKED"` rendering into the in-memory block and
+    not into the Postgres one: same code, two prompts, on the one invariant this module is.
+
+    All four doors, including the caller's own object: `upsert_edge` used to store the instance
+    it was handed, so whoever built it kept a live handle on the store."""
+    mine = edge("José", "Maria", "SPOUSE_OF", attributes={"since": "2010"})
+    await kg.upsert_edge(mine)
+
+    mine.attributes["note"] = "via the caller's own alias"
+    (await kg.walk(SCOPE, "José"))[0].attributes["note"] = "via the walk result"
+    (await kg.get_node_context(SCOPE, "José")).edges[0].attributes["note"] = "via node_context"
+    await kg.upsert_edge(edge("José", "Ana", "FRIEND_OF", status=EDGE_PROPOSED))
+    (await kg.pending_edges(SCOPE))[0].attributes["note"] = "via the queue"
+
+    spoken = format_graph_context(await kg.walk(SCOPE, "José"))
+    assert "via the" not in spoken, spoken
+    assert "since: 2010" in spoken
+
+
+async def test_the_copy_is_deep_enough_to_matter(kg):
+    """`dataclasses.replace` alone is SHALLOW — the copy would share its `attributes` dict with
+    the store, so mutating that dict still lands. Pinned because the shallow version passes
+    every other test here: `walk` filters proposals out anyway, which masks it."""
+    await kg.upsert_edge(edge("José", "Maria", "SPOUSE_OF", attributes={"since": "2010"}))
+    handed = (await kg.walk(SCOPE, "José"))[0]
+    assert handed.attributes is not (await kg.walk(SCOPE, "José"))[0].attributes

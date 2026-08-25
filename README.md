@@ -77,6 +77,37 @@ equivalent of the parent's LIST(tenant), with zero DDL per new scope):
 await ensure_schema(conn, partition_by_scope=True, partitions=8)
 ```
 
+## Edge curation — who asserted it decides whether it is spoken
+
+A graph edge becomes a sentence the agent states about a person **as if it knew**. "Your son Pedro" is either a kindness or an invention, and nothing downstream can tell which — so the difference rides on the edge:
+
+```python
+GraphEdge(scope, "José", "Pedro", "PARENT_OF", attributes={"age": 8})            # asserted
+GraphEdge(scope, "José", "Rex", "OWNS_PET", status="proposed")                   # waiting
+```
+
+| | |
+| --- | --- |
+| `walk()` | returns **`accepted` only**, and has no flag to say otherwise |
+| traversal | a proposal is **skipped**, not merely filtered from the result |
+| `format_graph_context` | repeats the filter at the last step before text |
+| `pending_edges` / `set_edge_status` | the curation queue and the verdict |
+
+The detail is what reaches the prompt, not just the store:
+
+```
+[Knowledge Graph]
+- José --[PARENT_OF]--> Pedro (age: 8; note: joga futebol no sábado)
+```
+
+Bounded per edge and newline-flattened — the value comes from a person typing into an admin field, and a line break inside a bullet turns one fact into what reads as two.
+
+The missing flag is deliberate: a walk feeds the prompt, and "show me the unreviewed ones too" is a curation question, not a retrieval one. Skipping the traversal is the half that is easy to miss — filter only the result and a proposal still decides what the walk can *reach*, leaking the same unverified claim one hop further away.
+
+`hypnos.periodic_consolidate(propose_relations=True)` makes Tier 2 propose instead of assert. **Opt-in**, because flipping the default would silently empty the graph block of every host already running. Re-asserting an edge merges its attributes and may *promote* a proposal, but never demotes a verdict — a review the next LLM pass could expire is a review nobody would do. `rejected` is **sticky**: `upsert_edge` cannot tell a deliberate correction from the LLM re-emitting the same edge, and it defaults to `accepted`, so promoting from `rejected` would resurrect every rejected edge on the next Tier-2 run. `set_edge_status` is the way back, and undoing a human verdict taking a human is the point.
+
+`pending_edges` returns **oldest first** in both adapters: with a `limit` and no cursor, newest-first would make the oldest proposals — the ones a curator most needs to clear — permanently unreachable, and the queue would never drain.
+
 ## Maintenance (sleep-time upkeep)
 
 Like `hypnos`, the host schedules; engram does the work — keeping the substrate

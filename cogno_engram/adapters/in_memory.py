@@ -16,7 +16,12 @@ from datetime import datetime, timedelta, timezone
 from typing import AsyncIterator, Optional
 from uuid import uuid4
 
+from dataclasses import replace
+
 from cogno_engram.types import (
+    EDGE_ACCEPTED,
+    EDGE_PROPOSED,
+    require_edge_status,
     GraphEdge,
     GraphNode,
     HybridWeights,
@@ -395,8 +400,32 @@ class InMemoryGraph:
             if (existing.scope == edge.scope and existing.source.lower() == edge.source.lower()
                     and existing.target.lower() == edge.target.lower()
                     and existing.relation == edge.relation):
+                if existing.status == EDGE_ACCEPTED and edge.status == EDGE_PROPOSED:
+                    # A PROPOSAL cannot modify a VERDICT — in any field, not just `status`.
+                    # The gate used to cover `status` alone while `attributes` merged straight
+                    # through, and `_detail` puts attributes in the prompt: a caller that marked
+                    # the whole edge unreviewed had its relation held and its free text SPOKEN
+                    # ("Pedro (note: expelled from school for cheating)"). Reviewed means
+                    # reviewed as it stood; a proposal with something to add needs its own turn
+                    # through the queue.
+                    return
                 existing.confidence = edge.confidence
                 existing.source_session = edge.source_session
+                # Merge, never replace: the LLM that re-proposes an edge must not wipe the
+                # detail a human typed. (Key-level: the LLM CAN overwrite a value for a key it
+                # also emits — what is protected is the keys it omits.)
+                #
+                # A re-assertion promotes a PROPOSAL and never demotes a verdict. `rejected` is
+                # deliberately sticky, and a review was right that the code did not say so: a
+                # rejection is a person stating the claim is WRONG about this contact, and the
+                # next extraction pass must not be able to undo it — `upsert_edge` cannot tell a
+                # deliberate correction from the LLM re-emitting the same edge, and it defaults
+                # to `accepted`, so promoting from `rejected` here would resurrect every
+                # rejected edge on the next Tier-2 run. `set_edge_status` is the way back, and
+                # it is the way back on purpose: undoing a human verdict takes a human.
+                existing.attributes = {**existing.attributes, **edge.attributes}
+                if existing.status == EDGE_PROPOSED:
+                    existing.status = edge.status
                 return
         self._edges.append(edge)
 
@@ -412,6 +441,30 @@ class InMemoryGraph:
         scored.sort(key=lambda pair: pair[0], reverse=True)
         return [n for _, n in scored[:limit]]
 
+    async def pending_edges(self, scope: str, *, limit: int = 100) -> list[GraphEdge]:
+        """Oldest first — see the Postgres adapter for why the two must agree on this.
+
+        COPIES, not the stored objects. Postgres builds fresh rows and this returned live
+        references, so a curation UI that edited a queue item published the edge here and did
+        nothing there — the two stores disagreeing on exactly the invariant this feature is.
+        """
+        _require_scope(scope)
+        if limit <= 0:                  # Postgres raises on a negative LIMIT; agree on empty
+            return []
+        return [replace(e) for e in self._edges
+                if e.scope == scope and e.status == EDGE_PROPOSED][:limit]
+
+    async def set_edge_status(self, scope: str, source: str, target: str, relation: str,
+                              status: str) -> bool:
+        _require_scope(scope)
+        want = require_edge_status(status)
+        for e in self._edges:
+            if (e.scope == scope and e.source.lower() == source.lower()
+                    and e.target.lower() == target.lower() and e.relation == relation):
+                e.status = want
+                return True
+        return False
+
     async def walk(self, scope: str, start_label: str, *, max_depth: int = 2) -> list[GraphEdge]:
         _require_scope(scope)
         result: list[GraphEdge] = []
@@ -424,6 +477,11 @@ class InMemoryGraph:
                 continue
             for edge in self._edges:
                 if edge.scope != scope:
+                    continue
+                if edge.status != EDGE_ACCEPTED:
+                    # Skipped, not merely unreturned: an unreviewed edge must not decide what
+                    # the walk can REACH either. Returning it later while letting it route the
+                    # traversal now would leak the same unverified claim one hop further away.
                     continue
                 if edge.source.lower() == label:
                     nxt = edge.target
@@ -443,7 +501,11 @@ class InMemoryGraph:
         _require_scope(scope)
         labels: set[str] = set()
         for edge in self._edges:
-            if edge.scope != scope:
+            if edge.scope != scope or edge.status != EDGE_ACCEPTED:
+                # An unreviewed edge still DISCLOSES its endpoint. The relation label is gone,
+                # but "this person is connected to José" is exactly the unverified claim the
+                # feature holds back — and `NodeContext` hands edges and neighbors to the same
+                # caller, so filtering one and not the other leaks it through the other field.
                 continue
             if edge.source.lower() == label.lower():
                 labels.add(edge.target.lower())
@@ -457,7 +519,8 @@ class InMemoryGraph:
         if node is None:
             return None
         edges = [e for e in self._edges
-                 if e.scope == scope and label.lower() in (e.source.lower(), e.target.lower())]
+                 if e.scope == scope and e.status == EDGE_ACCEPTED
+                 and label.lower() in (e.source.lower(), e.target.lower())]
         return NodeContext(node=node, edges=edges, neighbors=await self.neighbors(scope, label))
 
     async def list_nodes(self, scope: str, *, node_type: Optional[str] = None,

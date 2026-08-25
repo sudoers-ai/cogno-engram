@@ -32,6 +32,8 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 from cogno_engram.ports import KnowledgeGraph, MemoryStore
 from cogno_engram.types import (
+    EDGE_ACCEPTED,
+    EDGE_PROPOSED,
     DEFAULT_CONFIDENCE,
     VALID_NODE_TYPES,
     GraphEdge,
@@ -216,7 +218,8 @@ async def _embed_and_save(store: MemoryStore, mems: list[MemoryRecord], embedder
 async def _extract_relations(kg: KnowledgeGraph, backend: Any, *, scope: str, session_id: str,
                              turns: list[TurnRecord], embedder: Any,
                              system: str, prompt: str,
-                             edge_filter: Optional[Callable[[str, str, str], bool]] = None) -> int:
+                             edge_filter: Optional[Callable[[str, str, str], bool]] = None,
+                             status: str = EDGE_ACCEPTED) -> int:
     """LLM relation extraction → upsert nodes + edges (source_session tagged).
 
     ``edge_filter(source, target, relation) -> bool`` (optional) vetoes edges before upsert
@@ -253,7 +256,8 @@ async def _extract_relations(kg: KnowledgeGraph, backend: Any, *, scope: str, se
             conf = float(edge.get("confidence", 1.0))
         except (TypeError, ValueError):
             conf = 1.0
-        await kg.upsert_edge(GraphEdge(scope, src, tgt, rel, conf, source_session=session_id))
+        await kg.upsert_edge(GraphEdge(scope, src, tgt, rel, conf, source_session=session_id,
+                                          status=status))
         edges += 1
     return edges
 
@@ -277,6 +281,7 @@ async def periodic_consolidate(
     relation_system: str = DEFAULT_RELATION_SYSTEM,
     relation_prompt: str = DEFAULT_RELATION_PROMPT,
     edge_filter: Optional[Callable[[str, str, str], bool]] = None,
+    propose_relations: bool = False,
 ) -> list[MemoryRecord]:
     """Tier 2 — periodic LLM extraction over the last ``batch_n`` (non-disliked) turns.
 
@@ -289,6 +294,14 @@ async def periodic_consolidate(
     ``edge_filter(source, target, relation) -> bool`` (optional) vetoes relations before they
     are persisted — the caller owns the domain judgement of what belongs in the durable graph
     (e.g. dropping volatile state like an appointment/status that a live tool read should own).
+
+    ``propose_relations`` writes the extracted edges as ``proposed`` instead of ``accepted``, so
+    they wait for a human before a walk can speak them (``KnowledgeGraph.pending_edges`` /
+    ``set_edge_status``). **Opt-in, and deliberately so.** An edge here becomes a sentence the
+    agent states about a person as if it knew — "your son Pedro" is either a kindness or an
+    invention — which argues for review; but flipping the default would, on the next deploy,
+    silently empty the graph block of every host already running, with nothing in the logs
+    saying why. The host that has somewhere to review them turns it on.
     """
     # Scope the read: session_id is a host-derived uuid5 that can collide across scopes, and the
     # extract below is written back into THIS scope — an un-scoped read would fold another tenant's
@@ -304,7 +317,8 @@ async def periodic_consolidate(
         await _extract_relations(kg, backend, scope=kg_scope or scope, session_id=session_id,
                                  turns=turns, embedder=embedder,
                                  system=relation_system, prompt=relation_prompt,
-                                 edge_filter=edge_filter)
+                                 edge_filter=edge_filter,
+                                 status=EDGE_PROPOSED if propose_relations else EDGE_ACCEPTED)
     logger.info("stage=hypnos tier=2 event=periodic_done turns=%d extracted=%d",
                 len(turns), len(mems))
     return mems

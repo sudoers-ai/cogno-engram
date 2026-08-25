@@ -28,7 +28,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import TYPE_CHECKING, Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional, Union
 
 from cogno_engram.ports import KnowledgeGraph, MemoryStore
 from cogno_engram.types import (
@@ -256,13 +256,42 @@ async def _extract_relations(kg: KnowledgeGraph, backend: Any, *, scope: str, se
             conf = float(edge.get("confidence", 1.0))
         except (TypeError, ValueError):
             conf = 1.0
+        # `status` is a value (every edge the same) or a decision PER RELATION. The failure
+        # mode lives with the decision, in `_status_rule` — not duplicated here, where a second
+        # guard would be a branch the public path can never reach.
+        st = status(src, tgt, rel) if callable(status) else status
         await kg.upsert_edge(GraphEdge(scope, src, tgt, rel, conf, source_session=session_id,
-                                          status=status))
+                                          status=st))
         edges += 1
     return edges
 
 
 # ── Tier 2 — periodic (LLM) ───────────────────────────────────────────────────
+
+def _status_rule(propose: "Union[bool, Callable[[str, str, str], bool]]"):
+    """`propose_relations` (bool or predicate) → what `_extract_relations` should stamp.
+
+    A bool keeps the original meaning exactly (every edge the same), so nothing changes for a
+    host that never passes a predicate. A callable is forwarded, and the per-edge decision plus
+    its failure mode live at the single site that applies it.
+    """
+    if not callable(propose):
+        return EDGE_PROPOSED if propose else EDGE_ACCEPTED
+
+    def _decide(source: str, target: str, relation: str) -> str:
+        # A predicate that raises yields `proposed`, never `accepted`: an edge nobody could
+        # classify waits for a human rather than being spoken as fact. Defaulting the other way
+        # would let one broken classifier publish exactly the class it exists to hold back.
+        try:
+            hold = propose(source, target, relation)
+        except Exception:  # noqa: BLE001 — an unclassifiable edge is held, not lost
+            logger.warning("stage=hypnos event=status_predicate_failed relation=%s", relation,
+                           exc_info=True)
+            return EDGE_PROPOSED
+        return EDGE_PROPOSED if hold else EDGE_ACCEPTED
+
+    return _decide
+
 
 async def periodic_consolidate(
     store: MemoryStore,
@@ -281,7 +310,7 @@ async def periodic_consolidate(
     relation_system: str = DEFAULT_RELATION_SYSTEM,
     relation_prompt: str = DEFAULT_RELATION_PROMPT,
     edge_filter: Optional[Callable[[str, str, str], bool]] = None,
-    propose_relations: bool = False,
+    propose_relations: "Union[bool, Callable[[str, str, str], bool]]" = False,
 ) -> list[MemoryRecord]:
     """Tier 2 — periodic LLM extraction over the last ``batch_n`` (non-disliked) turns.
 
@@ -302,6 +331,16 @@ async def periodic_consolidate(
     invention — which argues for review; but flipping the default would, on the next deploy,
     silently empty the graph block of every host already running, with nothing in the logs
     saying why. The host that has somewhere to review them turns it on.
+
+    **It also takes a PREDICATE** — ``propose_relations(source, target, relation) -> bool`` —
+    because "review everything or review nothing" is the wrong granularity for the thing being
+    protected. The edges that become a sentence about a PERSON ("your wife Maria") are a small,
+    nameable class; the rest ("the clinic accepts Unimed") are domain facts a walk should keep
+    stating. All-or-nothing forces a host to choose between speaking unreviewed claims about
+    someone's family and losing its whole knowledge block — and the first host to meet that
+    choice took the first option without noticing. The predicate lets proximity wait for a human
+    while domain relations stay ``accepted``. Same shape and same seam as ``edge_filter``, which
+    already decides per relation what is worth persisting at all.
     """
     # Scope the read: session_id is a host-derived uuid5 that can collide across scopes, and the
     # extract below is written back into THIS scope — an un-scoped read would fold another tenant's
@@ -318,7 +357,7 @@ async def periodic_consolidate(
                                  turns=turns, embedder=embedder,
                                  system=relation_system, prompt=relation_prompt,
                                  edge_filter=edge_filter,
-                                 status=EDGE_PROPOSED if propose_relations else EDGE_ACCEPTED)
+                                 status=_status_rule(propose_relations))
     logger.info("stage=hypnos tier=2 event=periodic_done turns=%d extracted=%d",
                 len(turns), len(mems))
     return mems

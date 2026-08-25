@@ -82,7 +82,10 @@ decides what may be spoken, and engram enforces it:
 ```python
 # an LLM extraction PROPOSES (opt-in; default is still assert, so nothing changes on upgrade)
 await hypnos.periodic_consolidate(store, backend, scope=scope, session_id=sid, kg=kg,
-                                  propose_relations=True)
+                                  # bool, or a predicate per relation: hold the ones that
+                                  # become a sentence about a PERSON, keep domain facts
+                                  # `accepted` so the staff block stays populated.
+                                  propose_relations=lambda s, t, r: r in PROXIMITY)
 
 # the host's curation UI reads the queue and writes the verdict
 for e in await kg.pending_edges(scope):

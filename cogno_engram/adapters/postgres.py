@@ -245,6 +245,22 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
         "CREATE INDEX IF NOT EXISTS idx_turns_scope_time ON turns (scope, created_at DESC, id DESC)",
         "CREATE INDEX IF NOT EXISTS idx_turns_session ON turns (session_id, turn_n)",
         "CREATE INDEX IF NOT EXISTS idx_turn_traces_session ON turn_traces (session_id, turn_n)",
+        # `admin_traces` lê uma SUBÁRVORE de escopo ordenada por tempo, e não tinha índice
+        # nenhum que a servisse — enquanto o `admin_turns` irmão, igualmente uma leitura de
+        # manutenção, tem o seu. A assimetria era o achado; o custo absoluto ainda não.
+        #
+        # `text_pattern_ops` NÃO é decoração, e é a parte que uma correcção "óbvia" erra: a
+        # base corre em `en_US.utf8`, e num collation que não seja C um btree COMUM não serve
+        # `LIKE 'prefixo/%'`. Medido em 200k linhas, um tenant a 0,025% da tabela:
+        #
+        #     sem índice              Parallel Seq Scan   12,8 ms
+        #     btree comum             Parallel Seq Scan   13,0 ms   ← o índice nem é considerado
+        #     text_pattern_ops        Bitmap Heap Scan     0,21 ms
+        #
+        # O ramo `scope = %s` já era servido pela UNIQUE `(scope, session_id, turn_n)`; o que
+        # faltava era o ramo do LIKE, e é por isso que o `BitmapOr` do plano usa os dois.
+        "CREATE INDEX IF NOT EXISTS idx_turn_traces_scope_time "
+        "ON turn_traces (scope text_pattern_ops, created_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_memories_scope_time ON memories (scope, created_at DESC)",
         "CREATE INDEX IF NOT EXISTS idx_memories_tsv ON memories USING gin (tsv)",
         "CREATE INDEX IF NOT EXISTS idx_memories_embedding ON memories "

@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Fixed
+
+- **`admin_traces` ganha o índice que o irmão já tinha.** A leitura de subárvore filtra por escopo
+  + `created_at` e ordenava sem índice nenhum — enquanto o `admin_turns`, igualmente uma leitura de
+  manutenção, tem o seu (`idx_turns_scope_time`). A assimetria era o achado; o custo absoluto ainda
+  não doía.
+
+  **`text_pattern_ops` não é decoração**, e é onde a correcção "óbvia" falha: a base corre em
+  `en_US.utf8`, e num collation que não seja C um btree COMUM **não serve** `LIKE 'prefixo/%'`.
+  Medido em 200k linhas, com um tenant a 0,025% da tabela:
+
+  | índice | plano | tempo |
+  |---|---|---|
+  | nenhum | Parallel Seq Scan | 12,8 ms |
+  | btree comum | Parallel Seq Scan | 13,0 ms — nem é considerado |
+  | `text_pattern_ops` | Bitmap Heap Scan | **0,21 ms** |
+
+  O ramo `scope = %s` já era servido pela UNIQUE `(scope, session_id, turn_n)`; faltava o ramo do
+  LIKE, e é por isso que o `BitmapOr` do plano usa os dois. O teste afirma o **plano**, não a DDL —
+  uma asserção de DDL passaria com um índice que o planeador nunca escolhe, que é exactamente o
+  estado que a correcção óbvia produz.
+
 ### Added
 
 - **`KnowledgeGraph.count_nodes(scope, *, label=None)`** — how many nodes a scope holds, or how

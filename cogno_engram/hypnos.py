@@ -275,6 +275,11 @@ def _accepts_three(params: "Any") -> bool:
     kinds = [p.kind for p in params.values()]
     if any(k is inspect.Parameter.VAR_POSITIONAL for k in kinds):
         return True
+    # A REQUIRED keyword-only parameter is as fatal as a wrong arity: the call site passes three
+    # positionals and nothing else, so `lambda s, t, r, *, flag` raises on every single edge.
+    if any(p.kind is inspect.Parameter.KEYWORD_ONLY and p.default is inspect.Parameter.empty
+           for p in params.values()):
+        return False
     positional = [k for k in kinds if k in (inspect.Parameter.POSITIONAL_ONLY,
                                             inspect.Parameter.POSITIONAL_OR_KEYWORD)]
     required = [p for p in params.values()
@@ -301,7 +306,10 @@ def _status_rule(
     # so the host's graph block quietly EMPTIES — which is the regression the opt-in default
     # exists to prevent, arriving through the option meant to avoid it. A wrong predicate is a
     # programming error at wiring time; it must not be discovered as a slow leak in prod.
-    if inspect.iscoroutinefunction(propose):
+    # `iscoroutinefunction` is False for an OBJECT whose `__call__` is async, and such an object
+    # is just as callable — and just as silently wrong, since the call returns a truthy coroutine.
+    if inspect.iscoroutinefunction(propose) or \
+            inspect.iscoroutinefunction(getattr(propose, "__call__", None)):
         raise TypeError("propose_relations must be a sync predicate: a coroutine function is "
                         "callable, so every edge would be judged on a truthy coroutine object")
     try:
@@ -451,16 +459,17 @@ async def consolidate_session(
                             f"Domains: {', '.join(domains) or 'general'}. Memories: {len(mems)}.")
 
     if disliked and kg is not None:
-        # The prune now REFUSES a blank session id (a blank is not a wildcard). Catch it here:
-        # by this line the LLM pass has run and the memories are saved, and `close_session` is
-        # still ahead — so letting it out would leave the session OPEN and the janitor would
-        # re-consolidate it every tick, duplicating memories. The guard exists to protect the
-        # human-written edges, and it still does; what it must not do is split this write.
-        try:
-            await kg.delete_edges_by_session(kg_scope or session.scope, session.id)
-        except ValueError:
+        # The prune REFUSES a blank session id (a blank is not a wildcard). Check it HERE rather
+        # than catching the raise: by this line the LLM pass has run and the memories are saved,
+        # and `close_session` is still ahead — letting it out would leave the session OPEN and
+        # the janitor would re-consolidate it every tick, duplicating memories. And an
+        # `except ValueError` around the call would also swallow `_require_scope`'s, reporting a
+        # bad SCOPE as a blank session id — a wrong diagnosis is worse than none.
+        if not (session.id or "").strip():
             logger.warning("stage=hypnos tier=3 event=prune_skipped reason=blank_session_id "
                            "scope=%s — feedback pruning needs a real session id", session.scope)
+        else:
+            await kg.delete_edges_by_session(kg_scope or session.scope, session.id)
     if close:
         # scope the WRITE too: the sessions table is keyed by id alone, so without it a colliding
         # id from another tenant would receive this scope's LLM-generated summary.

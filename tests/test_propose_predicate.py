@@ -134,3 +134,25 @@ def test_a_callable_whose_signature_cannot_be_READ_is_allowed_through(monkeypatc
                         _inspect.iscoroutinefunction)
     rule = _status_rule(lambda s, t, r: True)          # shape is fine; it just cannot be read
     assert rule("a", "b", "SPOUSE_OF") == EDGE_PROPOSED
+
+
+@pytest.mark.parametrize("bad,why", [
+    (lambda s, t, r, *, flag: True, "a REQUIRED keyword-only argument"),
+])
+def test_a_predicate_that_cannot_take_three_POSITIONALS_is_refused(bad, why):
+    """`lambda s, t, r, *, flag` reads as arity three and is not: the call site passes three
+    positionals and nothing else, so it raises on every single edge — the same silent
+    everything-becomes-`proposed` as a wrong arity."""
+    with pytest.raises(TypeError, match="source, target, relation"):
+        _status_rule(bad)
+
+
+def test_an_object_whose___call___is_ASYNC_is_refused():
+    """`inspect.iscoroutinefunction` is False for the OBJECT, and the object is just as callable
+    — and just as silently wrong, since calling it yields a truthy coroutine."""
+    class _AsyncCallable:
+        async def __call__(self, s, t, r):
+            return True
+
+    with pytest.raises(TypeError, match="sync predicate"):
+        _status_rule(_AsyncCallable())

@@ -90,6 +90,7 @@ await hypnos.periodic_consolidate(store, backend, scope=scope, session_id=sid, k
                                   # makes `spouse_of` miss the set, and a miss stamps the edge
                                   # `accepted` — failing OPEN, on exactly the class this is
                                   # meant to hold back.
+                                  # from cogno_engram import VALID_PROXIMITY_RELATIONS
                                   propose_relations=lambda s, t, r: (
                                       (r or "").upper() in VALID_PROXIMITY_RELATIONS))
 

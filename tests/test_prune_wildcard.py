@@ -38,16 +38,23 @@ async def test_a_real_session_still_prunes_only_its_own():
     assert [e.relation for e in kg._edges] == ["SPOUSE_OF"]
 
 
-def test_the_POSTGRES_guard_exists_too():
-    """The twin. `tests/test_prune_wildcard.py` exercises the in-memory adapter, and the guard
-    that protects the PRODUCTION adapter was the untested one — deleting it left the suite
-    green. The validator is module-level and needs no database, so the twin costs nothing."""
-    from cogno_engram.adapters.postgres import _require_session as pg_require
+async def test_the_POSTGRES_adapter_REFUSES_it_too():
+    """The twin, and the first version of it did not discriminate.
 
+    It called `_require_session` directly, which tests the validator and not the CALL: deleting
+    the line in `postgres.py` that invokes it left the suite green — a guard on the PRODUCTION
+    adapter, pinned by a test that could not tell whether it ran.
+
+    Going through the real adapter fixes that. The constructor only stores the DSN (`_conn` is
+    lazy), so the refusal happens before any connection is attempted — the unreachable host in
+    the DSN is the proof: if the guard were gone, this would fail trying to connect instead.
+    """
+    from cogno_engram.adapters.postgres import PostgresKnowledgeGraph
+
+    kg = PostgresKnowledgeGraph(dsn="postgresql://x@127.0.0.1:1/x_test")
     for blank in ("", "   ", "\t"):
         with pytest.raises(ValueError, match="not a wildcard"):
-            pg_require(blank)
-    assert pg_require("s1") == "s1"
+            await kg.delete_edges_by_session("acme", blank)
 
 
 async def test_tier_3_does_not_split_its_WRITE_over_a_blank_id(caplog):
@@ -55,7 +62,9 @@ async def test_tier_3_does_not_split_its_WRITE_over_a_blank_id(caplog):
 
     By the prune, `consolidate_session` has already run the LLM pass and saved the memories, and
     `close_session` is still ahead — so a raise escaping here leaves the session OPEN and the
-    janitor re-consolidates it on every tick, duplicating memories.
+    janitor re-consolidates it on every tick, duplicating memories. The id is checked BEFORE
+    the call rather than caught after it, so a bad SCOPE still raises instead of being
+    misreported as a blank session id.
     """
     from cogno_engram.adapters.in_memory import InMemoryStore
     from cogno_engram.hypnos import consolidate_session

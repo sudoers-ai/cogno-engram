@@ -47,6 +47,16 @@
 
 ### Changed
 
+- **O comentário do índice `idx_turn_traces_scope_time` passa a dizer o que foi medido**, em três
+  pontos onde afirmava de mais: contradizia-se ("não tinha índice nenhum que a servisse" vs "o
+  ramo `scope = %s` já era servido pela UNIQUE" — o segundo é o correcto); citava
+  `idx_turns_scope_time` como o irmão que "já tinha" o índice, quando esse irmão é btree COMUM e
+  pelo mesmo argumento não serve o ramo do LIKE dele próprio (medido a 200k, `admin_turns` e
+  `admin_scopes` dão ambos `Parallel Seq Scan on turns` — os outros dois consumidores do padrão
+  ficam NOMEADOS lá); e o `created_at` no segundo lugar, onde uma corrida única dizia "empate" e
+  sete dizem 10,97 ms contra 4,84 ms com as distribuições sem sobreposição. O `DESC`, esse, nunca
+  é lido (o `Sort` explícito por cima do `BitmapOr`) e fica por consistência de forma.
+
 - `PostgresStore.save_turn_trace` now honours `TurnTrace.created_at` when set (the
   in-memory adapter always did); absent, the column default stamps the row as before.
   A backfilled or imported trace no longer reads as "now", so a `since` window over it
@@ -80,6 +90,28 @@ existing walk returns what it returned before. The **contract** does change — 
 stops satisfying it under mypy/`isinstance` until it implements both.
 
 ### Fixed
+
+- **O teste de plano do índice da subárvore ficava VERMELHO em código correcto.** Ele afirmava o
+  NOME do índice; num cluster com collation `C` (`initdb --locale=C`, `postgres:alpine`, qualquer
+  base criada `LC_COLLATE 'C'`) a UNIQUE pré-existente já serve ambos os ramos do OR, não há Seq
+  Scan nenhum — e o teste falhava com uma mensagem a dizer o contrário do que o plano mostrava.
+  Passa a afirmar a ausência de `Seq Scan`, que é a propriedade do próprio título e é verdadeira
+  sob `C`, `en_US.utf8` e ICU. Reproduzido: versão antiga sob `C` vermelha, nova verde.
+
+  Segundo defeito no mesmo teste: ele copiava à mão uma aproximação do SQL em vez de exercitar o
+  `admin_traces`. Uma garantia de desempenho sobre uma consulta que ninguém emite não é garantia
+  — medido, trocar o predicado por um curinga à cabeça (que nenhum índice pode servir) deixava-o
+  VERDE. Agora o SQL é capturado do método e é esse que vai ao EXPLAIN; essa mutação passou a
+  matar. O que ele continua a não apanhar, dito na docstring, é deriva do ORDER BY — um
+  `BitmapOr` nunca preserva ordem, o plano acaba sempre num `Sort`, e a propriedade sob teste é
+  insensível a ela.
+
+- **O índice da subárvore passa a ser verificado no modo PARTICIONADO**, que é o que a produção
+  corre (`cogno_host/migrate.py::init_db` usa `partition_by_scope=True`). Aí o índice do pai é
+  propagado aos filhos sob nome auto-gerado, o nome do pai nunca aparece num plano, e uma
+  asserção de plano exigiria linhas suficientes para cada partição passar o limiar — minutos de
+  teste. É por isso, deliberadamente, uma asserção de DDL: prova que o índice EXISTE em cada
+  partição, não que o planeador o escolhe lá (tecto dito na docstring).
 
 - **Os irmãos do `admin_traces` não tinham guarda nenhuma a fixar que CHAMAM o escaping.**
   `_subtree_like`/`_SUBTREE` são partilhados por `admin_turns`, `admin_scopes` e `admin_traces`,

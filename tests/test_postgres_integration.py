@@ -487,6 +487,58 @@ async def test_hash_partitioning_roundtrip():
     assert out and out[0].content == "x"
 
 
+async def test_the_subtree_index_reaches_every_PARTITION():
+    """O modo que a produção corre — e o único em que o teste de plano acima não vale.
+
+    `cogno_host/migrate.py::init_db` chama `ensure_schema(..., partition_by_scope=True)`. Nesse
+    modo o índice declarado no pai é propagado a cada filho sob nome AUTO-GERADO
+    (`turn_traces_p0_scope_created_at_idx`, …), portanto o nome do pai nunca aparece num plano —
+    e uma asserção sobre plano exigiria linhas suficientes para CADA partição passar o limiar de
+    Seq Scan (medido: 2000 linhas por 8 partições ficam todas abaixo), o que é um teste de
+    minutos para verificar uma coisa que o Postgres garante.
+
+    Por isso esta é, deliberadamente, uma asserção de DDL — a forma que critiquei no teste acima
+    e que aqui é a garantia honesta disponível. O que ela apanha é real e já aconteceu noutras
+    tabelas: um índice declarado no pai que NÃO chega aos filhos deixa a produção inteira sem
+    ele, com a suíte verde porque o modo não particionado é o que os testes exercitam.
+
+    TECTO, dito em voz alta: isto prova que o índice EXISTE em cada partição, não que o
+    planeador o escolhe lá. Essa continua por medir."""
+    if not await _pg_available():
+        pytest.skip("set ENGRAM_TEST_DSN to run")
+    conn = await psycopg.AsyncConnection.connect(DSN, autocommit=True)
+    for tbl in ("knowledge_edges", "knowledge_nodes", "turn_traces", "memories", "turns",
+                "sessions"):
+        await conn.execute(f"DROP TABLE IF EXISTS {tbl} CASCADE")
+    await ensure_schema(conn, embedding_dim=EMB_DIM, partition_by_scope=True, partitions=4)
+
+    cur = await conn.execute(
+        "SELECT c.relname FROM pg_inherits i "
+        "  JOIN pg_class p ON p.oid = i.inhparent "
+        "  JOIN pg_class c ON c.oid = i.inhrelid "
+        "WHERE p.relname = 'turn_traces' ORDER BY c.relname")
+    filhas = [r[0] for r in await cur.fetchall()]
+    assert len(filhas) == 4, f"esperava 4 partições de turn_traces, achei {filhas}"
+
+    # `scope` sob uma opclass de padrão em cada filha — é o que serve o ramo do LIKE, e é a
+    # metade que um btree comum não faz (ver o comentário do índice em `postgres.py`)
+    sem_indice = []
+    for filha in filhas:
+        c = await conn.execute(
+            "SELECT count(*) FROM pg_index x "
+            "  JOIN pg_class t ON t.oid = x.indrelid "
+            "  JOIN pg_opclass o ON o.oid = x.indclass[0] "
+            "WHERE t.relname = %s AND o.opcname IN ('text_pattern_ops', 'varchar_pattern_ops')",
+            (filha,))
+        if (await c.fetchone())[0] == 0:
+            sem_indice.append(filha)
+    await conn.close()
+
+    assert not sem_indice, (
+        f"o índice da subárvore não chegou a {sem_indice} — em produção, que corre "
+        f"particionada, essas partições ficam sem ele e a suíte não notaria")
+
+
 # ── edge curation: the two adapters must agree ────────────────────────────
 #
 # Every behaviour below is pinned against the in-memory adapter in `test_edge_curation.py`.
@@ -799,17 +851,36 @@ async def test_pg_count_nodes_scopes_and_zeroes(graph):
 
 @pytest.mark.asyncio
 async def test_admin_traces_does_not_seq_scan_the_whole_table(store):
-    """O índice da subárvore existe E é USADO — medido pelo plano, não pela DDL.
+    """O índice da subárvore é USADO — medido pelo plano do SQL que o `admin_traces` emite.
 
-    Um teste que só afirmasse "a DDL contém o CREATE INDEX" passaria com um índice que o
-    planeador nunca escolhe, que foi exactamente o que aconteceu com a correcção "óbvia": num
-    collation que não seja C (esta base é `en_US.utf8`), um btree COMUM não serve
-    `LIKE 'prefixo/%'`, e o plano continua Seq Scan com o índice criado ao lado. Só
-    `text_pattern_ops` o torna elegível.
+    Duas coisas que a primeira versão deste teste fazia mal, ambas medidas em review:
 
-    Por isso a asserção é sobre o PLANO. É mais frágil que uma asserção de DDL — uma tabela
-    pequena de mais faz o planeador preferir Seq Scan por ser genuinamente mais barato —, e é
-    por isso que este teste semeia o suficiente para a escolha deixar de ser trivial."""
+    **Afirmava o NOME do índice, não a propriedade do próprio título.** Numa base com collation
+    `C` — `initdb --locale=C`, `postgres:alpine`, qualquer cluster criado `LC_COLLATE 'C'`, que é
+    uma escolha comum por desempenho — a UNIQUE pré-existente já serve os DOIS ramos do OR, não
+    há Seq Scan nenhum, e o teste ficava VERMELHO em código correcto com uma mensagem a dizer o
+    contrário do que o plano mostrava. A asserção passou a ser a ausência de Seq Scan: verdadeira
+    sob `C`, sob `en_US.utf8`, sob ICU, e sobrevive a alguém renomear o índice.
+
+    **Copiava à mão uma aproximação do SQL** — outra ordem de colunas, e `ORDER BY created_at
+    DESC` onde o real é `created_at DESC, session_id DESC, turn_n DESC`. Uma garantia de
+    desempenho sobre uma consulta que ninguém emite não é garantia: medido, trocar o predicado do
+    `admin_traces` por um `LIKE '%' || %s` (curinga à cabeça, que nenhum índice pode servir)
+    deixava este teste VERDE. Agora o SQL é capturado do próprio método e é esse que vai ao
+    EXPLAIN — o que este teste passa a apanhar é deriva do PREDICADO (medido: a mutação do
+    curinga, que sobrevivia, agora mata).
+
+    **O que ele continua a NÃO apanhar, medido e não presumido:** deriva do ORDER BY. Trocar
+    `created_at DESC, session_id DESC, turn_n DESC` por `turn_n ASC` sobrevive — e sobrevive com
+    razão, porque um `BitmapOr` nunca preserva ordem de índice e o plano acaba num `Sort`
+    explícito seja qual for o ORDER BY. A propriedade sob teste é "não varreu a tabela", e essa é
+    insensível à ordenação. Dizer o contrário na docstring seria a mesma sobre-afirmação que este
+    conserto veio remover.
+
+    A asserção continua a ser sobre o plano e não sobre a DDL, e essa parte estava certa: um
+    índice que o planeador nunca escolhe passa em qualquer teste de DDL — foi exactamente o que
+    a correcção "óbvia" (btree comum) produziu."""
+    import contextlib
     from datetime import datetime, timedelta, timezone
 
     from cogno_engram.types import TurnTrace
@@ -822,19 +893,53 @@ async def test_admin_traces_does_not_seq_scan_the_whole_table(store):
                                               i % 30, {"i": i},
                                               created_at=t0 + timedelta(minutes=i)))
 
-    async with store._conn() as conn:                              # type: ignore[attr-defined]
+    emitido: "list[tuple]" = []
+
+    class _Espiao:
+        """Regista o SQL que passa e delega TUDO o resto.
+
+        `__getattr__` e não uma lista de métodos à mão: um wrapper que enumera o que reencaminha
+        cala-se sobre o que esqueceu e mente ao `isinstance` — defeito já pago noutro sítio deste
+        ecossistema."""
+
+        def __init__(self, conn):
+            self._conn = conn
+
+        def __getattr__(self, nome):
+            return getattr(self._conn, nome)
+
+        async def execute(self, sql, params=None, *a, **kw):
+            emitido.append((sql, params))
+            return await self._conn.execute(sql, params, *a, **kw)
+
+    real = store._conn                                             # type: ignore[attr-defined]
+
+    @contextlib.asynccontextmanager
+    async def _espiado():
+        async with real() as c:
+            yield _Espiao(c)
+
+    store._conn = _espiado                                         # type: ignore[attr-defined]
+    try:
+        await store.admin_traces(f"{marca}007", since=t0, limit=30)
+    finally:
+        store._conn = real                                         # type: ignore[attr-defined]
+
+    sql, params = emitido[0]                                       # o SELECT; o [1] é o count
+    assert "FROM turn_traces" in sql and "ORDER BY" in sql, f"não capturei o SELECT: {sql!r}"
+
+    async with real() as conn:
         await conn.execute("ANALYZE turn_traces")
         async with conn.cursor() as cur:
-            await cur.execute(
-                "EXPLAIN SELECT session_id, scope, turn_n, trace, created_at FROM turn_traces "
-                "WHERE (scope = %s OR scope LIKE %s ESCAPE '\\') AND created_at >= %s "
-                "ORDER BY created_at DESC LIMIT 30",
-                (f"{marca}007", f"{marca}007/%", t0))
+            await cur.execute("EXPLAIN " + sql, params)
             # a conexão usa row_factory de dict — a coluna do EXPLAIN chama-se "QUERY PLAN"
             plano = "\n".join(
                 (r["QUERY PLAN"] if isinstance(r, dict) else r[0])
                 for r in await cur.fetchall())
 
-    assert "idx_turn_traces_scope_time" in plano, (
-        f"o índice da subárvore não foi usado — o plano foi:\n{plano}"
-    )
+    # A não-vacuidade primeiro: uma asserção NEGATIVA sobre uma string passa trivialmente se a
+    # string vier vazia — inalcançável aqui na prática, mas é barato tornar isso explícito em vez
+    # de confiar que continua inalcançável.
+    assert "on turn_traces" in plano, f"o EXPLAIN não falou de turn_traces:\n{plano}"
+    assert "Seq Scan on turn_traces" not in plano, (
+        f"a leitura de subárvore varreu a tabela inteira — o plano foi:\n{plano}")

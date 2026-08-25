@@ -82,13 +82,73 @@ decides what may be spoken, and engram enforces it:
 ```python
 # an LLM extraction PROPOSES (opt-in; default is still assert, so nothing changes on upgrade)
 await hypnos.periodic_consolidate(store, backend, scope=scope, session_id=sid, kg=kg,
-                                  propose_relations=True)
+                                  # bool, or a predicate per relation: hold the ones that
+                                  # become a sentence about a PERSON, keep domain facts
+                                  # `accepted` so the staff block stays populated.
+                                  # NOTE the `.upper()`: the predicate receives the relation
+                                  # as the MODEL emitted it, unnormalised. Comparing it raw
+                                  # makes `spouse_of` miss the set, and a miss stamps the edge
+                                  # `accepted` — failing OPEN, on exactly the class this is
+                                  # meant to hold back.
+                                  # from cogno_engram import VALID_PROXIMITY_RELATIONS
+                                  propose_relations=lambda s, t, r: (
+                                      (r or "").upper() in VALID_PROXIMITY_RELATIONS))
 
 # the host's curation UI reads the queue and writes the verdict
 for e in await kg.pending_edges(scope):
     ...
 await kg.set_edge_status(scope, "José", "Pedro", "PARENT_OF", "accepted")
 ```
+### Migrating rows that are already `accepted`
+
+Turning the predicate on changes what the NEXT extraction stamps. It does not touch what is
+already stored: `upsert_edge` only ever promotes a status, so every proximity edge an earlier
+run wrote as `accepted` stays `accepted` and keeps being walked, and `pending_edges` cannot even
+list them (it lists proposals, which is exactly what these are not).
+
+Migrating them is a deliberate act on live data. It is **reversible** — `set_edge_status(...,
+"accepted")` puts any row back — and **idempotent**: `walk` returns only `accepted` edges, so a
+second run finds nothing left to demote.
+
+```python
+from cogno_engram import VALID_PROXIMITY_RELATIONS
+from cogno_engram.types import EDGE_PROPOSED
+
+async def demote_extracted_proximity(kg, scope: str, *, dry_run: bool = True) -> int:
+    """Send the LLM-extracted proximity edges back for review. Returns how many were demoted.
+
+    Only edges an EXTRACTION asserted are touched — `source_session` is non-empty for those and
+    empty for anything a human or an admin API wrote, and a human's note must not be demoted by
+    a migration. Run once with `dry_run=True` and read the count before running it for real.
+    """
+    seen, demoted = set(), 0
+    after = None
+    while True:
+        nodes = await kg.scan_nodes(scope, after_id=after, limit=500)
+        if not nodes:
+            break
+        after = nodes[-1].id
+        for node in nodes:
+            for e in await kg.walk(scope, node.label, max_depth=1):
+                key = (e.source, e.target, e.relation)
+                if key in seen:
+                    continue                    # a walk reaches an edge from both endpoints
+                seen.add(key)
+                if e.relation.upper() not in VALID_PROXIMITY_RELATIONS:
+                    continue                    # domain fact: the staff block keeps it
+                if not (e.source_session or "").strip():
+                    continue                    # a person wrote it; not ours to demote
+                demoted += 1
+                if not dry_run:
+                    await kg.set_edge_status(scope, e.source, e.target, e.relation,
+                                             EDGE_PROPOSED)
+    return demoted
+```
+
+`scope` is the **tenant** scope the graph is written at (`tenant_of(...)` on the host side), not
+the per-identity one. After it runs, the contact block goes quiet for those relations until
+somebody reviews them — which is the point, and what makes it worth reading the dry-run count
+first.
 
 Three things the host does **not** have to remember:
 

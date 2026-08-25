@@ -60,6 +60,22 @@ def _require_scope(scope: str) -> str:
         raise ValueError("scope must be a non-empty string (engram isolates every row by scope)")
     return scope
 
+def _require_session(session_id: str) -> str:
+    """A session id that is blank is NOT a wildcard, and the prune must not treat it as one.
+
+    ``delete_edges_by_session(scope, "")`` matches every edge whose ``source_session`` is empty
+    — which is precisely the class nothing automated writes: the notes a HUMAN or an admin API
+    put there. One disliked turn arriving with a blank id would erase them all, silently, and a
+    `DELETE ... WHERE source_session = ''` looks entirely ordinary in a log.
+
+    Refusing is right rather than returning 0: an empty id here is a caller bug (a missing
+    session on the feedback path), and swallowing it hides the bug while pretending the prune
+    ran.
+    """
+    if not (session_id or "").strip():
+        raise ValueError("session_id must be non-empty: a blank id is not a wildcard")
+    return session_id
+
 
 def _cosine(a: Optional[list[float]], b: Optional[list[float]]) -> float:
     if not a or not b or len(a) != len(b):
@@ -582,6 +598,7 @@ class InMemoryGraph:
 
     async def delete_edges_by_session(self, scope: str, session_id: str) -> int:
         _require_scope(scope)
+        _require_session(session_id)
         before = len(self._edges)
         self._edges = [e for e in self._edges
                        if not (e.scope == scope and e.source_session == session_id)]

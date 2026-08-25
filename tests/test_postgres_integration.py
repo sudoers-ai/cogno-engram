@@ -33,6 +33,7 @@ from cogno_engram.adapters.postgres import (  # noqa: E402
     ensure_schema,
 )
 from cogno_engram.types import (  # noqa: E402
+    AUDIENCE_STAFF,
     GraphEdge,
     GraphNode,
     HybridWeights,
@@ -321,7 +322,7 @@ async def test_node_upsert_and_find(graph):
     a = await graph.upsert_node(GraphNode(scope, "José", "PERSON"))
     b = await graph.upsert_node(GraphNode(scope, "josé", "PERSON", attributes={"age": 40}))
     assert a == b
-    node = await graph.find_node(scope, "JOSÉ")
+    node = await graph.find_node(scope, "JOSÉ", audience=AUDIENCE_STAFF)
     assert node is not None and node.attributes == {"age": 40}
 
 
@@ -334,11 +335,11 @@ async def test_node_label_matched_literally_not_as_like_pattern(graph):
     await graph.upsert_node(GraphNode(scope, "100%", "CONCEPT"))
     await graph.upsert_node(GraphNode(scope, "100pct", "CONCEPT"))
 
-    found = await graph.find_node(scope, "conta_corrente")
+    found = await graph.find_node(scope, "conta_corrente", audience=AUDIENCE_STAFF)
     assert found is not None and found.label == "conta_corrente"            # not contaXcorrente
     # delete by a %-bearing label must remove ONLY that node, never everything matching "100%"
     assert await graph.delete_node(scope, "100%") is True
-    assert await graph.find_node(scope, "100pct") is not None               # survived
+    assert await graph.find_node(scope, "100pct", audience=AUDIENCE_STAFF) is not None               # survived
 
 
 async def test_walk_terminates_on_a_cycle(graph):
@@ -346,35 +347,35 @@ async def test_walk_terminates_on_a_cycle(graph):
     scope = f"t/{uuid4()}"
     for a, b in (("A", "B"), ("B", "C"), ("C", "A")):
         await graph.upsert_edge(GraphEdge(scope, a, b, "LINK"))
-    edges = await graph.walk(scope, "A", max_depth=5)
+    edges = await graph.walk(scope, "A", max_depth=5, audience=AUDIENCE_STAFF)
     assert {e.relation for e in edges} == {"LINK"} and len(edges) == 3      # each edge once
 
 
 async def test_multi_hop_walk(graph):
     scope = f"t/{uuid4()}"
     await _build_jose_rex(graph, scope)
-    edges = await graph.walk(scope, "José", max_depth=2)
+    edges = await graph.walk(scope, "José", max_depth=2, audience=AUDIENCE_STAFF)
     assert {e.relation for e in edges} == {"OWNS", "BREED"}
 
 
 async def test_walk_depth_limit(graph):
     scope = f"t/{uuid4()}"
     await _build_jose_rex(graph, scope)
-    edges = await graph.walk(scope, "José", max_depth=1)
+    edges = await graph.walk(scope, "José", max_depth=1, audience=AUDIENCE_STAFF)
     assert {e.relation for e in edges} == {"OWNS"}
 
 
 async def test_neighbors(graph):
     scope = f"t/{uuid4()}"
     await _build_jose_rex(graph, scope)
-    assert {n.label for n in await graph.neighbors(scope, "Rex")} == {"José", "Pastor Alemão"}
+    assert {n.label for n in await graph.neighbors(scope, "Rex", audience=AUDIENCE_STAFF)} == {"José", "Pastor Alemão"}
 
 
 async def test_node_embedding_search(graph):
     scope = f"t/{uuid4()}"
     await graph.upsert_node(GraphNode(scope, "alpha", "CONCEPT", embedding=_emb(1.0, 0.0)))
     await graph.upsert_node(GraphNode(scope, "beta", "CONCEPT", embedding=_emb(0.0, 1.0)))
-    out = await graph.find_nodes_by_embedding(scope, _emb(0.95, 0.05), limit=1)
+    out = await graph.find_nodes_by_embedding(scope, _emb(0.95, 0.05), limit=1, audience=AUDIENCE_STAFF)
     assert out and out[0].label == "alpha"
 
 
@@ -384,7 +385,7 @@ async def test_delete_edges_by_session_prunes(graph):
     await graph.upsert_edge(GraphEdge(scope, "José", "Maria", "KNOWS", source_session="sess2"))
     deleted = await graph.delete_edges_by_session(scope, "sess1")
     assert deleted == 2
-    assert {e.relation for e in await graph.walk(scope, "José", max_depth=3)} == {"KNOWS"}
+    assert {e.relation for e in await graph.walk(scope, "José", max_depth=3, audience=AUDIENCE_STAFF)} == {"KNOWS"}
 
 
 # ── parent-parity surface (added for completeness) ─────────────────────────
@@ -414,14 +415,14 @@ async def test_update_turn_response_and_counts(store):
 async def test_graph_node_context_list_delete(graph):
     scope = f"t/{uuid4()}"
     await _build_jose_rex(graph, scope)
-    ctx = await graph.get_node_context(scope, "José")
+    ctx = await graph.get_node_context(scope, "José", audience=AUDIENCE_STAFF)
     assert ctx is not None and {e.relation for e in ctx.edges} == {"OWNS"}
     assert {n.label for n in ctx.neighbors} == {"Rex"}
-    assert {n.label for n in await graph.list_nodes(scope)} == {"José", "Rex", "Pastor Alemão"}
-    assert [n.label for n in await graph.list_nodes(scope, node_type="ANIMAL")] == ["Rex"]
+    assert {n.label for n in await graph.list_nodes(scope, audience=AUDIENCE_STAFF)} == {"José", "Rex", "Pastor Alemão"}
+    assert [n.label for n in await graph.list_nodes(scope, node_type="ANIMAL", audience=AUDIENCE_STAFF)] == ["Rex"]
     assert await graph.delete_node(scope, "Rex") is True
-    assert await graph.find_node(scope, "Rex") is None
-    assert await graph.walk(scope, "José", max_depth=2) == []   # edges cascaded
+    assert await graph.find_node(scope, "Rex", audience=AUDIENCE_STAFF) is None
+    assert await graph.walk(scope, "José", max_depth=2, audience=AUDIENCE_STAFF) == []   # edges cascaded
 
 
 # ── maintenance + partitioning ─────────────────────────────────────────────
@@ -458,8 +459,8 @@ async def test_maintenance_prune_orphan_nodes(graph):
     await graph.upsert_node(GraphNode(scope, "Lonely", "CONCEPT"))
     from cogno_engram import maintenance
     assert await maintenance.prune_orphan_nodes(graph, scope) == 1
-    assert await graph.find_node(scope, "Lonely") is None
-    assert await graph.find_node(scope, "A") is not None
+    assert await graph.find_node(scope, "Lonely", audience=AUDIENCE_STAFF) is None
+    assert await graph.find_node(scope, "A", audience=AUDIENCE_STAFF) is not None
 
 
 async def test_hash_partitioning_roundtrip():
@@ -551,10 +552,10 @@ async def test_pg_walk_excludes_a_proposal_and_the_hop_behind_it(graph):
     await graph.upsert_edge(GraphEdge(scope, "José", "Rex", "OWNS_PET", status="proposed"))
     await graph.upsert_edge(GraphEdge(scope, "Rex", "Pastor Alemão", "BREED"))
 
-    assert await graph.walk(scope, "José", max_depth=3) == []
+    assert await graph.walk(scope, "José", max_depth=3, audience=AUDIENCE_STAFF) == []
 
     assert await graph.set_edge_status(scope, "José", "Rex", "OWNS_PET", "accepted")
-    reached = {e.target for e in await graph.walk(scope, "José", max_depth=3)}
+    reached = {e.target for e in await graph.walk(scope, "José", max_depth=3, audience=AUDIENCE_STAFF)}
     assert reached == {"Rex", "Pastor Alemão"}
 
 
@@ -566,7 +567,7 @@ async def test_pg_queue_holds_only_proposals_and_carries_the_detail(graph):
                                       attributes={"note": "vira-lata caramelo"},
                                       status="proposed"))
 
-    queued = await graph.pending_edges(scope)
+    queued = await graph.pending_edges(scope, audience=AUDIENCE_STAFF)
     assert [e.target for e in queued] == ["Rex"]
     assert queued[0].attributes == {"note": "vira-lata caramelo"}   # the jsonb round-trips
 
@@ -578,13 +579,13 @@ async def test_pg_reassertion_merges_and_promotes_but_never_demotes(graph):
     # a human asserts the same edge: merge the detail, promote the status
     await graph.upsert_edge(GraphEdge(scope, "José", "Pedro", "PARENT_OF",
                                       attributes={"age": 8}))
-    edge = (await graph.walk(scope, "José"))[0]
+    edge = (await graph.walk(scope, "José", audience=AUDIENCE_STAFF))[0]
     assert edge.attributes == {"note": "joga futebol", "age": 8} and edge.status == "accepted"
 
     # the next extraction proposes it again — a verdict does not expire on its own
     await graph.upsert_edge(GraphEdge(scope, "José", "Pedro", "PARENT_OF", status="proposed"))
-    assert (await graph.walk(scope, "José"))[0].status == "accepted"
-    assert await graph.pending_edges(scope) == []
+    assert (await graph.walk(scope, "José", audience=AUDIENCE_STAFF))[0].status == "accepted"
+    assert await graph.pending_edges(scope, audience=AUDIENCE_STAFF) == []
 
 
 async def test_pg_verdict_on_an_absent_edge_is_reported(graph):
@@ -659,7 +660,7 @@ async def test_an_existing_database_GETS_the_new_columns_and_keeps_its_edges(pg)
 
     # ...and it is still spoken
     kg = PostgresKnowledgeGraph(dsn=pg)
-    assert [(e.relation, e.status) for e in await kg.walk("t:mig", "Jose")] == \
+    assert [(e.relation, e.status) for e in await kg.walk("t:mig", "Jose", audience=AUDIENCE_STAFF)] == \
         [("PARENT_OF", "accepted")]
 
 
@@ -670,8 +671,8 @@ async def test_pg_a_proposal_leaks_through_neither_neighbors_nor_node_context(gr
     scope = "tenant:acme|identity:jose"
     await graph.upsert_edge(GraphEdge(scope, "José", "Pedro", "PARENT_OF", status="proposed"))
 
-    assert await graph.neighbors(scope, "José") == []
-    ctx = await graph.get_node_context(scope, "José")
+    assert await graph.neighbors(scope, "José", audience=AUDIENCE_STAFF) == []
+    ctx = await graph.get_node_context(scope, "José", audience=AUDIENCE_STAFF)
     assert ctx is not None and ctx.edges == [] and ctx.neighbors == []
 
 
@@ -682,7 +683,7 @@ async def test_pg_queue_drains_oldest_first(graph):
     for i in range(5):
         await graph.upsert_edge(GraphEdge(scope, "José", f"Contato {i}", "FRIEND_OF",
                                           status="proposed"))
-    assert [e.target for e in await graph.pending_edges(scope, limit=2)] == \
+    assert [e.target for e in await graph.pending_edges(scope, limit=2, audience=AUDIENCE_STAFF)] == \
         ["Contato 0", "Contato 1"]
 
 
@@ -693,7 +694,7 @@ async def test_pg_a_value_json_cannot_serialise_does_not_take_the_turn_down(grap
     scope = "tenant:acme|identity:jose"
     await graph.upsert_edge(GraphEdge(scope, "José", "Pedro", "PARENT_OF",
                                       attributes={"since": datetime(2020, 1, 1)}))
-    edge = (await graph.walk(scope, "José"))[0]
+    edge = (await graph.walk(scope, "José", audience=AUDIENCE_STAFF))[0]
     assert "2020-01-01" in str(edge.attributes["since"])
 
 
@@ -703,7 +704,7 @@ async def test_pg_an_explicit_None_attributes_does_not_poison_the_next_merge(gra
     scope = "tenant:acme|identity:jose"
     await graph.upsert_edge(GraphEdge(scope, "José", "Pedro", "PARENT_OF", attributes=None))
     await graph.upsert_edge(GraphEdge(scope, "José", "Pedro", "PARENT_OF", attributes={"age": 8}))
-    assert (await graph.walk(scope, "José"))[0].attributes == {"age": 8}
+    assert (await graph.walk(scope, "José", audience=AUDIENCE_STAFF))[0].attributes == {"age": 8}
 
 
 @pytest.mark.asyncio
@@ -823,9 +824,9 @@ async def test_pg_count_nodes_answers_beyond_the_page(graph):
         await graph.upsert_node(GraphNode(scope, f"Contato {i}", "PERSON"))
     await graph.upsert_node(GraphNode(scope, "Maria", "PERSON"))
 
-    assert await graph.count_nodes(scope) == 121
-    assert await graph.count_nodes(scope, label="maria") == 1        # case-insensitive
-    assert len(await graph.list_nodes(scope, limit=50)) == 50        # the page, for contrast
+    assert await graph.count_nodes(scope, audience=AUDIENCE_STAFF) == 121
+    assert await graph.count_nodes(scope, label="maria", audience=AUDIENCE_STAFF) == 1        # case-insensitive
+    assert len(await graph.list_nodes(scope, limit=50, audience=AUDIENCE_STAFF)) == 50        # the page, for contrast
 
 
 async def test_pg_count_nodes_SEES_the_homonym_the_double_collapses(graph):
@@ -839,14 +840,14 @@ async def test_pg_count_nodes_SEES_the_homonym_the_double_collapses(graph):
     await graph.upsert_node(GraphNode(scope, "José", "PERSON"))
     await graph.upsert_node(GraphNode(scope, "José", "CONCEPT"))
 
-    assert await graph.count_nodes(scope, label="José") == 2
+    assert await graph.count_nodes(scope, label="José", audience=AUDIENCE_STAFF) == 2
 
 
 async def test_pg_count_nodes_scopes_and_zeroes(graph):
     mine, theirs = f"t/{uuid4()}", f"t/{uuid4()}"
     await graph.upsert_node(GraphNode(theirs, "José", "PERSON"))
-    assert await graph.count_nodes(mine) == 0
-    assert await graph.count_nodes(mine, label="José") == 0
+    assert await graph.count_nodes(mine, audience=AUDIENCE_STAFF) == 0
+    assert await graph.count_nodes(mine, label="José", audience=AUDIENCE_STAFF) == 0
 
 
 @pytest.mark.asyncio

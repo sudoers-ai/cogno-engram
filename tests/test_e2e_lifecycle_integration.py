@@ -25,7 +25,7 @@ from cogno_engram.adapters.postgres import (  # noqa: E402
     ensure_schema,
 )
 from cogno_engram.adapters.redis_buffer import RedisConversationBuffer  # noqa: E402
-from cogno_engram.types import RetrievalQuery, TurnRecord  # noqa: E402
+from cogno_engram.types import AUDIENCE_STAFF, RetrievalQuery, TurnRecord  # noqa: E402
 
 DSN = os.getenv("ENGRAM_TEST_DSN", "")
 REDIS_URL = os.getenv("ENGRAM_TEST_REDIS_URL", "")
@@ -111,7 +111,7 @@ async def test_full_lifecycle_on_real_infra(infra):
     ])
     await hypnos.periodic_consolidate(store, backend, scope=scope, session_id=session.id,
                                       embedder=emb, kg=kg)
-    assert [e.relation for e in await kg.walk(scope, "João", max_depth=1)] == ["WANTS"]
+    assert [e.relation for e in await kg.walk(scope, "João", max_depth=1, audience=AUDIENCE_STAFF)] == ["WANTS"]
 
     # hybrid retrieval + rerank
     hits = await store.load_memories(

@@ -17,6 +17,7 @@ import pytest
 from cogno_engram.adapters.in_memory import InMemoryGraph
 from cogno_engram.graph_context import format_graph_context
 from cogno_engram.types import (
+    AUDIENCE_STAFF,
     EDGE_ACCEPTED,
     EDGE_PROPOSED,
     EDGE_REJECTED,
@@ -44,7 +45,7 @@ async def test_a_proposal_is_not_returned_by_a_walk(kg):
     await kg.upsert_edge(edge("José", "Pedro", "PARENT_OF"))
     await kg.upsert_edge(edge("José", "Rex", "OWNS_PET", status=EDGE_PROPOSED))
 
-    walked = await kg.walk(SCOPE, "José")
+    walked = await kg.walk(SCOPE, "José", audience=AUDIENCE_STAFF)
     assert [(e.source, e.target) for e in walked] == [("José", "Pedro")]
 
 
@@ -56,7 +57,7 @@ async def test_a_proposal_does_not_decide_what_the_walk_can_REACH(kg):
     await kg.upsert_edge(edge("José", "Rex", "OWNS_PET", status=EDGE_PROPOSED))
     await kg.upsert_edge(edge("Rex", "Pastor Alemão", "BREED"))          # accepted!
 
-    assert await kg.walk(SCOPE, "José", max_depth=3) == []
+    assert await kg.walk(SCOPE, "José", max_depth=3, audience=AUDIENCE_STAFF) == []
 
 
 async def test_the_prompt_formatter_repeats_the_filter(kg):
@@ -81,18 +82,18 @@ async def test_a_block_of_nothing_but_proposals_renders_NOTHING(kg):
 async def test_accepting_puts_it_in_the_prompt_AND_makes_it_traversable(kg):
     await kg.upsert_edge(edge("José", "Rex", "OWNS_PET", status=EDGE_PROPOSED))
     await kg.upsert_edge(edge("Rex", "Pastor Alemão", "BREED"))
-    assert await kg.walk(SCOPE, "José", max_depth=3) == []
+    assert await kg.walk(SCOPE, "José", max_depth=3, audience=AUDIENCE_STAFF) == []
 
     assert await kg.set_edge_status(SCOPE, "José", "Rex", "OWNS_PET", EDGE_ACCEPTED)
-    reached = {e.target for e in await kg.walk(SCOPE, "José", max_depth=3)}
+    reached = {e.target for e in await kg.walk(SCOPE, "José", max_depth=3, audience=AUDIENCE_STAFF)}
     assert reached == {"Rex", "Pastor Alemão"}      # the hop opens the path behind it
 
 
 async def test_rejecting_keeps_it_out_and_off_the_queue(kg):
     await kg.upsert_edge(edge("José", "Rex", "OWNS_PET", status=EDGE_PROPOSED))
     assert await kg.set_edge_status(SCOPE, "José", "Rex", "OWNS_PET", EDGE_REJECTED)
-    assert await kg.walk(SCOPE, "José") == []
-    assert await kg.pending_edges(SCOPE) == []      # answered — no longer waiting on a human
+    assert await kg.walk(SCOPE, "José", audience=AUDIENCE_STAFF) == []
+    assert await kg.pending_edges(SCOPE, audience=AUDIENCE_STAFF) == []      # answered — no longer waiting on a human
 
 
 async def test_a_verdict_on_an_edge_that_is_not_there_is_reported_not_invented(kg):
@@ -104,7 +105,7 @@ async def test_the_queue_holds_only_what_is_waiting(kg):
     await kg.upsert_edge(edge("José", "Rex", "OWNS_PET", status=EDGE_PROPOSED))
     await kg.upsert_edge(edge("José", "Flamengo", "SUPPORTS", status=EDGE_REJECTED))
 
-    assert [e.target for e in await kg.pending_edges(SCOPE)] == ["Rex"]
+    assert [e.target for e in await kg.pending_edges(SCOPE, audience=AUDIENCE_STAFF)] == ["Rex"]
 
 
 # ── re-assertion ──────────────────────────────────────────────────────────
@@ -115,7 +116,7 @@ async def test_a_re_extraction_does_not_wipe_what_a_human_typed(kg):
                               attributes={"age": 8, "note": "joga futebol no sábado"}))
     await kg.upsert_edge(edge("José", "Pedro", "PARENT_OF", attributes={"age": 9}))
 
-    kept = (await kg.walk(SCOPE, "José"))[0]
+    kept = (await kg.walk(SCOPE, "José", audience=AUDIENCE_STAFF))[0]
     assert kept.attributes == {"age": 9, "note": "joga futebol no sábado"}
 
 
@@ -123,7 +124,7 @@ async def test_a_deliberate_re_assertion_PROMOTES_a_proposal(kg):
     """A host writing the same edge on purpose is itself a verdict."""
     await kg.upsert_edge(edge("José", "Rex", "OWNS_PET", status=EDGE_PROPOSED))
     await kg.upsert_edge(edge("José", "Rex", "OWNS_PET"))            # default: accepted
-    assert [e.target for e in await kg.walk(SCOPE, "José")] == ["Rex"]
+    assert [e.target for e in await kg.walk(SCOPE, "José", audience=AUDIENCE_STAFF)] == ["Rex"]
 
 
 async def test_a_re_extraction_can_NEVER_demote_a_verdict(kg):
@@ -133,8 +134,8 @@ async def test_a_re_extraction_can_NEVER_demote_a_verdict(kg):
     await kg.upsert_edge(edge("José", "Pedro", "PARENT_OF"))
     await kg.upsert_edge(edge("José", "Pedro", "PARENT_OF", status=EDGE_PROPOSED))
 
-    assert [e.target for e in await kg.walk(SCOPE, "José")] == ["Pedro"]
-    assert await kg.pending_edges(SCOPE) == []
+    assert [e.target for e in await kg.walk(SCOPE, "José", audience=AUDIENCE_STAFF)] == ["Pedro"]
+    assert await kg.pending_edges(SCOPE, audience=AUDIENCE_STAFF) == []
 
 
 # ── back-compat + vocabulary ──────────────────────────────────────────────
@@ -143,7 +144,7 @@ async def test_an_edge_that_says_nothing_behaves_exactly_as_before(kg):
     """Every caller written before this field existed keeps working, and `accepted` is why: the
     feature is inert until something explicitly proposes."""
     await kg.upsert_edge(edge("José", "Pedro", "PARENT_OF"))
-    walked = await kg.walk(SCOPE, "José")
+    walked = await kg.walk(SCOPE, "José", audience=AUDIENCE_STAFF)
     assert walked and walked[0].status == EDGE_ACCEPTED and walked[0].attributes == {}
 
 
@@ -190,10 +191,10 @@ async def test_a_proposal_does_not_leak_through_neighbors(kg):
     gone, but "this person is connected to José" is exactly the unverified claim the feature
     holds back, and `NodeContext` hands edges and neighbors to the same caller."""
     await kg.upsert_edge(edge("José", "Pedro", "PARENT_OF", status=EDGE_PROPOSED))
-    assert await kg.neighbors(SCOPE, "José") == []
+    assert await kg.neighbors(SCOPE, "José", audience=AUDIENCE_STAFF) == []
 
     await kg.set_edge_status(SCOPE, "José", "Pedro", "PARENT_OF", EDGE_ACCEPTED)
-    assert [n.label for n in await kg.neighbors(SCOPE, "José")] == ["Pedro"]
+    assert [n.label for n in await kg.neighbors(SCOPE, "José", audience=AUDIENCE_STAFF)] == ["Pedro"]
 
 
 async def test_a_proposal_does_not_leak_through_node_context(kg):
@@ -201,7 +202,7 @@ async def test_a_proposal_does_not_leak_through_node_context(kg):
     in-memory twin read `self._edges` directly and was not. Same call, same edge, two answers —
     so a host rendering `node_context.edges` spoke the unreviewed claim in dev and not in prod."""
     await kg.upsert_edge(edge("José", "Pedro", "PARENT_OF", status=EDGE_PROPOSED))
-    ctx = await kg.get_node_context(SCOPE, "José")
+    ctx = await kg.get_node_context(SCOPE, "José", audience=AUDIENCE_STAFF)
     assert ctx is not None and ctx.edges == [] and ctx.neighbors == []
 
 
@@ -211,7 +212,7 @@ async def test_the_curation_queue_drains_oldest_first(kg):
     adapters disagreed on this and the disagreement was invisible."""
     for i in range(5):
         await kg.upsert_edge(edge("José", f"Contato {i}", "FRIEND_OF", status=EDGE_PROPOSED))
-    assert [e.target for e in await kg.pending_edges(SCOPE, limit=2)] == ["Contato 0", "Contato 1"]
+    assert [e.target for e in await kg.pending_edges(SCOPE, limit=2, audience=AUDIENCE_STAFF)] == ["Contato 0", "Contato 1"]
 
 
 # ── the detail actually reaches the prompt ────────────────────────────────
@@ -251,11 +252,11 @@ async def test_a_rejected_edge_is_NOT_resurrected_by_the_next_extraction(kg):
     await kg.set_edge_status(SCOPE, "José", "Pedro", "PARENT_OF", EDGE_REJECTED)
 
     await kg.upsert_edge(edge("José", "Pedro", "PARENT_OF"))        # the extraction runs again
-    assert await kg.walk(SCOPE, "José") == []
-    assert await kg.pending_edges(SCOPE) == []
+    assert await kg.walk(SCOPE, "José", audience=AUDIENCE_STAFF) == []
+    assert await kg.pending_edges(SCOPE, audience=AUDIENCE_STAFF) == []
 
     assert await kg.set_edge_status(SCOPE, "José", "Pedro", "PARENT_OF", EDGE_ACCEPTED)
-    assert [e.target for e in await kg.walk(SCOPE, "José")] == ["Pedro"]
+    assert [e.target for e in await kg.walk(SCOPE, "José", audience=AUDIENCE_STAFF)] == ["Pedro"]
 
 
 # ── the two ways a verification found to break the invariant ──────────────
@@ -273,8 +274,8 @@ async def test_a_MISSING_verdict_does_not_publish_the_edge(kg, not_a_verdict):
     await kg.upsert_edge(edge("José", "Pedro", "PARENT_OF", status=EDGE_PROPOSED))
     with pytest.raises(ValueError, match="not a verdict"):
         await kg.set_edge_status(SCOPE, "José", "Pedro", "PARENT_OF", not_a_verdict)
-    assert await kg.walk(SCOPE, "José") == []
-    assert [e.target for e in await kg.pending_edges(SCOPE)] == ["Pedro"]
+    assert await kg.walk(SCOPE, "José", audience=AUDIENCE_STAFF) == []
+    assert [e.target for e in await kg.pending_edges(SCOPE, audience=AUDIENCE_STAFF)] == ["Pedro"]
 
 
 async def test_a_PROPOSAL_cannot_modify_a_VERDICT_in_any_field(kg):
@@ -289,9 +290,9 @@ async def test_a_PROPOSAL_cannot_modify_a_VERDICT_in_any_field(kg):
     await kg.upsert_edge(edge("José", "Pedro", "PARENT_OF", status=EDGE_PROPOSED,
                               attributes={"note": "expulso da escola por cola"}))
 
-    spoken = format_graph_context(await kg.walk(SCOPE, "José"))
+    spoken = format_graph_context(await kg.walk(SCOPE, "José", audience=AUDIENCE_STAFF))
     assert "expulso" not in spoken and "age: 8" in spoken
-    assert await kg.pending_edges(SCOPE) == []      # ...and it did not sneak into the queue
+    assert await kg.pending_edges(SCOPE, audience=AUDIENCE_STAFF) == []      # ...and it did not sneak into the queue
 
 
 async def test_the_queue_hands_out_COPIES_not_the_stored_edge(kg):
@@ -299,9 +300,9 @@ async def test_the_queue_hands_out_COPIES_not_the_stored_edge(kg):
     queue item published the edge in one store and did nothing in the other — the two
     disagreeing on exactly the invariant this feature is."""
     await kg.upsert_edge(edge("José", "Pedro", "PARENT_OF", status=EDGE_PROPOSED))
-    queued = (await kg.pending_edges(SCOPE))[0]
+    queued = (await kg.pending_edges(SCOPE, audience=AUDIENCE_STAFF))[0]
     queued.status = EDGE_ACCEPTED               # a UI editing what it was handed
-    assert await kg.walk(SCOPE, "José") == []   # ...changes nothing until it says so
+    assert await kg.walk(SCOPE, "José", audience=AUDIENCE_STAFF) == []   # ...changes nothing until it says so
 
 
 async def test_a_non_positive_limit_means_EMPTY_in_both_stores(kg):
@@ -313,9 +314,9 @@ async def test_a_non_positive_limit_means_EMPTY_in_both_stores(kg):
     is not guarded, it is coincidence."""
     for target in ("Pedro", "Rex"):
         await kg.upsert_edge(edge("José", target, "FRIEND_OF", status=EDGE_PROPOSED))
-    assert await kg.pending_edges(SCOPE, limit=0) == []
-    assert await kg.pending_edges(SCOPE, limit=-1) == []
-    assert len(await kg.pending_edges(SCOPE, limit=1)) == 1      # ...and a real one still works
+    assert await kg.pending_edges(SCOPE, limit=0, audience=AUDIENCE_STAFF) == []
+    assert await kg.pending_edges(SCOPE, limit=-1, audience=AUDIENCE_STAFF) == []
+    assert len(await kg.pending_edges(SCOPE, limit=1, audience=AUDIENCE_STAFF)) == 1      # ...and a real one still works
 
 
 def test_the_curation_vocabulary_is_reachable_from_the_PACKAGE_ROOT():
@@ -343,8 +344,8 @@ async def test_a_proposal_still_creates_its_ENDPOINT_NODES_and_that_is_a_known_b
     Pinned so the next reader finds a decision instead of a surprise; closing it properly means
     giving nodes a status of their own, which is a bigger change than this one."""
     await kg.upsert_edge(edge("José", "Amante Secreta", "FRIEND_OF", status=EDGE_PROPOSED))
-    assert {n.label for n in await kg.list_nodes(SCOPE)} == {"José", "Amante Secreta"}
-    assert format_graph_context(await kg.walk(SCOPE, "José")) == ""      # never spoken
+    assert {n.label for n in await kg.list_nodes(SCOPE, audience=AUDIENCE_STAFF)} == {"José", "Amante Secreta"}
+    assert format_graph_context(await kg.walk(SCOPE, "José", audience=AUDIENCE_STAFF)) == ""      # never spoken
 
 
 # ── what a read hands out is a COPY ───────────────────────────────────────
@@ -361,12 +362,12 @@ async def test_no_read_hands_out_the_stored_edge(kg):
     await kg.upsert_edge(mine)
 
     mine.attributes["note"] = "via the caller's own alias"
-    (await kg.walk(SCOPE, "José"))[0].attributes["note"] = "via the walk result"
-    (await kg.get_node_context(SCOPE, "José")).edges[0].attributes["note"] = "via node_context"
+    (await kg.walk(SCOPE, "José", audience=AUDIENCE_STAFF))[0].attributes["note"] = "via the walk result"
+    (await kg.get_node_context(SCOPE, "José", audience=AUDIENCE_STAFF)).edges[0].attributes["note"] = "via node_context"
     await kg.upsert_edge(edge("José", "Ana", "FRIEND_OF", status=EDGE_PROPOSED))
-    (await kg.pending_edges(SCOPE))[0].attributes["note"] = "via the queue"
+    (await kg.pending_edges(SCOPE, audience=AUDIENCE_STAFF))[0].attributes["note"] = "via the queue"
 
-    spoken = format_graph_context(await kg.walk(SCOPE, "José"))
+    spoken = format_graph_context(await kg.walk(SCOPE, "José", audience=AUDIENCE_STAFF))
     assert "via the" not in spoken, spoken
     assert "since: 2010" in spoken
 
@@ -376,5 +377,5 @@ async def test_the_copy_is_deep_enough_to_matter(kg):
     the store, so mutating that dict still lands. Pinned because the shallow version passes
     every other test here: `walk` filters proposals out anyway, which masks it."""
     await kg.upsert_edge(edge("José", "Maria", "SPOUSE_OF", attributes={"since": "2010"}))
-    handed = (await kg.walk(SCOPE, "José"))[0]
-    assert handed.attributes is not (await kg.walk(SCOPE, "José"))[0].attributes
+    handed = (await kg.walk(SCOPE, "José", audience=AUDIENCE_STAFF))[0]
+    assert handed.attributes is not (await kg.walk(SCOPE, "José", audience=AUDIENCE_STAFF))[0].attributes

@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from cogno_engram import VALID_PROXIMITY_RELATIONS
 from cogno_engram.adapters.in_memory import InMemoryGraph
-from cogno_engram.types import EDGE_ACCEPTED, EDGE_PROPOSED, GraphEdge, GraphNode
+from cogno_engram.types import AUDIENCE_STAFF, EDGE_ACCEPTED, EDGE_PROPOSED, GraphEdge, GraphNode
 
 SCOPE = "acme"
 
@@ -23,12 +23,12 @@ async def demote_extracted_proximity(kg, scope: str, *, dry_run: bool = True) ->
     seen, demoted = set(), 0
     after = None
     while True:
-        nodes = await kg.scan_nodes(scope, after_id=after, limit=500)
+        nodes = await kg.scan_nodes(scope, after_id=after, limit=500, audience=AUDIENCE_STAFF)
         if not nodes:
             break
         after = nodes[-1].id
         for node in nodes:
-            for e in await kg.walk(scope, node.label, max_depth=1):
+            for e in await kg.walk(scope, node.label, max_depth=1, audience=AUDIENCE_STAFF):
                 key = (e.source, e.target, e.relation)
                 if key in seen:
                     continue
@@ -100,6 +100,6 @@ async def test_the_contact_block_goes_quiet_and_a_review_brings_it_back():
     """The effect the migration exists for, end to end through `walk`."""
     kg = await _box()
     await demote_extracted_proximity(kg, SCOPE, dry_run=False)
-    assert {e.relation for e in await kg.walk(SCOPE, "José", max_depth=1)} == {"NICKNAME_OF"}
+    assert {e.relation for e in await kg.walk(SCOPE, "José", max_depth=1, audience=AUDIENCE_STAFF)} == {"NICKNAME_OF"}
     await kg.set_edge_status(SCOPE, "José", "Maria", "SPOUSE_OF", EDGE_ACCEPTED)
-    assert "SPOUSE_OF" in {e.relation for e in await kg.walk(SCOPE, "José", max_depth=1)}
+    assert "SPOUSE_OF" in {e.relation for e in await kg.walk(SCOPE, "José", max_depth=1, audience=AUDIENCE_STAFF)}

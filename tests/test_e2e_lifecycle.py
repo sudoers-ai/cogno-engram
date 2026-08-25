@@ -11,7 +11,7 @@ import json
 
 from cogno_engram import hypnos, rerank
 from cogno_engram.adapters.in_memory import InMemoryBuffer, InMemoryGraph, InMemoryStore
-from cogno_engram.types import RetrievalQuery, TurnRecord
+from cogno_engram.types import AUDIENCE_STAFF, RetrievalQuery, TurnRecord
 
 
 class ScriptedBackend:
@@ -78,7 +78,7 @@ async def test_full_memory_lifecycle():
     new_mems = await hypnos.periodic_consolidate(
         store, backend, scope=SCOPE, session_id=session.id, embedder=emb, kg=kg)
     assert any("pix" in m.content for m in new_mems)
-    edges = await kg.walk(SCOPE, "João", max_depth=1)
+    edges = await kg.walk(SCOPE, "João", max_depth=1, audience=AUDIENCE_STAFF)
     assert [e.relation for e in edges] == ["WANTS"] and edges[0].source_session == session.id
 
     # ── 3. retrieval + rerank surfaces the payment preference ──
@@ -106,4 +106,4 @@ async def test_lifecycle_feedback_prunes_graph_on_close():
     await kg.upsert_edge(GraphEdge(SCOPE, "X", "Y", "REL", source_session=session.id))
 
     await hypnos.consolidate_session(store, ScriptedBackend([]), session=session, kg=kg)
-    assert await kg.walk(SCOPE, "X", max_depth=1) == []   # pruned because a turn was disliked
+    assert await kg.walk(SCOPE, "X", max_depth=1, audience=AUDIENCE_STAFF) == []   # pruned because a turn was disliked

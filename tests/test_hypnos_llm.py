@@ -4,7 +4,7 @@ import json
 
 from cogno_engram import hypnos
 from cogno_engram.adapters.in_memory import InMemoryGraph, InMemoryStore
-from cogno_engram.types import TurnRecord
+from cogno_engram.types import AUDIENCE_STAFF, TurnRecord
 
 
 class ScriptedBackend:
@@ -112,7 +112,7 @@ async def test_periodic_extracts_relations_into_graph():
                     "edges": [{"source": "José", "target": "Rex", "relation": "OWNS", "confidence": 0.9}]}),
     ])
     await hypnos.periodic_consolidate(store, backend, scope=scope, session_id=sid, kg=kg)
-    edges = await kg.walk(scope, "José", max_depth=1)
+    edges = await kg.walk(scope, "José", max_depth=1, audience=AUDIENCE_STAFF)
     assert [e.relation for e in edges] == ["OWNS"]
     assert edges[0].source_session == sid     # tagged for later pruning
 
@@ -140,7 +140,7 @@ async def test_periodic_edge_filter_vetoes_relations():
 
     await hypnos.periodic_consolidate(store, backend, scope=scope, session_id=sid, kg=kg,
                                       edge_filter=_keep_durable)
-    edges = await kg.walk(scope, "José", max_depth=1)
+    edges = await kg.walk(scope, "José", max_depth=1, audience=AUDIENCE_STAFF)
     assert [e.relation for e in edges] == ["WORKS_AT"]          # volatile edge never persisted
     assert dropped == [("José", "Rex", "HAS_APPOINTMENT")]      # filter saw + vetoed it
 
@@ -207,7 +207,7 @@ async def test_final_prunes_graph_on_disliked_turns():
     await kg.upsert_edge(GraphEdge("acme/p", "A", "B", "R", source_session=session.id))
     backend = ScriptedBackend([_mem_json()])
     await hypnos.consolidate_session(store, backend, session=session, kg=kg)
-    assert await kg.walk("acme/p", "A", max_depth=1) == []
+    assert await kg.walk("acme/p", "A", max_depth=1, audience=AUDIENCE_STAFF) == []
 
 
 async def test_final_no_active_turns_still_closes():
@@ -236,8 +236,8 @@ async def test_periodic_relations_honour_kg_scope():
                                              kg=kg, kg_scope="acme")
     # memories stay at the identity scope, graph data lands at the tenant scope
     assert [m.scope for m in mems] == [scope]
-    assert [e.relation for e in await kg.walk("acme", "José", max_depth=1)] == ["OWNS"]
-    assert await kg.walk(scope, "José", max_depth=1) == []
+    assert [e.relation for e in await kg.walk("acme", "José", max_depth=1, audience=AUDIENCE_STAFF)] == ["OWNS"]
+    assert await kg.walk(scope, "José", max_depth=1, audience=AUDIENCE_STAFF) == []
 
 
 async def test_final_prune_honours_kg_scope():
@@ -250,7 +250,7 @@ async def test_final_prune_honours_kg_scope():
     await kg.upsert_edge(GraphEdge("acme", "A", "B", "R", source_session=session.id))
     backend = ScriptedBackend([_mem_json()])
     await hypnos.consolidate_session(store, backend, session=session, kg=kg, kg_scope="acme")
-    assert await kg.walk("acme", "A", max_depth=1) == []
+    assert await kg.walk("acme", "A", max_depth=1, audience=AUDIENCE_STAFF) == []
 
 
 # ── Tier 2 proposals (opt-in) ─────────────────────────────────────────────
@@ -273,8 +273,8 @@ async def test_tier2_still_asserts_by_default():
     await _seed(store, scope, sid, [TurnRecord(sid, scope, 1, "o cachorro do José é o Rex")])
     await hypnos.periodic_consolidate(store, _one_edge_backend(), scope=scope, session_id=sid, kg=kg)
 
-    assert [e.relation for e in await kg.walk(scope, "José")] == ["OWNS_PET"]
-    assert await kg.pending_edges(scope) == []
+    assert [e.relation for e in await kg.walk(scope, "José", audience=AUDIENCE_STAFF)] == ["OWNS_PET"]
+    assert await kg.pending_edges(scope, audience=AUDIENCE_STAFF) == []
 
 
 async def test_tier2_can_PROPOSE_instead_and_then_nothing_is_spoken_until_a_human_says_so():
@@ -283,10 +283,10 @@ async def test_tier2_can_PROPOSE_instead_and_then_nothing_is_spoken_until_a_huma
     await hypnos.periodic_consolidate(store, _one_edge_backend(), scope=scope, session_id=sid,
                                       kg=kg, propose_relations=True)
 
-    assert await kg.walk(scope, "José") == []                       # not in the prompt…
-    queued = await kg.pending_edges(scope)
+    assert await kg.walk(scope, "José", audience=AUDIENCE_STAFF) == []                       # not in the prompt…
+    queued = await kg.pending_edges(scope, audience=AUDIENCE_STAFF)
     assert [e.relation for e in queued] == ["OWNS_PET"]              # …waiting on a person
     assert queued[0].source_session == sid                           # still prunable by session
 
     await kg.set_edge_status(scope, "José", "Rex", "OWNS_PET", "accepted")
-    assert [e.relation for e in await kg.walk(scope, "José")] == ["OWNS_PET"]
+    assert [e.relation for e in await kg.walk(scope, "José", audience=AUDIENCE_STAFF)] == ["OWNS_PET"]

@@ -161,6 +161,64 @@ def sanitize_edge_status(raw: object) -> str:
     return text if text in VALID_EDGE_STATUS else EDGE_PROPOSED
 
 
+# ── Audience: who may READ an edge ───────────────────────────────────────────
+#
+# "Tenant sees everything in the graph; an identity sees only its own life. They do not mix."
+# — the product decision, 2026-08-25.
+#
+# **This lives on the EDGE, and that is forced, not preferred.** `knowledge_nodes` is unique on
+# `(scope, lower(label), node_type)`, so the node "Maria" is ONE row for the whole tenant: two
+# contacts who each mention a Maria share it. There is no "José's Maria" to mark. The EDGE
+# `José --SPOUSE_OF--> Maria` is his; the node is just a label. Node visibility is DERIVED from
+# the edges a reader may see.
+AUDIENCE_UNCLASSIFIED = ""      # a writer that did not declare: staff sees it, no contact does
+AUDIENCE_TENANT = "tenant"      # a business fact: staff and EVERY identity may read it
+_AUDIENCE_IDENTITY_PREFIX = "identity:"
+
+# Not a stored value — the argument a STAFF read passes. Distinct from anything `audience_for`
+# can produce, so a stored row can never be mistaken for a staff request.
+AUDIENCE_STAFF = "__staff__"
+
+
+def audience_for(identity_id: object) -> str:
+    """The audience value for one contact's own life, or ``""`` when there is no identity.
+
+    The only producer of identity audiences. Callers never hand-write the string, so the prefix
+    cannot drift and a raw identity id cannot be stored by accident.
+    """
+    text = str(identity_id or "").strip()
+    return f"{_AUDIENCE_IDENTITY_PREFIX}{text}" if text else AUDIENCE_UNCLASSIFIED
+
+
+def sanitize_audience(raw: object) -> str:
+    """Any input → a storable audience. Pure, total, never raises.
+
+    Anything unrecognisable becomes ``AUDIENCE_UNCLASSIFIED``, and that direction is the whole
+    point: an unclassified edge is visible to STAFF and to NO contact. A writer that forgets, or
+    garbles, costs a missing block — visible, annoying, safe — and never a leak. Two
+    discriminators in this codebase defaulted the permissive way (`status` to `accepted`,
+    `source_session` to empty) and both had to be undone after they had already spoken.
+    """
+    text = str(raw or "").strip()
+    if text == AUDIENCE_TENANT:
+        return AUDIENCE_TENANT
+    if text.startswith(_AUDIENCE_IDENTITY_PREFIX) and text[len(_AUDIENCE_IDENTITY_PREFIX):].strip():
+        return text
+    return AUDIENCE_UNCLASSIFIED
+
+
+def audience_can_read(audience: str, row_audience: str) -> bool:
+    """May a reader with ``audience`` see a row stamped ``row_audience``? PURE — one rule, one
+    place, so the two adapters cannot drift and a third one inherits it.
+    """
+    if audience == AUDIENCE_STAFF:
+        return True                                   # tenant/staff read: everything
+    row = sanitize_audience(row_audience)
+    if row == AUDIENCE_TENANT:
+        return True                                   # a business fact, for everyone
+    return bool(row) and row == sanitize_audience(audience)
+
+
 @dataclass
 class GraphEdge:
     scope: str
@@ -176,6 +234,8 @@ class GraphEdge:
     attributes: dict = field(default_factory=dict)
     # Curation state. ``accepted`` edges are the only ones a walk returns — see the port.
     status: str = EDGE_ACCEPTED
+    # WHO MAY READ IT — see the block above. Default is unclassified: staff yes, contact no.
+    audience: str = AUDIENCE_UNCLASSIFIED
 
     def __post_init__(self) -> None:
         """One normalisation, both stores.
@@ -191,6 +251,10 @@ class GraphEdge:
         concatenating an object with a scalar — a divergence that only surfaces in production.
         """
         self.status = sanitize_edge_status(self.status)
+        # Same reason as `status`: normalise in the TYPE, so the two adapters cannot disagree
+        # about a non-canonical value and produce an edge that is invisible in one and visible
+        # in the other. A garbled audience lands unclassified — staff-only — never public.
+        self.audience = sanitize_audience(self.audience)
         if not isinstance(self.attributes, dict):
             self.attributes = {}
 

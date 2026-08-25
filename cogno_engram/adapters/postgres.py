@@ -32,6 +32,10 @@ import psycopg
 from psycopg.rows import dict_row
 
 from cogno_engram.types import (
+    AUDIENCE_STAFF,
+    AUDIENCE_TENANT,
+    AUDIENCE_UNCLASSIFIED,
+    sanitize_audience,
     EDGE_ACCEPTED,
     EDGE_PROPOSED,
     require_edge_status,
@@ -221,6 +225,9 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
             source_session text NOT NULL DEFAULT '',
             attributes     jsonb NOT NULL DEFAULT '{}',
             status         text NOT NULL DEFAULT 'accepted',
+            -- WHO MAY READ IT. '' = unclassified (staff only), 'tenant' = everyone in the
+            -- tenant, 'identity:<id>' = that contact's own life. See `types.audience_can_read`.
+            audience       text NOT NULL DEFAULT '',
             created_at     timestamptz NOT NULL DEFAULT now(),
             UNIQUE (source_id, target_id, relation)
         )
@@ -303,6 +310,10 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
         "CREATE INDEX IF NOT EXISTS idx_nodes_embedding ON knowledge_nodes "
         "USING hnsw (embedding vector_cosine_ops)",
         "CREATE INDEX IF NOT EXISTS idx_edges_session ON knowledge_edges (scope, source_session)",
+        # every contact-scoped read filters on it
+        "CREATE INDEX IF NOT EXISTS idx_edges_audience ON knowledge_edges (scope, audience)",
+        # existing deployments: the column is added before the index that needs it
+        "ALTER TABLE knowledge_edges ADD COLUMN IF NOT EXISTS audience text NOT NULL DEFAULT ''",
         "CREATE INDEX IF NOT EXISTS idx_edges_source ON knowledge_edges (source_id)",
         "CREATE INDEX IF NOT EXISTS idx_edges_target ON knowledge_edges (target_id)",
     ]
@@ -770,6 +781,23 @@ class PostgresStore(_PgBase):
                 await conn.execute("SELECT pg_advisory_unlock(%s)", (lock_id,))
 
 
+# ── audience predicates ──────────────────────────────────────────────────────
+#
+# Built from the constants rather than typed into the SQL, so the vocabulary has one source and
+# a rename cannot leave a string literal behind. These are our own values, never user input.
+#
+# EDGE: staff sees everything; anyone sees a tenant fact; an identity sees its own.
+_EDGE_VISIBLE = (f"(%s = '{AUDIENCE_STAFF}' OR e.audience = '{AUDIENCE_TENANT}' "
+                 f"OR e.audience = %s)")
+# NODE: DERIVED — visible when some visible edge touches it. Staff short-circuits BEFORE the
+# EXISTS, because an orphan node (no edges at all) must still be visible to staff; deriving it
+# for staff too would hide every node `ingest_entities` created before any relation existed.
+_NODE_VISIBLE = (f"""(%s = '{AUDIENCE_STAFF}' OR EXISTS (
+        SELECT 1 FROM knowledge_edges e
+        WHERE (e.source_id = n.id OR e.target_id = n.id) AND e.scope = n.scope
+          AND (e.audience = '{AUDIENCE_TENANT}' OR e.audience = %s)))""")
+
+
 def _edge_from_row(scope: str, row: Any) -> GraphEdge:
     """One place turns a row into an edge. Written when the third read path appeared: three
     hand-built constructors is how one of them silently stops carrying a new column."""
@@ -777,7 +805,8 @@ def _edge_from_row(scope: str, row: Any) -> GraphEdge:
                      relation=row["relation"], confidence=row["confidence"],
                      source_session=row["source_session"],
                      attributes=row.get("attributes") or {},
-                     status=row.get("status") or EDGE_ACCEPTED)
+                     status=row.get("status") or EDGE_ACCEPTED,
+                     audience=row.get("audience") or AUDIENCE_UNCLASSIFIED)
 
 
 class PostgresKnowledgeGraph(_PgBase):
@@ -835,8 +864,8 @@ class PostgresKnowledgeGraph(_PgBase):
             await conn.execute(
                 """INSERT INTO knowledge_edges
                    (scope, source_id, target_id, relation, confidence, source_session,
-                    attributes, status)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+                    attributes, status, audience)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s)
                    ON CONFLICT (source_id, target_id, relation) DO UPDATE SET
                        confidence     = GREATEST(knowledge_edges.confidence, EXCLUDED.confidence),
                        source_session = EXCLUDED.source_session,
@@ -855,18 +884,27 @@ class PostgresKnowledgeGraph(_PgBase):
                        -- cannot tell a deliberate correction from the LLM re-emitting the same
                        -- edge, so `set_edge_status` is the only way back)
                        status         = CASE WHEN knowledge_edges.status = 'proposed'
-                                             THEN EXCLUDED.status ELSE knowledge_edges.status END""",
+                                             THEN EXCLUDED.status ELSE knowledge_edges.status END,
+                       -- a re-assertion may NARROW the audience but never widen it: the same
+                       -- reasoning as `status`, and the direction that cannot leak. An edge
+                       -- already private to someone stays private even if a later writer
+                       -- forgets to declare.
+                       audience       = CASE WHEN knowledge_edges.audience = ''
+                                             THEN EXCLUDED.audience ELSE knowledge_edges.audience END""",
                 (edge.scope, src, tgt, edge.relation, edge.confidence, edge.source_session,
                  json.dumps(edge.attributes or {}, default=str),
-                 sanitize_edge_status(edge.status)))
+                 sanitize_edge_status(edge.status), sanitize_audience(edge.audience)))
 
-    async def find_node(self, scope: str, label: str) -> Optional[GraphNode]:
+    async def find_node(self, scope: str, label: str, *,
+                        audience: str) -> Optional[GraphNode]:
         _require_scope(scope)
         async with self._conn() as conn:
             cur = await conn.execute(
-                "SELECT id, scope, label, node_type, attributes, created_at, updated_at "
-                "FROM knowledge_nodes WHERE scope = %s AND lower(label) = lower(%s) LIMIT 1",
-                (scope, label))
+                "SELECT n.id, n.scope, n.label, n.node_type, n.attributes, n.created_at, "
+                "n.updated_at FROM knowledge_nodes n "
+                "WHERE n.scope = %s AND lower(n.label) = lower(%s) "
+                f"AND {_NODE_VISIBLE} LIMIT 1",
+                (scope, label, audience, audience))
             row = await cur.fetchone()
         if not row:
             return None
@@ -875,24 +913,27 @@ class PostgresKnowledgeGraph(_PgBase):
                          created_at=row["created_at"], updated_at=row["updated_at"])
 
     async def find_nodes_by_embedding(self, scope: str, embedding: list[float],
-                                      *, limit: int = 5) -> list[GraphNode]:
+                                      *, audience: str, limit: int = 5) -> list[GraphNode]:
         _require_scope(scope)
         async with self._conn() as conn:
             cur = await conn.execute(
-                "SELECT id, scope, label, node_type, attributes FROM knowledge_nodes "
-                "WHERE scope = %s AND embedding IS NOT NULL "
-                "ORDER BY embedding <=> %s::vector LIMIT %s", (scope, _vec(embedding), limit))
+                "SELECT n.id, n.scope, n.label, n.node_type, n.attributes "
+                "FROM knowledge_nodes n WHERE n.scope = %s AND n.embedding IS NOT NULL "
+                f"AND {_NODE_VISIBLE} "
+                "ORDER BY n.embedding <=> %s::vector LIMIT %s",
+                (scope, audience, audience, _vec(embedding), limit))
             rows = await cur.fetchall()
         return [GraphNode(scope=r["scope"], label=r["label"], node_type=r["node_type"],
                           attributes=r["attributes"], id=r["id"]) for r in rows]
 
-    async def walk(self, scope: str, start_label: str, *, max_depth: int = 2) -> list[GraphEdge]:
+    async def walk(self, scope: str, start_label: str, *, audience: str,
+                   max_depth: int = 2) -> list[GraphEdge]:
         _require_scope(scope)
         async with self._conn() as conn:
             # Emit the edge used at each hop, bounded by depth (mirrors the
             # in-memory BFS: only nodes at depth < max_depth expand their edges).
             cur = await conn.execute(
-                """
+                f"""
                 WITH RECURSIVE walk AS (
                     SELECT n.id AS node_id, 0 AS depth, NULL::bigint AS edge_id,
                            ARRAY[n.id] AS path
@@ -912,32 +953,38 @@ class PostgresKnowledgeGraph(_PgBase):
                           AND e.scope = %s
                           -- an unreviewed edge must not decide what the walk can REACH either
                           AND e.status = 'accepted'
+                          -- ...and neither may an edge this reader is not allowed to see: an
+                          -- invisible edge that still ROUTED the traversal would disclose the
+                          -- neighbour it leads to.
+                          AND {_EDGE_VISIBLE}
                     ) nxt ON true
                     WHERE w.depth < %s AND NOT (nxt.node_id = ANY(w.path))
                 )
                 SELECT DISTINCT e.id, sn.label AS source, tn.label AS target,
-                       e.relation, e.confidence, e.source_session, e.attributes, e.status
+                       e.relation, e.confidence, e.source_session, e.attributes, e.status,
+                       e.audience
                 FROM walk w
                 JOIN knowledge_edges e ON e.id = w.edge_id
                 JOIN knowledge_nodes sn ON sn.id = e.source_id
                 JOIN knowledge_nodes tn ON tn.id = e.target_id
                 """,
-                (scope, start_label, scope, max_depth))
+                (scope, start_label, scope, audience, audience, max_depth))
             rows = await cur.fetchall()
         return [_edge_from_row(scope, r) for r in rows]
 
-    async def pending_edges(self, scope: str, *, limit: int = 100) -> list[GraphEdge]:
+    async def pending_edges(self, scope: str, *, audience: str,
+                            limit: int = 100) -> list[GraphEdge]:
         _require_scope(scope)
         if limit <= 0:          # a negative LIMIT raises here and truncated in memory; agree
             return []
         async with self._conn() as conn:
             cur = await conn.execute(
-                """SELECT sn.label AS source, tn.label AS target, e.relation, e.confidence,
-                          e.source_session, e.attributes, e.status
+                f"""SELECT sn.label AS source, tn.label AS target, e.relation, e.confidence,
+                          e.source_session, e.attributes, e.status, e.audience
                    FROM knowledge_edges e
                    JOIN knowledge_nodes sn ON sn.id = e.source_id
                    JOIN knowledge_nodes tn ON tn.id = e.target_id
-                   WHERE e.scope = %s AND e.status = %s
+                   WHERE e.scope = %s AND e.status = %s AND {_EDGE_VISIBLE}
                    -- OLDEST first, and the direction is the point: with a `limit` and no
                    -- cursor, newest-first makes the oldest proposals — the ones a curator most
                    -- needs to clear — permanently unreachable, and the queue never drains. The
@@ -945,7 +992,7 @@ class PostgresKnowledgeGraph(_PgBase):
                    -- review found the two disagreeing and the disagreement was invisible.
                    ORDER BY e.created_at ASC, e.id ASC
                    LIMIT %s""",
-                (scope, EDGE_PROPOSED, limit))
+                (scope, EDGE_PROPOSED, audience, audience, limit))
             rows = await cur.fetchall()
         return [_edge_from_row(scope, r) for r in rows]
 
@@ -962,42 +1009,49 @@ class PostgresKnowledgeGraph(_PgBase):
                 (require_edge_status(status), scope, source, target, relation))
         return bool(cur.rowcount)
 
-    async def neighbors(self, scope: str, label: str) -> list[GraphNode]:
+    async def neighbors(self, scope: str, label: str, *, audience: str) -> list[GraphNode]:
         _require_scope(scope)
         async with self._conn() as conn:
             cur = await conn.execute(
-                """SELECT DISTINCT nn.id, nn.scope, nn.label, nn.node_type, nn.attributes
+                f"""SELECT DISTINCT nn.id, nn.scope, nn.label, nn.node_type, nn.attributes
                    FROM knowledge_nodes n
                    JOIN knowledge_edges e ON (e.source_id = n.id OR e.target_id = n.id)
                    JOIN knowledge_nodes nn
                      ON nn.id = CASE WHEN e.source_id = n.id THEN e.target_id ELSE e.source_id END
                    WHERE n.scope = %s AND lower(n.label) = lower(%s)
                      -- an unreviewed edge still DISCLOSES its endpoint; see the in-memory twin
-                     AND e.status = 'accepted'""", (scope, label))
+                     AND e.status = 'accepted'
+                     AND {_EDGE_VISIBLE}""", (scope, label, audience, audience))
             rows = await cur.fetchall()
         return [GraphNode(scope=r["scope"], label=r["label"], node_type=r["node_type"],
                           attributes=r["attributes"], id=r["id"]) for r in rows]
 
-    async def get_node_context(self, scope: str, label: str) -> Optional[NodeContext]:
+    async def get_node_context(self, scope: str, label: str, *,
+                               audience: str) -> Optional[NodeContext]:
         _require_scope(scope)
-        node = await self.find_node(scope, label)
+        node = await self.find_node(scope, label, audience=audience)
         if node is None:
             return None
-        edges = await self.walk(scope, label, max_depth=1)
+        edges = await self.walk(scope, label, audience=audience, max_depth=1)
         edges = [e for e in edges
                  if label.lower() in (e.source.lower(), e.target.lower())]
-        return NodeContext(node=node, edges=edges, neighbors=await self.neighbors(scope, label))
+        return NodeContext(node=node, edges=edges,
+                           neighbors=await self.neighbors(scope, label, audience=audience))
 
-    async def list_nodes(self, scope: str, *, node_type: Optional[str] = None,
+    async def list_nodes(self, scope: str, *, audience: str,
+                         node_type: Optional[str] = None,
                          limit: int = 100) -> list[GraphNode]:
         _require_scope(scope)
-        sql = ("SELECT id, scope, label, node_type, attributes, created_at, updated_at "
-               "FROM knowledge_nodes WHERE scope = %s")
-        params: list = [scope]
+        sql = ("SELECT n.id, n.scope, n.label, n.node_type, n.attributes, n.created_at, "
+               "n.updated_at FROM knowledge_nodes n WHERE n.scope = %s "
+               f"AND {_NODE_VISIBLE}")
+        # two, and in this order: `_NODE_VISIBLE` carries `%s` twice (the staff
+        # short-circuit, then the identity match) and sits immediately after `scope`.
+        params: list = [scope, audience, audience]
         if node_type is not None:
-            sql += " AND node_type = %s"
+            sql += " AND n.node_type = %s"
             params.append(node_type)
-        sql += " ORDER BY id LIMIT %s"
+        sql += " ORDER BY n.id LIMIT %s"
         params.append(limit)
         async with self._conn() as conn:
             cur = await conn.execute(sql, params)
@@ -1007,7 +1061,8 @@ class PostgresKnowledgeGraph(_PgBase):
                           created_at=r["created_at"], updated_at=r["updated_at"])
                 for r in rows]
 
-    async def count_nodes(self, scope: str, *, label: Optional[str] = None) -> int:
+    async def count_nodes(self, scope: str, *, audience: str,
+                          label: Optional[str] = None) -> int:
         """How many nodes this scope holds, or how many carry ``label``.
 
         `lower(label)` on both sides, matching `find_node` and the `walk` seed — the unique index
@@ -1015,24 +1070,31 @@ class PostgresKnowledgeGraph(_PgBase):
         expression the planner already has an index for.
         """
         _require_scope(scope)
-        sql = "SELECT count(*) AS n FROM knowledge_nodes WHERE scope = %s"
-        params: list = [scope]
+        sql = ("SELECT count(*) AS n FROM knowledge_nodes n WHERE n.scope = %s "
+               f"AND {_NODE_VISIBLE}")
+        # two, and in this order: `_NODE_VISIBLE` carries `%s` twice (the staff
+        # short-circuit, then the identity match) and sits immediately after `scope`.
+        params: list = [scope, audience, audience]
         if label is not None:
-            sql += " AND lower(label) = lower(%s)"
+            sql += " AND lower(n.label) = lower(%s)"
             params.append(label.strip())
         async with self._conn() as conn:
             cur = await conn.execute(sql, params)
             row = await cur.fetchone()
         return int(row["n"] if isinstance(row, dict) else row[0])
 
-    async def scan_nodes(self, scope: str, *, after_id: Optional[int] = None,
+    async def scan_nodes(self, scope: str, *, audience: str,
+                         after_id: Optional[int] = None,
                          limit: int = 1000) -> list[GraphNode]:
         _require_scope(scope)
-        sql = ("SELECT id, scope, label, node_type, attributes, created_at, updated_at "
-               "FROM knowledge_nodes WHERE scope = %s")
-        params: list = [scope]
+        sql = ("SELECT n.id, n.scope, n.label, n.node_type, n.attributes, n.created_at, "
+               "n.updated_at FROM knowledge_nodes n WHERE n.scope = %s "
+               f"AND {_NODE_VISIBLE}")
+        # two, and in this order: `_NODE_VISIBLE` carries `%s` twice (the staff
+        # short-circuit, then the identity match) and sits immediately after `scope`.
+        params: list = [scope, audience, audience]
         if after_id is not None:
-            sql += " AND id > %s"
+            sql += " AND n.id > %s"
             params.append(after_id)
         sql += " ORDER BY id ASC LIMIT %s"
         params.append(limit)
@@ -1043,6 +1105,17 @@ class PostgresKnowledgeGraph(_PgBase):
                           attributes=r["attributes"], id=r["id"],
                           created_at=r["created_at"], updated_at=r["updated_at"])
                 for r in rows]
+
+    async def has_edges(self, scope: str, label: str) -> bool:
+        """Every edge, any audience, any status — see the port for why it takes no audience."""
+        _require_scope(scope)
+        async with self._conn() as conn:
+            cur = await conn.execute(
+                """SELECT 1 FROM knowledge_edges e
+                   JOIN knowledge_nodes n ON n.id IN (e.source_id, e.target_id)
+                   WHERE e.scope = %s AND lower(n.label) = lower(%s) LIMIT 1""",
+                (scope, label))
+            return await cur.fetchone() is not None
 
     async def delete_node(self, scope: str, label: str) -> bool:
         _require_scope(scope)

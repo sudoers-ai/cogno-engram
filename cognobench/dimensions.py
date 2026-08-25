@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from cogno_engram import AUDIENCE_STAFF
 from cogno_engram import hypnos, rerank
 from cogno_engram.adapters.in_memory import InMemoryBuffer, InMemoryGraph, InMemoryStore
 from cogno_engram.types import GraphEdge, GraphNode, MemoryRecord, RetrievalQuery, TurnRecord
@@ -20,11 +21,11 @@ from cognobench.types import CheckResult, DimensionResult
 
 async def _snapshot(graph: InMemoryGraph, scope: str, title: str, note: str = "") -> GraphSnapshot:
     """Collect what a case left in the graph (for --graph-html)."""
-    nodes = await graph.list_nodes(scope)
+    nodes = await graph.list_nodes(scope, audience=AUDIENCE_STAFF)
     seen: set[tuple[str, str, str]] = set()
     edges: list[tuple[str, str, str, float]] = []
     for node in nodes:
-        for e in await graph.walk(scope, node.label, max_depth=3):
+        for e in await graph.walk(scope, node.label, max_depth=3, audience=AUDIENCE_STAFF):
             key = (e.source.lower(), e.target.lower(), e.relation)
             if key not in seen:
                 seen.add(key)
@@ -80,7 +81,7 @@ async def run_graph(limit: int | None = None, *,
             await graph.upsert_node(GraphNode("bench", label, ntype))
         for src, tgt, rel in case.edges:
             await graph.upsert_edge(GraphEdge("bench", src, tgt, rel, source_session="s1"))
-        edges = await graph.walk("bench", case.start, max_depth=case.max_depth)
+        edges = await graph.walk("bench", case.start, max_depth=case.max_depth, audience=AUDIENCE_STAFF)
         got = {e.relation for e in edges}
         dim.checks.append(CheckResult(
             case.id, "reachable_relations", str(sorted(case.expect_relations)),
@@ -195,10 +196,10 @@ async def run_graph_capture(limit: int | None = None, *,
             store, backend, scope=mem_scope, session_id=session.id,
             kg=graph, kg_scope=kg_scope, extract_relations=True)
 
-        nodes = await graph.list_nodes(kg_scope)
+        nodes = await graph.list_nodes(kg_scope, audience=AUDIENCE_STAFF)
         labels = {n.label.lower() for n in nodes}
         edges = [e for e in graph._edges if e.scope == kg_scope]
-        leaked = ([n for n in await graph.list_nodes(mem_scope)]
+        leaked = ([n for n in await graph.list_nodes(mem_scope, audience=AUDIENCE_STAFF)]
                   + [e for e in graph._edges if e.scope == mem_scope])
         # hard invariants
         dim.checks.append(CheckResult(case.id, "kg_scope_only", "no rows at memory scope",
@@ -219,7 +220,7 @@ async def run_graph_capture(limit: int | None = None, *,
             start_node = next((n.label for n in nodes if start in n.label.lower()), None)
             reached: set[str] = set()
             if start_node:
-                for e in await graph.walk(kg_scope, start_node, max_depth=2):
+                for e in await graph.walk(kg_scope, start_node, max_depth=2, audience=AUDIENCE_STAFF):
                     reached.update((e.source.lower(), e.target.lower()))
             hit = any(target in r for r in reached)
             dim.checks.append(CheckResult(case.id, f"connected:{start}->{target}(soft)",

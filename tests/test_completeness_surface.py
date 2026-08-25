@@ -2,7 +2,7 @@
 
 from cogno_engram import format_graph_context, ingest_entities
 from cogno_engram.adapters.in_memory import InMemoryStore
-from cogno_engram.types import GraphEdge, GraphNode, MemoryRecord, TurnRecord
+from cogno_engram.types import AUDIENCE_STAFF, GraphEdge, GraphNode, MemoryRecord, TurnRecord
 
 
 # ── MemoryStore additions ─────────────────────────────────────────────────
@@ -49,25 +49,25 @@ async def _jose_rex(graph):
 
 async def test_get_node_context(graph):
     await _jose_rex(graph)
-    ctx = await graph.get_node_context("s", "José")
+    ctx = await graph.get_node_context("s", "José", audience=AUDIENCE_STAFF)
     assert ctx is not None
     assert ctx.node.label == "José"
     assert [e.relation for e in ctx.edges] == ["OWNS"]
     assert {n.label for n in ctx.neighbors} == {"Rex"}
-    assert await graph.get_node_context("s", "missing") is None
+    assert await graph.get_node_context("s", "missing", audience=AUDIENCE_STAFF) is None
 
 
 async def test_list_nodes_with_type_filter(graph):
     await _jose_rex(graph)
-    assert {n.label for n in await graph.list_nodes("s")} == {"José", "Rex"}
-    assert [n.label for n in await graph.list_nodes("s", node_type="ANIMAL")] == ["Rex"]
+    assert {n.label for n in await graph.list_nodes("s", audience=AUDIENCE_STAFF)} == {"José", "Rex"}
+    assert [n.label for n in await graph.list_nodes("s", node_type="ANIMAL", audience=AUDIENCE_STAFF)] == ["Rex"]
 
 
 async def test_delete_node_cascades_edges(graph):
     await _jose_rex(graph)
     assert await graph.delete_node("s", "Rex") is True
-    assert await graph.find_node("s", "Rex") is None
-    assert await graph.walk("s", "José", max_depth=2) == []     # edge cascaded
+    assert await graph.find_node("s", "Rex", audience=AUDIENCE_STAFF) is None
+    assert await graph.walk("s", "José", max_depth=2, audience=AUDIENCE_STAFF) == []     # edge cascaded
     assert await graph.delete_node("s", "Rex") is False         # already gone
 
 
@@ -76,13 +76,13 @@ async def test_delete_node_cascades_edges(graph):
 async def test_ingest_entities_creates_nodes(graph):
     n = await ingest_entities(graph, "s", ["Maria", ("Acme", "ORG"), ("", "PERSON"), "bad-type-skipped"])
     assert n == 3      # the empty label is skipped
-    assert (await graph.find_node("s", "Acme")).node_type == "ORG"
-    assert (await graph.find_node("s", "Maria")).node_type == "CONCEPT"   # default
+    assert (await graph.find_node("s", "Acme", audience=AUDIENCE_STAFF)).node_type == "ORG"
+    assert (await graph.find_node("s", "Maria", audience=AUDIENCE_STAFF)).node_type == "CONCEPT"   # default
 
 
 async def test_ingest_entities_normalizes_unknown_type(graph):
     await ingest_entities(graph, "s", [("Thing", "WIDGET")])
-    assert (await graph.find_node("s", "Thing")).node_type == "CONCEPT"
+    assert (await graph.find_node("s", "Thing", audience=AUDIENCE_STAFF)).node_type == "CONCEPT"
 
 
 def test_format_graph_context_block():

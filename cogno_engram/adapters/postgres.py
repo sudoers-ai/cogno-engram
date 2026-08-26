@@ -1090,7 +1090,8 @@ def _edge_from_row(scope: str, row: Any) -> GraphEdge:
                      source_session=row["source_session"],
                      attributes=row.get("attributes") or {},
                      status=row.get("status") or EDGE_ACCEPTED,
-                     audience=row.get("audience") or AUDIENCE_UNCLASSIFIED)
+                     audience=row.get("audience") or AUDIENCE_UNCLASSIFIED,
+                     created_at=row.get("created_at"))
 
 
 class PostgresKnowledgeGraph(_PgBase):
@@ -1269,7 +1270,7 @@ class PostgresKnowledgeGraph(_PgBase):
                 )
                 SELECT DISTINCT e.id, sn.label AS source, tn.label AS target,
                        e.relation, e.confidence, e.source_session, e.attributes, e.status,
-                       e.audience
+                       e.audience, e.created_at
                 FROM walk w
                 JOIN knowledge_edges e ON e.id = w.edge_id
                 JOIN knowledge_nodes sn ON sn.id = e.source_id
@@ -1287,7 +1288,8 @@ class PostgresKnowledgeGraph(_PgBase):
         async with self._conn() as conn:
             cur = await conn.execute(
                 f"""SELECT sn.label AS source, tn.label AS target, e.relation, e.confidence,
-                          e.source_session, e.attributes, e.status, e.audience
+                          e.source_session, e.attributes, e.status, e.audience,
+                          e.created_at
                    FROM knowledge_edges e
                    JOIN knowledge_nodes sn ON sn.id = e.source_id
                    JOIN knowledge_nodes tn ON tn.id = e.target_id

@@ -1507,3 +1507,24 @@ async def test_the_net_catches_legacy_shapes_and_NOTHING_else(exc, swallowed, ca
             await _partition_existing_table(conn, "turns", 2)
         assert not [r for r in caplog.records if "partitioning_skipped" in r.getMessage()], (
             "a non-legacy failure was reported as a legacy shape — the net is too wide")
+
+
+async def test_the_edge_carries_the_date_the_STORE_stamped(pg):
+    """The Postgres half of the parity above: the value must come from the COLUMN, not from a
+    clock on this side. `_edge_from_row` is the one constructor — the place a new column
+    silently stops being carried, as its own docstring says."""
+    from datetime import datetime, timezone
+
+    from cogno_engram.adapters.postgres import PostgresKnowledgeGraph
+    from cogno_engram.types import AUDIENCE_STAFF, GraphEdge
+
+    kg = PostgresKnowledgeGraph(dsn=pg)
+    antes = datetime.now(timezone.utc)
+    await kg.upsert_edge(GraphEdge("s", "José", "Rex", "OWNS_PET", audience=AUDIENCE_STAFF))
+    lida = (await kg.walk("s", "José", audience=AUDIENCE_STAFF))[0]
+    assert lida.created_at is not None, "a coluna existe e a aresta veio sem ela"
+    assert abs((lida.created_at - antes).total_seconds()) < 300, (
+        f"a data não parece a do servidor: {lida.created_at} vs {antes}")
+    # e a mesma data chega pela outra porta, senão as duas leituras discordam sobre o mesmo facto
+    ctx = await kg.get_node_context("s", "José", audience=AUDIENCE_STAFF)
+    assert ctx.edges[0].created_at == lida.created_at

@@ -19,6 +19,7 @@ from uuid import uuid4
 from dataclasses import replace
 
 
+from cogno_engram.folding import fold_label
 from cogno_engram.types import (
     AUDIENCE_STAFF,
     audience_can_read,
@@ -401,7 +402,7 @@ class InMemoryGraph:
     """Reference ``KnowledgeGraph`` — typed nodes + directed edges + BFS walk."""
 
     def __init__(self) -> None:
-        self._nodes: dict[tuple[str, str], GraphNode] = {}   # (scope, label.lower()) -> node
+        self._nodes: dict[tuple[str, str], GraphNode] = {}   # (scope, fold_label(label)) -> node
         self._edges: list[GraphEdge] = []
         self._next_id = 1
 
@@ -422,13 +423,13 @@ class InMemoryGraph:
             return {lbl for (sc, lbl) in self._nodes if sc == scope}
         out: set[str] = set()
         for e in self._readable(scope, audience):
-            out.add(e.source.lower())
-            out.add(e.target.lower())
+            out.add(fold_label(e.source))
+            out.add(fold_label(e.target))
         return out
 
     async def upsert_node(self, node: GraphNode) -> int:
         _require_scope(node.scope)
-        key = (node.scope, node.label.lower())
+        key = (node.scope, fold_label(node.label))
         existing = self._nodes.get(key)
         now = datetime.now(timezone.utc)
         if existing is not None:
@@ -451,11 +452,11 @@ class InMemoryGraph:
         # (Pg's _resolve_node_id INSERTs with the column default node_type='CONCEPT'), so an
         # LLM extraction that lists an edge without declaring both nodes never dangles.
         for label in (edge.source, edge.target):
-            if (edge.scope, label.lower()) not in self._nodes:
+            if (edge.scope, fold_label(label)) not in self._nodes:
                 await self.upsert_node(GraphNode(edge.scope, label, "CONCEPT"))
         for existing in self._edges:
-            if (existing.scope == edge.scope and existing.source.lower() == edge.source.lower()
-                    and existing.target.lower() == edge.target.lower()
+            if (existing.scope == edge.scope and fold_label(existing.source) == fold_label(edge.source)
+                    and fold_label(existing.target) == fold_label(edge.target)
                     and existing.relation == edge.relation):
                 if existing.status == EDGE_ACCEPTED and edge.status == EDGE_PROPOSED:
                     # A PROPOSAL cannot modify a VERDICT — in any field, not just `status`.
@@ -496,9 +497,9 @@ class InMemoryGraph:
     async def find_node(self, scope: str, label: str, *,
                         audience: str) -> Optional[GraphNode]:
         _require_scope(scope)
-        if label.lower() not in self._visible_labels(scope, audience):
+        if fold_label(label) not in self._visible_labels(scope, audience):
             return None
-        return self._nodes.get((scope, label.lower()))
+        return self._nodes.get((scope, fold_label(label)))
 
     async def find_nodes_by_embedding(self, scope: str, embedding: list[float],
                                       *, audience: str, limit: int = 5) -> list[GraphNode]:
@@ -506,7 +507,7 @@ class InMemoryGraph:
         visible = self._visible_labels(scope, audience)
         scored = [(_cosine(embedding, n.embedding), n)
                   for n in self._nodes.values()
-                  if n.scope == scope and n.embedding and n.label.lower() in visible]
+                  if n.scope == scope and n.embedding and fold_label(n.label) in visible]
         scored.sort(key=lambda pair: pair[0], reverse=True)
         return [n for _, n in scored[:limit]]
 
@@ -529,8 +530,8 @@ class InMemoryGraph:
         _require_scope(scope)
         want = require_edge_status(status)
         for e in self._edges:
-            if (e.scope == scope and e.source.lower() == source.lower()
-                    and e.target.lower() == target.lower() and e.relation == relation):
+            if (e.scope == scope and fold_label(e.source) == fold_label(source)
+                    and fold_label(e.target) == fold_label(target) and e.relation == relation):
                 e.status = want
                 return True
         return False
@@ -541,8 +542,8 @@ class InMemoryGraph:
         _require_scope(scope)
         want = sanitize_audience(audience)
         for e in self._edges:
-            if (e.scope == scope and e.source.lower() == source.lower()
-                    and e.target.lower() == target.lower() and e.relation == relation):
+            if (e.scope == scope and fold_label(e.source) == fold_label(source)
+                    and fold_label(e.target) == fold_label(target) and e.relation == relation):
                 e.audience = want
                 return True
         return False
@@ -553,8 +554,8 @@ class InMemoryGraph:
         readable = self._readable(scope, audience)
         result: list[GraphEdge] = []
         seen_edges: set[int] = set()
-        visited = {start_label.lower()}
-        frontier: list[tuple[str, int]] = [(start_label.lower(), 0)]
+        visited = {fold_label(start_label)}
+        frontier: list[tuple[str, int]] = [(fold_label(start_label), 0)]
         while frontier:
             label, depth = frontier.pop(0)
             if depth >= max_depth:
@@ -565,18 +566,18 @@ class InMemoryGraph:
                     # the walk can REACH either. Returning it later while letting it route the
                     # traversal now would leak the same unverified claim one hop further away.
                     continue
-                if edge.source.lower() == label:
+                if fold_label(edge.source) == label:
                     nxt = edge.target
-                elif edge.target.lower() == label:
+                elif fold_label(edge.target) == label:
                     nxt = edge.source
                 else:
                     continue
                 if id(edge) not in seen_edges:
                     seen_edges.add(id(edge))
                     result.append(_detached(edge))
-                if nxt.lower() not in visited:
-                    visited.add(nxt.lower())
-                    frontier.append((nxt.lower(), depth + 1))
+                if fold_label(nxt) not in visited:
+                    visited.add(fold_label(nxt))
+                    frontier.append((fold_label(nxt), depth + 1))
         return result
 
     async def neighbors(self, scope: str, label: str, *, audience: str) -> list[GraphNode]:
@@ -589,21 +590,21 @@ class InMemoryGraph:
                 # feature holds back — and `NodeContext` hands edges and neighbors to the same
                 # caller, so filtering one and not the other leaks it through the other field.
                 continue
-            if edge.source.lower() == label.lower():
-                labels.add(edge.target.lower())
-            elif edge.target.lower() == label.lower():
-                labels.add(edge.source.lower())
+            if fold_label(edge.source) == fold_label(label):
+                labels.add(fold_label(edge.target))
+            elif fold_label(edge.target) == fold_label(label):
+                labels.add(fold_label(edge.source))
         return [n for (s, lbl), n in self._nodes.items() if s == scope and lbl in labels]
 
     async def get_node_context(self, scope: str, label: str, *,
                                audience: str) -> Optional[NodeContext]:
         _require_scope(scope)
-        node = self._nodes.get((scope, label.lower()))
-        if node is None or label.lower() not in self._visible_labels(scope, audience):
+        node = self._nodes.get((scope, fold_label(label)))
+        if node is None or fold_label(label) not in self._visible_labels(scope, audience):
             return None
         edges = [_detached(e) for e in self._readable(scope, audience)
                  if e.status == EDGE_ACCEPTED
-                 and label.lower() in (e.source.lower(), e.target.lower())]
+                 and fold_label(label) in (fold_label(e.source), fold_label(e.target))]
         return NodeContext(node=node, edges=edges,
                            neighbors=await self.neighbors(scope, label, audience=audience))
 
@@ -648,19 +649,19 @@ class InMemoryGraph:
     async def has_edges(self, scope: str, label: str) -> bool:
         """Every edge, any audience, any status — see the port for why it takes no audience."""
         _require_scope(scope)
-        want = label.lower()
-        return any(e.scope == scope and want in (e.source.lower(), e.target.lower())
+        want = fold_label(label)
+        return any(e.scope == scope and want in (fold_label(e.source), fold_label(e.target))
                    for e in self._edges)
 
     async def delete_node(self, scope: str, label: str) -> bool:
         _require_scope(scope)
-        key = (scope, label.lower())
+        key = (scope, fold_label(label))
         if key not in self._nodes:
             return False
         del self._nodes[key]
         # cascade: drop edges touching the node
         self._edges = [e for e in self._edges
-                       if not (e.scope == scope and label.lower() in (e.source.lower(), e.target.lower()))]
+                       if not (e.scope == scope and fold_label(label) in (fold_label(e.source), fold_label(e.target)))]
         return True
 
     async def delete_edges_by_session(self, scope: str, session_id: str) -> int:

@@ -31,6 +31,7 @@ from uuid import uuid4
 import psycopg
 from psycopg.rows import dict_row
 
+from cogno_engram.folding import FOLD_FUNCTION_SQL, fold_label
 from cogno_engram.types import (
     AUDIENCE_STAFF,
     AUDIENCE_TENANT,
@@ -125,6 +126,10 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
     """
     ts_config = _validate_ts_config(ts_config)  # interpolated into the tsvector DDL
     await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+    # `unaccent` + o wrapper IMMUTABLE por baixo da identidade de nó: `José` e `Jose` são a mesma
+    # pessoa (decisão de produto). Tem de vir ANTES dos índices — a UNIQUE de nós usa a função.
+    await conn.execute("CREATE EXTENSION IF NOT EXISTS unaccent")
+    await conn.execute(FOLD_FUNCTION_SQL)
 
     # sessions / knowledge_* stay unpartitioned (low volume); turns/memories opt in.
     pk = "PRIMARY KEY (id, scope)" if partition_by_scope else "PRIMARY KEY (id)"
@@ -265,9 +270,24 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
 
     # ── indexes (see engram-blueprint indexing strategy) ──
     stmts = [
-        # Case-insensitive node identity (matches the in-memory adapter's dedup).
-        "CREATE UNIQUE INDEX IF NOT EXISTS uq_nodes_scope_label_type "
-        "ON knowledge_nodes (scope, lower(label), node_type)",
+        # Identidade de nó insensível a caixa E a acento — `engram_fold`, a mesma função que o
+        # adaptador in-memory corre em Python (`folding.fold_label`). Era `lower(label)`, que sob
+        # um cluster `LC_COLLATE 'C'` nem sequer dobra maiúsculas acentuadas: `lower('JOSÉ')` dá
+        # `'josÉ'` e o nó gravado como `josé` ficava inalcançável.
+        #
+        # NOME NOVO de propósito: `CREATE INDEX IF NOT EXISTS` com o nome antigo e definição nova
+        # é um no-op SILENCIOSO — a armadilha que o `idx_turns_scope_pattern` já documentou. E o
+        # CREATE vem antes do DROP: se o processo morrer entre os dois, fica-se com os dois
+        # índices (a identidade mais apertada já em vigor) e não sem nenhum.
+        #
+        # ATENÇÃO À MIGRAÇÃO: numa base que já tenha `José` e `Jose` como nós SEPARADOS, este
+        # CREATE FALHA com duplicate key — e é o comportamento correcto. Fundir nós de um grafo de
+        # conhecimento automaticamente perderia arestas de um deles sem ninguém ver; a colisão tem
+        # de ser resolvida por quem sabe qual dos dois é a pessoa. `python -m cogno_host.migrate`
+        # levanta com os rótulos em conflito nomeados.
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_nodes_scope_fold_type "
+        "ON knowledge_nodes (scope, engram_fold(label), node_type)",
+        "DROP INDEX IF EXISTS uq_nodes_scope_label_type",
         # The curation queue reads one status within one scope; the prompt walk reads the other.
         "CREATE INDEX IF NOT EXISTS idx_edges_scope_status ON knowledge_edges (scope, status)",
         "CREATE INDEX IF NOT EXISTS idx_sessions_scope_time ON sessions (scope, started_at DESC)",
@@ -361,7 +381,48 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
         "CREATE INDEX IF NOT EXISTS idx_edges_target ON knowledge_edges (target_id)",
     ]
     for stmt in stmts:
-        await conn.execute(stmt)
+        try:
+            await conn.execute(stmt)
+        except Exception as erro:                    # noqa: BLE001 — re-levantado, nunca engolido
+            if "uq_nodes_scope_fold_type" not in stmt:
+                raise
+            raise _colisao_de_rotulos(await _rotulos_em_conflito(conn), erro) from erro
+
+
+async def _rotulos_em_conflito(conn) -> "list[str]":
+    """Os grupos de rótulos que a identidade nova funde — vazio se a leitura falhar.
+
+    O erro do Postgres nomeia a CHAVE dobrada (`Key (scope, engram_fold(label), node_type)=(t,
+    jose, PERSON) is duplicated`), que é precisamente o que o operador não precisa: ele quer saber
+    QUE nós tem de fundir. Um diagnóstico não pode ser o motivo de a migração falhar de outra
+    maneira, portanto qualquer erro AQUI degrada para lista vazia — o erro original propaga na
+    mesma."""
+    try:
+        cur = await conn.execute(
+            "SELECT scope, node_type, string_agg(label, %s ORDER BY label) "
+            "FROM knowledge_nodes GROUP BY scope, node_type, engram_fold(label) "
+            "HAVING count(*) > 1 LIMIT 20", (" + ",))
+        return [f"{r[0]} / {r[1]}: {r[2]}" for r in await cur.fetchall()]
+    except Exception:                                # noqa: BLE001
+        return []
+
+
+def _colisao_de_rotulos(grupos: "list[str]", erro: Exception) -> RuntimeError:
+    """A identidade de nó passou a ignorar acentos e esta base tem nós que agora colidem.
+
+    Falhar é o comportamento CORRECTO, e a alternativa foi considerada e recusada: fundir os nós
+    automaticamente escolheria um dos rótulos e mudaria as arestas do outro de dono, em silêncio,
+    num grafo cujo propósito é dizer factos sobre pessoas. Qual dos dois `José` é a pessoa é
+    conhecimento que esta função não tem."""
+    if not grupos:
+        return RuntimeError(
+            "a identidade de nó passa a ignorar acentos (`José` == `Jose`) e esta base tem nós "
+            f"que agora colidem. Não consegui listá-los; o erro original foi: {erro}")
+    return RuntimeError(
+        "a identidade de nó passa a ignorar acentos (`José` == `Jose`) e esta base tem nós que "
+        "agora colidem. Funda-os À MÃO antes de migrar — automaticamente não, porque escolher um "
+        "dos rótulos muda as arestas do outro de dono em silêncio:\n  "
+        + "\n  ".join(grupos))
 
 
 class _PgBase:
@@ -873,7 +934,7 @@ class PostgresKnowledgeGraph(_PgBase):
             cur = await conn.execute(
                 """INSERT INTO knowledge_nodes (scope, label, node_type, attributes, embedding)
                    VALUES (%s, %s, %s, %s::jsonb, %s::vector)
-                   ON CONFLICT (scope, lower(label), node_type) DO UPDATE SET
+                   ON CONFLICT (scope, engram_fold(label), node_type) DO UPDATE SET
                        attributes = knowledge_nodes.attributes || EXCLUDED.attributes,
                        embedding  = COALESCE(EXCLUDED.embedding, knowledge_nodes.embedding),
                        updated_at = now()
@@ -885,24 +946,24 @@ class PostgresKnowledgeGraph(_PgBase):
 
     async def _resolve_node_id(self, conn, scope: str, label: str) -> int:
         cur = await conn.execute(
-            "SELECT id FROM knowledge_nodes WHERE scope = %s AND lower(label) = lower(%s) LIMIT 1",
+            "SELECT id FROM knowledge_nodes WHERE scope = %s AND engram_fold(label) = engram_fold(%s) LIMIT 1",
             (scope, label))
         row = await cur.fetchone()
         if row:
             return row["id"]
         # Idempotent insert: two concurrent upsert_edge calls referencing a not-yet-existing
-        # label both miss the SELECT above; a bare INSERT then races the uq(scope, lower(label),
+        # label both miss the SELECT above; a bare INSERT then races the uq(scope, engram_fold(label),
         # node_type) index and the loser raises IntegrityError, failing that turn. ON CONFLICT
         # DO NOTHING makes the loser return no row → re-SELECT the winner's id.
         cur = await conn.execute(
             "INSERT INTO knowledge_nodes (scope, label) VALUES (%s, %s) "
-            "ON CONFLICT (scope, lower(label), node_type) DO NOTHING RETURNING id",
+            "ON CONFLICT (scope, engram_fold(label), node_type) DO NOTHING RETURNING id",
             (scope, label))
         row = await cur.fetchone()
         if row:
             return row["id"]
         cur = await conn.execute(
-            "SELECT id FROM knowledge_nodes WHERE scope = %s AND lower(label) = lower(%s) LIMIT 1",
+            "SELECT id FROM knowledge_nodes WHERE scope = %s AND engram_fold(label) = engram_fold(%s) LIMIT 1",
             (scope, label))
         row = await cur.fetchone()
         return row["id"]
@@ -953,7 +1014,7 @@ class PostgresKnowledgeGraph(_PgBase):
             cur = await conn.execute(
                 "SELECT n.id, n.scope, n.label, n.node_type, n.attributes, n.created_at, "
                 "n.updated_at FROM knowledge_nodes n "
-                "WHERE n.scope = %s AND lower(n.label) = lower(%s) "
+                "WHERE n.scope = %s AND engram_fold(n.label) = engram_fold(%s) "
                 f"AND {_NODE_VISIBLE} LIMIT 1",
                 (scope, label, audience, audience, audience))
             row = await cur.fetchone()
@@ -989,7 +1050,7 @@ class PostgresKnowledgeGraph(_PgBase):
                     SELECT n.id AS node_id, 0 AS depth, NULL::bigint AS edge_id,
                            ARRAY[n.id] AS path
                     FROM knowledge_nodes n
-                    WHERE n.scope = %s AND lower(n.label) = lower(%s)
+                    WHERE n.scope = %s AND engram_fold(n.label) = engram_fold(%s)
                     UNION ALL
                     -- carry the visited-node path so a cyclic subgraph expands each node ONCE
                     -- (mirrors the in-memory walk's ``visited`` set); without this a cycle
@@ -1055,8 +1116,8 @@ class PostgresKnowledgeGraph(_PgBase):
                 """UPDATE knowledge_edges e SET status = %s
                    FROM knowledge_nodes sn, knowledge_nodes tn
                    WHERE e.source_id = sn.id AND e.target_id = tn.id
-                     AND e.scope = %s AND lower(sn.label) = lower(%s)
-                     AND lower(tn.label) = lower(%s) AND e.relation = %s""",
+                     AND e.scope = %s AND engram_fold(sn.label) = engram_fold(%s)
+                     AND engram_fold(tn.label) = engram_fold(%s) AND e.relation = %s""",
                 (require_edge_status(status), scope, source, target, relation))
         return bool(cur.rowcount)
 
@@ -1069,8 +1130,8 @@ class PostgresKnowledgeGraph(_PgBase):
                 """UPDATE knowledge_edges e SET audience = %s
                    FROM knowledge_nodes sn, knowledge_nodes tn
                    WHERE e.source_id = sn.id AND e.target_id = tn.id
-                     AND e.scope = %s AND lower(sn.label) = lower(%s)
-                     AND lower(tn.label) = lower(%s) AND e.relation = %s""",
+                     AND e.scope = %s AND engram_fold(sn.label) = engram_fold(%s)
+                     AND engram_fold(tn.label) = engram_fold(%s) AND e.relation = %s""",
                 (sanitize_audience(audience), scope, source, target, relation))
         return bool(cur.rowcount)
 
@@ -1083,7 +1144,7 @@ class PostgresKnowledgeGraph(_PgBase):
                    JOIN knowledge_edges e ON (e.source_id = n.id OR e.target_id = n.id)
                    JOIN knowledge_nodes nn
                      ON nn.id = CASE WHEN e.source_id = n.id THEN e.target_id ELSE e.source_id END
-                   WHERE n.scope = %s AND lower(n.label) = lower(%s)
+                   WHERE n.scope = %s AND engram_fold(n.label) = engram_fold(%s)
                      -- an unreviewed edge still DISCLOSES its endpoint; see the in-memory twin
                      AND e.status = 'accepted'
                      AND {_EDGE_VISIBLE}""", (scope, label, audience, audience, audience))
@@ -1099,7 +1160,7 @@ class PostgresKnowledgeGraph(_PgBase):
             return None
         edges = await self.walk(scope, label, audience=audience, max_depth=1)
         edges = [e for e in edges
-                 if label.lower() in (e.source.lower(), e.target.lower())]
+                 if fold_label(label) in (fold_label(e.source), fold_label(e.target))]
         return NodeContext(node=node, edges=edges,
                            neighbors=await self.neighbors(scope, label, audience=audience))
 
@@ -1130,8 +1191,8 @@ class PostgresKnowledgeGraph(_PgBase):
                           label: Optional[str] = None) -> int:
         """How many nodes this scope holds, or how many carry ``label``.
 
-        `lower(label)` on both sides, matching `find_node` and the `walk` seed — the unique index
-        `uq_nodes_scope_label_type` is on `(scope, lower(label), node_type)`, so this is the
+        `engram_fold(label)` on both sides, matching `find_node` and the `walk` seed — the unique
+        index `uq_nodes_scope_fold_type` is on `(scope, engram_fold(label), node_type)`, so this is the
         expression the planner already has an index for.
         """
         _require_scope(scope)
@@ -1141,7 +1202,7 @@ class PostgresKnowledgeGraph(_PgBase):
         # short-circuit, then the identity match) and sits immediately after `scope`.
         params: list = [scope, audience, audience, audience]
         if label is not None:
-            sql += " AND lower(n.label) = lower(%s)"
+            sql += " AND engram_fold(n.label) = engram_fold(%s)"
             params.append(label.strip())
         async with self._conn() as conn:
             cur = await conn.execute(sql, params)
@@ -1178,7 +1239,7 @@ class PostgresKnowledgeGraph(_PgBase):
             cur = await conn.execute(
                 """SELECT 1 FROM knowledge_edges e
                    JOIN knowledge_nodes n ON n.id IN (e.source_id, e.target_id)
-                   WHERE e.scope = %s AND lower(n.label) = lower(%s) LIMIT 1""",
+                   WHERE e.scope = %s AND engram_fold(n.label) = engram_fold(%s) LIMIT 1""",
                 (scope, label))
             return await cur.fetchone() is not None
 
@@ -1186,7 +1247,7 @@ class PostgresKnowledgeGraph(_PgBase):
         _require_scope(scope)
         async with self._conn() as conn:
             cur = await conn.execute(
-                "DELETE FROM knowledge_nodes WHERE scope = %s AND lower(label) = lower(%s)", (scope, label))
+                "DELETE FROM knowledge_nodes WHERE scope = %s AND engram_fold(label) = engram_fold(%s)", (scope, label))
             return cur.rowcount > 0   # edges cascade via FK ON DELETE CASCADE
 
     async def delete_edges_by_session(self, scope: str, session_id: str) -> int:

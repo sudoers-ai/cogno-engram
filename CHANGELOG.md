@@ -122,6 +122,36 @@ stops satisfying it under mypy/`isinstance` until it implements both.
 
 ### Fixed
 
+- **`José` e `Jose` passam a ser a mesma pessoa — e `find_node` deixa de perder o nó sob collation
+  `C`.** Decisão de produto do dono: num CRM que recebe WhatsApp, o contacto escreve o nome sem
+  acento metade das vezes, e um grafo que trate os dois como nós distintos parte a vida da pessoa
+  em duas.
+
+  O defeito por baixo era outro e mais estreito: a identidade de nó era `lower(label)` no Postgres
+  e `label.lower()` no Python, e **as duas discordavam**. Num cluster `LC_COLLATE 'C'` o `lower()`
+  do Postgres nem sequer dobra maiúsculas acentuadas — `lower('JOSÉ')` dá `'josÉ'` — logo
+  `find_node(scope, "JOSÉ")` devolvia `None` para um nó gravado como `josé`, enquanto o adaptador
+  in-memory acertava. Medido: 7 de 14 rótulos falhavam sob `C`, 0 sob `en_US.utf8`.
+
+  Agora há **uma** definição, `cogno_engram/folding.py::fold_label`, e as duas metades correm-na:
+  o Python directamente, o Postgres pela função `engram_fold` que o `ensure_schema` cria. Três
+  camadas, todas necessárias e todas medidas: `casefold()` (trata `ß`→`ss`, que `lower` não),
+  NFD + remoção de marcas combinantes (tira o acento), e uma tabela de transliteração de 15
+  entradas **derivada do `unaccent` do Postgres** (`æ`→`ae`, `ø`→`o`, `ł`→`l` — caracteres sem
+  decomposição combinante, que o passo 2 deixaria intactos).
+
+  `tests/test_folding_parity.py` re-deriva a tabela contra um Postgres a sério e falha se deixar
+  de bater: uma cópia de um dicionário que vive noutro processo apodrece em silêncio, e apodrecer
+  aqui significa os dois adaptadores darem respostas diferentes à mesma pergunta. O alfabeto
+  coberto está DECLARADO — Latin-1 Supplement + Latin Extended-A, onde vivem os nomes
+  pt/es/en/de/fr/it. Fora dele os dois lados podem divergir (medido: sigma final grego).
+
+  **A migração pode FALHAR, e isso é o comportamento certo.** Numa base que já tenha `José` e
+  `Jose` como nós separados, o índice novo recusa-se a nascer — e o `ensure_schema` levanta com os
+  rótulos em conflito NOMEADOS, em vez da chave dobrada que o Postgres reporta. Fundir
+  automaticamente escolheria um dos rótulos e mudaria as arestas do outro de dono, em silêncio,
+  num grafo cujo propósito é dizer factos sobre pessoas.
+
 - **O teste de plano do índice da subárvore ficava VERMELHO em código correcto.** Ele afirmava o
   NOME do índice; num cluster com collation `C` (`initdb --locale=C`, `postgres:alpine`, qualquer
   base criada `LC_COLLATE 'C'`) a UNIQUE pré-existente já serve ambos os ramos do OR, não há Seq

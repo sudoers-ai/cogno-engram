@@ -32,7 +32,7 @@ async def _pg_graph():
     return PostgresKnowledgeGraph(dsn=DSN)
 
 
-async def _adaptadores():
+async def _both_adapters():
     """Os DOIS, para o mesmo teste — é a discordância entre eles que estas regressões produzem."""
     return [("in-memory", InMemoryGraph()), ("postgres", await _pg_graph())]
 
@@ -48,17 +48,17 @@ async def test_the_ACCENTED_spelling_wins_and_never_loses_it_again():
 
     Sobe e não desce: uma vez acentuado, um `Jose` posterior não o rebaixa. Determinístico, senão
     o nome no painel oscilava a cada turno."""
-    for nome, kg in await _adaptadores():
-        escopo = f"acc/{os.urandom(4).hex()}"
-        await kg.upsert_node(GraphNode(escopo, "Jose", "PERSON"))       # sem acento primeiro
-        await kg.upsert_node(GraphNode(escopo, "José", "PERSON"))       # com acento depois
-        achado = await kg.find_node(escopo, "jose", audience=AUDIENCE_STAFF)
-        assert achado is not None and achado.label == "José", (
-            f"[{nome}] a grafia acentuada não subiu: ficou {achado.label if achado else None!r}")
+    for which, kg in await _both_adapters():
+        scope_ = f"acc/{os.urandom(4).hex()}"
+        await kg.upsert_node(GraphNode(scope_, "Jose", "PERSON"))       # sem acento primeiro
+        await kg.upsert_node(GraphNode(scope_, "José", "PERSON"))       # com acento depois
+        found = await kg.find_node(scope_, "jose", audience=AUDIENCE_STAFF)
+        assert found is not None and found.label == "José", (
+            f"[{which}] a grafia acentuada não subiu: ficou {found.label if found else None!r}")
 
-        await kg.upsert_node(GraphNode(escopo, "JOSE", "PERSON"))       # e não volta a descer
-        achado = await kg.find_node(escopo, "jose", audience=AUDIENCE_STAFF)
-        assert achado.label == "José", f"[{nome}] o acento foi perdido por um upsert posterior"
+        await kg.upsert_node(GraphNode(scope_, "JOSE", "PERSON"))       # e não volta a descer
+        found = await kg.find_node(scope_, "jose", audience=AUDIENCE_STAFF)
+        assert found.label == "José", f"[{which}] o acento foi perdido por um upsert posterior"
 
 
 @pytest.mark.asyncio
@@ -70,16 +70,16 @@ async def test_deleting_one_node_does_not_delete_its_fold_TWIN():
     atrás por `ON DELETE CASCADE`. O `cogno-ui` chama isto com um id que o host converte em
     rótulo, portanto o operador clicava num nó e perdia outro, sem aviso."""
     kg = await _pg_graph()
-    escopo = f"del/{os.urandom(4).hex()}"
-    await kg.upsert_node(GraphNode(escopo, "José", "PERSON"))
-    await kg.upsert_node(GraphNode(escopo, "Jose", "CONCEPT"))
+    scope_ = f"del/{os.urandom(4).hex()}"
+    await kg.upsert_node(GraphNode(scope_, "José", "PERSON"))
+    await kg.upsert_node(GraphNode(scope_, "Jose", "CONCEPT"))
 
-    apagou = await kg.delete_node(escopo, "José")
-    sobrou = await kg.list_nodes(escopo, audience=AUDIENCE_STAFF)
+    deleted = await kg.delete_node(scope_, "José")
+    left = await kg.list_nodes(scope_, audience=AUDIENCE_STAFF)
 
-    assert apagou is True, "o rótulo EXACTO existe, portanto tinha de apagar esse"
-    assert [n.node_type for n in sobrou] == ["CONCEPT"], (
-        f"apagar o PERSON levou o CONCEPT atrás: sobrou {[(n.label, n.node_type) for n in sobrou]}")
+    assert deleted is True, "o rótulo EXACTO existe, portanto tinha de apagar esse"
+    assert [n.node_type for n in left] == ["CONCEPT"], (
+        f"apagar o PERSON levou o CONCEPT atrás: sobrou {[(n.label, n.node_type) for n in left]}")
 
 
 @pytest.mark.asyncio
@@ -87,15 +87,15 @@ async def test_an_AMBIGUOUS_delete_refuses_instead_of_guessing():
     """Sem rótulo exacto e com vários candidatos, recusa. Escolher por quem chamou é escolher
     errado metade das vezes, em silêncio — e isto apaga arestas em cascata."""
     kg = await _pg_graph()
-    escopo = f"amb/{os.urandom(4).hex()}"
-    await kg.upsert_node(GraphNode(escopo, "José", "PERSON"))
-    await kg.upsert_node(GraphNode(escopo, "José", "CONCEPT"))
+    scope_ = f"amb/{os.urandom(4).hex()}"
+    await kg.upsert_node(GraphNode(scope_, "José", "PERSON"))
+    await kg.upsert_node(GraphNode(scope_, "José", "CONCEPT"))
 
-    apagou = await kg.delete_node(escopo, "Jose")        # não bate exacto com nenhum
-    sobrou = await kg.list_nodes(escopo, audience=AUDIENCE_STAFF)
+    deleted = await kg.delete_node(scope_, "Jose")        # não bate exacto com nenhum
+    left = await kg.list_nodes(scope_, audience=AUDIENCE_STAFF)
 
-    assert apagou is False, "devia ter recusado em vez de escolher"
-    assert len(sobrou) == 2, f"recusou e apagou na mesma: {sobrou}"
+    assert deleted is False, "devia ter recusado em vez de escolher"
+    assert len(left) == 2, f"recusou e apagou na mesma: {left}"
 
 
 @pytest.mark.asyncio
@@ -105,22 +105,22 @@ async def test_set_edge_audience_does_not_reclassify_a_twins_edge():
     from cogno_engram.types import GraphEdge
 
     kg = await _pg_graph()
-    escopo = f"aud/{os.urandom(4).hex()}"
-    await kg.upsert_node(GraphNode(escopo, "José", "PERSON"))
-    await kg.upsert_node(GraphNode(escopo, "Jose", "CONCEPT"))
-    await kg.upsert_node(GraphNode(escopo, "Rex", "PET"))
-    await kg.upsert_edge(GraphEdge(escopo, "José", "Rex", "OWNS", audience="tenant"))
-    await kg.upsert_edge(GraphEdge(escopo, "Jose", "Rex", "OWNS", audience="tenant"))
+    scope_ = f"aud/{os.urandom(4).hex()}"
+    await kg.upsert_node(GraphNode(scope_, "José", "PERSON"))
+    await kg.upsert_node(GraphNode(scope_, "Jose", "CONCEPT"))
+    await kg.upsert_node(GraphNode(scope_, "Rex", "PET"))
+    await kg.upsert_edge(GraphEdge(scope_, "José", "Rex", "OWNS", audience="tenant"))
+    await kg.upsert_edge(GraphEdge(scope_, "Jose", "Rex", "OWNS", audience="tenant"))
 
-    await kg.set_edge_audience(escopo, "José", "Rex", "OWNS", "identity:x")
+    await kg.set_edge_audience(scope_, "José", "Rex", "OWNS", "identity:x")
 
     conn = await psycopg.AsyncConnection.connect(DSN, autocommit=True)
     cur = await conn.execute(
         "SELECT sn.node_type, e.audience FROM knowledge_edges e "
-        "  JOIN knowledge_nodes sn ON sn.id = e.source_id WHERE e.scope = %s", (escopo,))
-    por_tipo = {r[0]: r[1] for r in await cur.fetchall()}
+        "  JOIN knowledge_nodes sn ON sn.id = e.source_id WHERE e.scope = %s", (scope_,))
+    by_kind = {r[0]: r[1] for r in await cur.fetchall()}
     await conn.close()
 
-    assert por_tipo.get("PERSON") == "identity:x", "a aresta escolhida não mudou"
-    assert por_tipo.get("CONCEPT") == "tenant", (
-        f"a aresta do GÉMEO mudou de audiência sem ninguém a escolher: {por_tipo}")
+    assert by_kind.get("PERSON") == "identity:x", "a aresta escolhida não mudou"
+    assert by_kind.get("CONCEPT") == "tenant", (
+        f"a aresta do GÉMEO mudou de audiência sem ninguém a escolher: {by_kind}")

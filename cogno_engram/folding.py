@@ -71,9 +71,9 @@ def fold_label(label: str) -> str:
     ORIGINAL que continua a ser guardado e mostrado. Confundir os dois far-se-ia perder o acento
     no nome de uma pessoa, que é precisamente o oposto do que esta função existe para conseguir.
     """
-    dobrado = unicodedata.normalize("NFD", label.casefold())
-    sem_marcas = "".join(c for c in dobrado if not unicodedata.combining(c))
-    return "".join(_TRANSLIT.get(c, c) for c in sem_marcas)
+    folded = unicodedata.normalize("NFD", label.casefold())
+    stripped = "".join(c for c in folded if not unicodedata.combining(c))
+    return "".join(_TRANSLIT.get(c, c) for c in stripped)
 
 
 def has_diacritics(label: str) -> bool:

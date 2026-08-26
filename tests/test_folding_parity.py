@@ -28,10 +28,10 @@ DSN = os.environ.get("ENGRAM_TEST_DSN", "")
 #: grego dá `σ` no Python e `ς` no Postgres) — fazer os dois concordarem em todo o Unicode exigiria
 #: portar o dicionário inteiro do `unaccent`, e um domínio maior do que o produto tem não paga a
 #: cópia. Um tecto declarado não é o mesmo que um tecto esquecido.
-def _alfabeto_coberto() -> "list[str]":
-    letras = [chr(c) for c in range(0xC0, 0x180)
+def _covered_alphabet() -> "list[str]":
+    letters = [chr(c) for c in range(0xC0, 0x180)
               if unicodedata.category(chr(c)).startswith("L")]
-    return list(dict.fromkeys(letras + list("ßœŒæÆøØðÐþÞıİ")))
+    return list(dict.fromkeys(letters + list("ßœŒæÆøØðÐþÞıİ")))
 
 
 async def _pg():
@@ -49,18 +49,18 @@ async def test_python_and_postgres_fold_the_SAME_over_the_covered_alphabet():
     Se um dia falhar, NÃO se ajusta o teste — ou o `unaccent` mudou de dicionário (e a
     `_TRANSLIT` tem de ser re-derivada), ou alguém tocou numa das metades sozinho."""
     conn = await _pg()
-    alfabeto = _alfabeto_coberto()
+    alphabet = _covered_alphabet()
     cur = await conn.execute(
-        "SELECT v, engram_fold(v) FROM unnest(%s::text[]) v", (alfabeto,))
-    do_banco = {linha[0]: linha[1] for linha in await cur.fetchall()}
+        "SELECT v, engram_fold(v) FROM unnest(%s::text[]) v", (alphabet,))
+    from_db = {row[0]: row[1] for row in await cur.fetchall()}
     await conn.close()
 
-    divergem = {c: (fold_label(c), do_banco[c])
-                for c in alfabeto if fold_label(c) != do_banco[c]}
-    assert not divergem, (
-        f"os dois adaptadores dobram diferente em {len(divergem)} de {len(alfabeto)} "
+    diverge = {c: (fold_label(c), from_db[c])
+                for c in alphabet if fold_label(c) != from_db[c]}
+    assert not diverge, (
+        f"os dois adaptadores dobram diferente em {len(diverge)} de {len(alphabet)} "
         f"caracteres — o mesmo rótulo encontraria nós diferentes conforme o adaptador: "
-        f"{ {c: f'py={p!r} pg={g!r}' for c, (p, g) in list(divergem.items())[:8]} }")
+        f"{ {c: f'py={p!r} pg={g!r}' for c, (p, g) in list(diverge.items())[:8]} }")
 
 
 @pytest.mark.asyncio
@@ -73,24 +73,24 @@ async def test_the_TRANSLIT_table_still_matches_the_postgres_dictionary():
     from cogno_engram.folding import _TRANSLIT
 
     conn = await _pg()
-    chaves = sorted(_TRANSLIT)
+    keys = sorted(_TRANSLIT)
     cur = await conn.execute(
-        "SELECT v, engram_fold(v) FROM unnest(%s::text[]) v", (chaves,))
-    do_banco = {linha[0]: linha[1] for linha in await cur.fetchall()}
+        "SELECT v, engram_fold(v) FROM unnest(%s::text[]) v", (keys,))
+    from_db = {row[0]: row[1] for row in await cur.fetchall()}
     await conn.close()
 
-    erradas = {c: (_TRANSLIT[c], do_banco[c]) for c in chaves if _TRANSLIT[c] != do_banco[c]}
-    assert not erradas, f"entradas que já não batem com o `unaccent`: {erradas}"
+    wrong = {c: (_TRANSLIT[c], from_db[c]) for c in keys if _TRANSLIT[c] != from_db[c]}
+    assert not wrong, f"entradas que já não batem com o `unaccent`: {wrong}"
 
     # e nenhuma entrada supérflua: se o NFD sozinho já lá chegava, a linha é ruído que esconde
     # uma mudança futura do dicionário
-    def so_nfd(s: str) -> str:
+    def _nfd_only(s: str) -> str:
         return "".join(c for c in unicodedata.normalize("NFD", s.casefold())
                        if not unicodedata.combining(c))
 
-    supérfluas = [c for c in chaves if so_nfd(c) == do_banco[c]]
-    assert not supérfluas, (
-        f"entradas que o NFD já resolvia sozinho — ruído na tabela: {supérfluas}")
+    superfluous = [c for c in keys if _nfd_only(c) == from_db[c]]
+    assert not superfluous, (
+        f"entradas que o NFD já resolvia sozinho — ruído na tabela: {superfluous}")
 
 
 @pytest.mark.asyncio
@@ -111,21 +111,21 @@ async def test_a_base_with_COLLIDING_nodes_fails_the_migration_by_NAME():
 
     # o estado de uma base ANTIGA: dois nós que a identidade nova funde. Entram por SQL directo
     # porque o adaptador — já com a identidade nova — recusaria o segundo, que é o ponto.
-    escopo = f"t/{os.urandom(4).hex()}"
+    scope_ = f"t/{os.urandom(4).hex()}"
     await conn.execute("DROP INDEX IF EXISTS uq_nodes_scope_fold_type")
     await conn.execute(
         "INSERT INTO knowledge_nodes (scope, label, node_type) VALUES (%s,%s,%s), (%s,%s,%s)",
-        (escopo, "José", "PERSON", escopo, "Jose", "PERSON"))
+        (scope_, "José", "PERSON", scope_, "Jose", "PERSON"))
 
-    with pytest.raises(RuntimeError) as caiu:
+    with pytest.raises(RuntimeError) as raised:
         await ensure_schema(conn, embedding_dim=8)
-    await conn.execute("DELETE FROM knowledge_nodes WHERE scope = %s", (escopo,))
+    await conn.execute("DELETE FROM knowledge_nodes WHERE scope = %s", (scope_,))
     await conn.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS uq_nodes_scope_fold_type "
         "ON knowledge_nodes (scope, engram_fold(label), node_type)")
     await conn.close()
 
-    msg = str(caiu.value)
+    msg = str(raised.value)
     assert "José" in msg and "Jose" in msg, (
         f"o erro não nomeou os rótulos em conflito — o operador fica com a chave dobrada e "
         f"sem saber que nós fundir:\n{msg}")
@@ -182,7 +182,7 @@ async def test_the_two_sides_agree_on_whole_LABELS_not_just_characters():
     duas grafias em que a base viva o tem, e as formas Unicode compostas E decompostas do mesmo
     nome — que é o caso que um teste por caractere nunca constrói."""
     conn = await _pg()
-    rotulos = [
+    labels = [
         "José", "Jose", "JOSÉ", "josé",
         "Vinicius Vale", "Vinícius Vale",          # o par que existe na base viva
         "Hernani", "Hernaní",
@@ -194,22 +194,22 @@ async def test_the_two_sides_agree_on_whole_LABELS_not_just_characters():
         "  José  ", "JOSÉ MARIA da SILVA",
     ]
     cur = await conn.execute(
-        "SELECT v, engram_fold(v) FROM unnest(%s::text[]) v", (rotulos,))
-    do_banco = {linha[0]: linha[1] for linha in await cur.fetchall()}
+        "SELECT v, engram_fold(v) FROM unnest(%s::text[]) v", (labels,))
+    from_db = {row[0]: row[1] for row in await cur.fetchall()}
     await conn.close()
 
-    divergem = {r: (fold_label(r), do_banco[r]) for r in rotulos if fold_label(r) != do_banco[r]}
-    assert not divergem, (
+    diverge = {r: (fold_label(r), from_db[r]) for r in labels if fold_label(r) != from_db[r]}
+    assert not diverge, (
         f"os dois adaptadores dobram RÓTULOS diferente — o mesmo nome encontraria nós diferentes "
-        f"conforme o adaptador: { {r: f'py={p!r} pg={g!r}' for r, (p, g) in divergem.items()} }")
+        f"conforme o adaptador: { {r: f'py={p!r} pg={g!r}' for r, (p, g) in diverge.items()} }")
 
     # e o que o produto PROMETE: as formas do mesmo nome caem todas na mesma chave
     for grupo in (["José", "Jose", "JOSÉ", "josé",
                    unicodedata.normalize("NFD", "José")],
                   ["Vinicius Vale", "Vinícius Vale"],
                   ["São Gonçalo do Amarante", "Sao Goncalo do Amarante"]):
-        chaves = {fold_label(r) for r in grupo}
-        assert len(chaves) == 1, f"{grupo} devia ser uma só pessoa/lugar, deu {chaves}"
+        keys = {fold_label(r) for r in grupo}
+        assert len(keys) == 1, f"{grupo} devia ser uma só pessoa/lugar, deu {keys}"
 
 
 @pytest.mark.asyncio
@@ -232,21 +232,21 @@ async def test_a_CHANGED_fold_rule_rebuilds_the_index_that_stores_it(monkeypatch
     from cogno_engram.adapters import postgres as pgmod
 
     conn = await _pg()
-    escopo = f"drift/{os.urandom(4).hex()}"
+    scope_ = f"drift/{os.urandom(4).hex()}"
     await conn.execute(
         "INSERT INTO knowledge_nodes (scope, label, node_type) VALUES (%s,%s,%s)",
-        (escopo, "Ørsted", "PERSON"))
+        (scope_, "Ørsted", "PERSON"))
 
-    async def _acha_pelo_indice(alvo: str) -> int:
+    async def _found_via_index(key: str) -> int:
         await conn.execute("SET enable_seqscan = off")
         cur = await conn.execute(
             "SELECT count(*) FROM knowledge_nodes "
-            " WHERE scope = %s AND engram_fold(label) = %s", (escopo, alvo))
+            " WHERE scope = %s AND engram_fold(label) = %s", (scope_, key))
         n = int((await cur.fetchone())[0])
         await conn.execute("SET enable_seqscan = on")
         return n
 
-    assert await _acha_pelo_indice("orsted") == 1, "o nó tinha de ser achável com a regra v1"
+    assert await _found_via_index("orsted") == 1, "o nó tinha de ser achável com a regra v1"
 
     # o deploy da v2: `Ø` passa a dobrar para `oe`, como faria uma entrada nova em `_TRANSLIT`
     v2 = ('CREATE OR REPLACE FUNCTION engram_fold(text) RETURNS text '
@@ -256,8 +256,8 @@ async def test_a_CHANGED_fold_rule_rebuilds_the_index_that_stores_it(monkeypatch
     monkeypatch.setattr(pgmod, "FOLD_FUNCTION_SQL", v2)
     await ensure_schema(conn, embedding_dim=8)
 
-    achou = await _acha_pelo_indice("oersted")
-    await conn.execute("DELETE FROM knowledge_nodes WHERE scope = %s", (escopo,))
+    achou = await _found_via_index("oersted")
+    await conn.execute("DELETE FROM knowledge_nodes WHERE scope = %s", (scope_,))
     await conn.execute("REINDEX INDEX uq_nodes_scope_fold_type")
     await conn.close()
 
@@ -284,12 +284,12 @@ async def test_a_CHANGED_fold_rule_rebuilds_the_index_that_stores_it(monkeypatch
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("erro,rotula_como_colisao", [
+@pytest.mark.parametrize("err,labelled_as_collision", [
     ("UniqueViolation", True),
     ("InsufficientPrivilege", False),
     ("LockNotAvailable", False),
 ])
-async def test_only_a_UNIQUE_violation_is_reported_as_a_label_collision(erro, rotula_como_colisao):
+async def test_only_a_UNIQUE_violation_is_reported_as_a_label_collision(err, labelled_as_collision):
     """O erro de colisão manda o operador FUNDIR NÓS — destrutivo. Rotular qualquer falha assim
     manda-o destruir dados para resolver outra coisa.
 
@@ -306,47 +306,47 @@ async def test_only_a_UNIQUE_violation_is_reported_as_a_label_collision(erro, ro
         pytest.skip("set ENGRAM_TEST_DSN to run")
     import contextlib
 
-    classe = getattr(psycopg.errors, erro)
+    cls = getattr(psycopg.errors, err)
 
-    class _Espiao:
+    class _Spy:
         """Delega tudo; levanta na declaração do índice do fold."""
 
         def __init__(self, conn):
             self._conn = conn
 
-        def __getattr__(self, nome):
-            return getattr(self._conn, nome)
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
 
         async def execute(self, sql, params=None, *a, **kw):
             if isinstance(sql, str) and "uq_nodes_scope_fold_type" in sql and "CREATE" in sql:
-                raise classe(f"injectado: {erro}")
+                raise cls(f"injectado: {err}")
             return await self._conn.execute(sql, params, *a, **kw)
 
     conn = await psycopg.AsyncConnection.connect(DSN, autocommit=True)
     await ensure_schema(conn, embedding_dim=8)
-    escopo = f"inj/{os.urandom(4).hex()}"
+    scope_ = f"inj/{os.urandom(4).hex()}"
     await conn.execute("DROP INDEX IF EXISTS uq_nodes_scope_fold_type")
     await conn.execute(
         "INSERT INTO knowledge_nodes (scope, label, node_type) VALUES (%s,%s,%s), (%s,%s,%s)",
-        (escopo, "José", "PERSON", escopo, "Jose", "PERSON"))
+        (scope_, "José", "PERSON", scope_, "Jose", "PERSON"))
 
-    with pytest.raises(Exception) as caiu:            # noqa: B017 — a MENSAGEM é o teste
-        await ensure_schema(_Espiao(conn), embedding_dim=8)
+    with pytest.raises(Exception) as raised:            # noqa: B017 — a MENSAGEM é o teste
+        await ensure_schema(_Spy(conn), embedding_dim=8)
 
-    await conn.execute("DELETE FROM knowledge_nodes WHERE scope = %s", (escopo,))
+    await conn.execute("DELETE FROM knowledge_nodes WHERE scope = %s", (scope_,))
     with contextlib.suppress(Exception):
         await ensure_schema(conn, embedding_dim=8)
     await conn.close()
 
-    msg = str(caiu.value)
-    if rotula_como_colisao:
+    msg = str(raised.value)
+    if labelled_as_collision:
         assert "ignorar acentos" in msg and "José" in msg, (
             f"uma violação de unicidade É colisão e tinha de nomear os rótulos:\n{msg}")
     else:
         assert "ignorar acentos" not in msg and "À MÃO" not in msg, (
-            f"{erro} não é colisão — o operador seria mandado FUNDIR NÓS, que é destrutivo, "
+            f"{err} não é colisão — o operador seria mandado FUNDIR NÓS, que é destrutivo, "
             f"para resolver outra coisa:\n{msg}")
-        assert erro.lower()[:8] in msg.lower() or "injectado" in msg, (
+        assert err.lower()[:8] in msg.lower() or "injectado" in msg, (
             f"o erro real tem de sobreviver, não ser substituído:\n{msg}")
 
 
@@ -368,25 +368,25 @@ async def test_the_diagnostic_names_the_labels_on_a_NON_autocommit_connection_to
 
     prep = await psycopg.AsyncConnection.connect(DSN, autocommit=True)
     await ensure_schema(prep, embedding_dim=8)
-    escopo = f"tx/{os.urandom(4).hex()}"
+    scope_ = f"tx/{os.urandom(4).hex()}"
     await prep.execute("DROP INDEX IF EXISTS uq_nodes_scope_fold_type")
     await prep.execute(
         "INSERT INTO knowledge_nodes (scope, label, node_type) VALUES (%s,%s,%s), (%s,%s,%s)",
-        (escopo, "José", "PERSON", escopo, "Jose", "PERSON"))
+        (scope_, "José", "PERSON", scope_, "Jose", "PERSON"))
     await prep.close()
 
     conn = await psycopg.AsyncConnection.connect(DSN, row_factory=dict_row)   # SEM autocommit
-    with pytest.raises(RuntimeError) as caiu:
+    with pytest.raises(RuntimeError) as raised:
         await ensure_schema(conn, embedding_dim=8)
     await conn.rollback()
     await conn.close()
 
-    limpa = await psycopg.AsyncConnection.connect(DSN, autocommit=True)
-    await limpa.execute("DELETE FROM knowledge_nodes WHERE scope = %s", (escopo,))
-    await ensure_schema(limpa, embedding_dim=8)
-    await limpa.close()
+    cleanup = await psycopg.AsyncConnection.connect(DSN, autocommit=True)
+    await cleanup.execute("DELETE FROM knowledge_nodes WHERE scope = %s", (scope_,))
+    await ensure_schema(cleanup, embedding_dim=8)
+    await cleanup.close()
 
-    msg = str(caiu.value)
+    msg = str(raised.value)
     assert "José" in msg and "Jose" in msg, (
         f"sob transacção envenenada o diagnóstico perdeu os rótulos e o operador fica com a "
         f"chave dobrada:\n{msg}")

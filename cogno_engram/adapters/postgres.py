@@ -133,9 +133,9 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
     # `unaccent` + o wrapper IMMUTABLE por baixo da identidade de nó: `José` e `Jose` são a mesma
     # pessoa (decisão de produto). Tem de vir ANTES dos índices — a UNIQUE de nós usa a função.
     await conn.execute("CREATE EXTENSION IF NOT EXISTS unaccent")
-    definicao_antes = await _definicao_do_fold(conn)
+    fold_before = await _installed_fold_definition(conn)
     await conn.execute(FOLD_FUNCTION_SQL)
-    await _reconstroi_indice_se_o_fold_mudou(conn, definicao_antes)
+    await _rebuild_index_if_fold_changed(conn, fold_before)
 
     # sessions / knowledge_* stay unpartitioned (low volume); turns/memories opt in.
     pk = "PRIMARY KEY (id, scope)" if partition_by_scope else "PRIMARY KEY (id)"
@@ -389,32 +389,32 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
     for stmt in stmts:
         try:
             await conn.execute(stmt)
-        except psycopg.errors.UniqueViolation as erro:
+        except psycopg.errors.UniqueViolation as cause:
             # SÓ violação de unicidade, e só neste índice. Um `except Exception` aqui rotulava
             # QUALQUER falha do CREATE — falta de ICU, permissões, função em falta — como
             # "colisão de rótulos", e mandava o operador fundir nós para resolver um problema que
             # não era esse. Um diagnóstico errado custa mais do que nenhum.
             if "uq_nodes_scope_fold_type" not in stmt:
                 raise
-            raise _colisao_de_rotulos(await _rotulos_em_conflito(conn), erro) from erro
+            raise _label_collision_error(await _colliding_labels(conn), cause) from cause
 
 
-async def _definicao_do_fold(conn) -> "str | None":
+async def _installed_fold_definition(conn) -> "str | None":
     """A definição de `engram_fold` que está INSTALADA, ou None se ainda não existe."""
     try:
         cur = await conn.execute(
             "SELECT pg_get_functiondef(p.oid) FROM pg_proc p JOIN pg_namespace n "
             "  ON n.oid = p.pronamespace "
             " WHERE p.proname = 'engram_fold' AND p.pronargs = 1 LIMIT 1")
-        linha = await cur.fetchone()
+        row = await cur.fetchone()
     except Exception:                                # noqa: BLE001 — ausência não é erro
         return None
-    if linha is None:
+    if row is None:
         return None
-    return linha[0] if not isinstance(linha, dict) else list(linha.values())[0]
+    return row[0] if not isinstance(row, dict) else list(row.values())[0]
 
 
-async def _reconstroi_indice_se_o_fold_mudou(conn, antes: "str | None") -> None:
+async def _rebuild_index_if_fold_changed(conn, previous: "str | None") -> None:
     """Se a regra de dobragem mudou, o índice que a GUARDA ficou a mentir — reconstrói.
 
     `uq_nodes_scope_fold_type` é um índice de EXPRESSÃO: guarda o resultado de `engram_fold`, não
@@ -436,10 +436,10 @@ async def _reconstroi_indice_se_o_fold_mudou(conn, antes: "str | None") -> None:
 
     Se a dobragem nova fizer colidir rótulos que antes eram distintos, o `REINDEX` FALHA — e é o
     mesmo comportamento correcto da criação inicial, com o mesmo erro nomeado."""
-    if antes is None:
+    if previous is None:
         return                                       # instalação nova: nada a reconstruir
-    depois = await _definicao_do_fold(conn)
-    if depois is None or depois == antes:
+    current = await _installed_fold_definition(conn)
+    if current is None or current == previous:
         return
     cur = await conn.execute(
         "SELECT 1 FROM pg_class WHERE relname = 'uq_nodes_scope_fold_type' AND relkind = 'i'")
@@ -450,10 +450,10 @@ async def _reconstroi_indice_se_o_fold_mudou(conn, antes: "str | None") -> None:
         "reason=engram_fold_definition_changed")
     try:
         await conn.execute("REINDEX INDEX uq_nodes_scope_fold_type")
-    except psycopg.errors.UniqueViolation as erro:
-        raise _colisao_de_rotulos(await _rotulos_em_conflito(conn), erro) from erro
+    except psycopg.errors.UniqueViolation as cause:
+        raise _label_collision_error(await _colliding_labels(conn), cause) from cause
 
-async def _rotulos_em_conflito(conn) -> "list[str]":
+async def _colliding_labels(conn) -> "list[str]":
     """Os grupos de rótulos que a identidade nova funde — vazio se a leitura falhar.
 
     O erro do Postgres nomeia a CHAVE dobrada (`Key (scope, engram_fold(label), node_type)=(t,
@@ -473,42 +473,42 @@ async def _rotulos_em_conflito(conn) -> "list[str]":
         except Exception:                            # noqa: BLE001 — autocommit, ou já limpa
             pass
         cur = await conn.execute(
-            "SELECT scope, node_type, string_agg(label, %s ORDER BY label) AS rotulos "
+            "SELECT scope, node_type, string_agg(label, %s ORDER BY label) AS labels "
             "FROM knowledge_nodes GROUP BY scope, node_type, engram_fold(label) "
             "HAVING count(*) > 1 LIMIT 21", (" + ",))
         # nomeadas, não posicionais: esta conexão pode vir com `dict_row` (o adaptador usa-o) e
         # aí `r[0]` levanta `KeyError`. O diagnóstico morreria exactamente no caso em que faz
         # falta — a migração já falhou e é isto que diz ao operador o que fazer.
-        linhas = await cur.fetchall()
-        def _campo(r, i, nome):
-            return r[nome] if isinstance(r, dict) else r[i]
-        fora = [f"{_campo(r, 0, 'scope')} / {_campo(r, 1, 'node_type')}: {_campo(r, 2, 'rotulos')}"
-                for r in linhas[:20]]
-        if len(linhas) > 20:
+        rows = await cur.fetchall()
+        def _field(r, i, name):
+            return r[name] if isinstance(r, dict) else r[i]
+        out = [f"{_field(r, 0, 'scope')} / {_field(r, 1, 'node_type')}: {_field(r, 2, 'labels')}"
+                for r in rows[:20]]
+        if len(rows) > 20:
             # truncar em silêncio manda o operador fundir 20, correr outra vez e falhar outra vez
-            fora.append("… e MAIS grupos além destes 20 — corra o relatório completo com "
+            out.append("… e MAIS grupos além destes 20 — corra o relatório completo com "
                         "`cogno_engram.fold_migration.fold_collisions()`")
-        return fora
+        return out
     except Exception:                                # noqa: BLE001
         return []
 
 
-def _colisao_de_rotulos(grupos: "list[str]", erro: Exception) -> RuntimeError:
+def _label_collision_error(groups: "list[str]", cause: Exception) -> RuntimeError:
     """A identidade de nó passou a ignorar acentos e esta base tem nós que agora colidem.
 
     Falhar é o comportamento CORRECTO, e a alternativa foi considerada e recusada: fundir os nós
     automaticamente escolheria um dos rótulos e mudaria as arestas do outro de dono, em silêncio,
     num grafo cujo propósito é dizer factos sobre pessoas. Qual dos dois `José` é a pessoa é
     conhecimento que esta função não tem."""
-    if not grupos:
+    if not groups:
         return RuntimeError(
             "a identidade de nó passa a ignorar acentos (`José` == `Jose`) e esta base tem nós "
-            f"que agora colidem. Não consegui listá-los; o erro original foi: {erro}")
+            f"que agora colidem. Não consegui listá-los; o erro original foi: {cause}")
     return RuntimeError(
         "a identidade de nó passa a ignorar acentos (`José` == `Jose`) e esta base tem nós que "
         "agora colidem. Funda-os À MÃO antes de migrar — automaticamente não, porque escolher um "
         "dos rótulos muda as arestas do outro de dono em silêncio:\n  "
-        + "\n  ".join(grupos))
+        + "\n  ".join(groups))
 
 
 class _PgBase:
@@ -529,14 +529,14 @@ class _PgBase:
         # static psycopg row type (tuple) doesn't reflect.
         if self._pool is not None:
             async with self._pool.connection() as conn:
-                prev = conn.row_factory
+                previous_rows = conn.row_factory
                 conn.row_factory = dict_row
                 try:
                     yield conn
                 finally:
                     # restore the pooled connection's factory so a later borrower that expects
                     # tuple rows isn't handed dicts (a shared-pool consumer must not inherit this).
-                    conn.row_factory = prev
+                    conn.row_factory = previous_rows
         else:
             assert self._dsn is not None  # __init__ guarantees dsn when pool is None
             conn = await psycopg.AsyncConnection.connect(
@@ -1225,8 +1225,8 @@ class PostgresKnowledgeGraph(_PgBase):
             # diferente coexistem legalmente, e um UPDATE por rótulo atingia os DOIS. No
             # `set_edge_audience` isso é uma mudança de PRIVACIDADE numa aresta que ninguém
             # escolheu.
-            src = await self._one_node_id(conn, scope, source, para="set_edge_status")
-            tgt = await self._one_node_id(conn, scope, target, para="set_edge_status")
+            src = await self._one_node_id(conn, scope, source, op="set_edge_status")
+            tgt = await self._one_node_id(conn, scope, target, op="set_edge_status")
             if src is None or tgt is None:
                 return False
             cur = await conn.execute(
@@ -1244,8 +1244,8 @@ class PostgresKnowledgeGraph(_PgBase):
             # diferente coexistem legalmente, e um UPDATE por rótulo atingia os DOIS. No
             # `set_edge_audience` isso é uma mudança de PRIVACIDADE numa aresta que ninguém
             # escolheu.
-            src = await self._one_node_id(conn, scope, source, para="set_edge_audience")
-            tgt = await self._one_node_id(conn, scope, target, para="set_edge_audience")
+            src = await self._one_node_id(conn, scope, source, op="set_edge_audience")
+            tgt = await self._one_node_id(conn, scope, target, op="set_edge_audience")
             if src is None or tgt is None:
                 return False
             cur = await conn.execute(
@@ -1372,7 +1372,7 @@ class PostgresKnowledgeGraph(_PgBase):
             return await cur.fetchone() is not None
 
     @staticmethod
-    async def _one_node_id(conn, scope: str, label: str, *, para: str) -> "int | None":
+    async def _one_node_id(conn, scope: str, label: str, *, op: str) -> "int | None":
         """O id do ÚNICO nó que este rótulo designa — ou None quando é ambíguo.
 
         A identidade dobrada ignora acento, mas o `node_type` NÃO faz parte do rótulo: `José`
@@ -1387,22 +1387,22 @@ class PostgresKnowledgeGraph(_PgBase):
         cur = await conn.execute(
             "SELECT id, label FROM knowledge_nodes "
             " WHERE scope = %s AND engram_fold(label) = engram_fold(%s)", (scope, label))
-        linhas = await cur.fetchall()
+        rows = await cur.fetchall()
 
-        def _campo(r, i, nome):
-            return r[nome] if isinstance(r, dict) else r[i]
+        def _field(r, i, name):
+            return r[name] if isinstance(r, dict) else r[i]
 
-        if not linhas:
+        if not rows:
             return None
-        if len(linhas) > 1:
-            exactos = [r for r in linhas if _campo(r, 1, "label") == label]
-            if len(exactos) != 1:
+        if len(rows) > 1:
+            exact = [r for r in rows if _field(r, 1, "label") == label]
+            if len(exact) != 1:
                 logger.warning(
                     "event=node_reference_ambiguous op=%s scope=%s label=%s matches=%d "
-                    "reason=fold_matches_several_node_types", para, scope, label, len(linhas))
+                    "reason=fold_matches_several_node_types", op, scope, label, len(rows))
                 return None
-            linhas = exactos
-        return int(_campo(linhas[0], 0, "id"))
+            rows = exact
+        return int(_field(rows[0], 0, "id"))
 
     async def delete_node(self, scope: str, label: str) -> bool:
         """Apaga UM nó — nunca mais do que um, mesmo quando a dobragem casa com vários.
@@ -1411,11 +1411,11 @@ class PostgresKnowledgeGraph(_PgBase):
         clicava num nó e perdia outro sem aviso. Ver `_one_node_id`."""
         _require_scope(scope)
         async with self._conn() as conn:
-            alvo = await self._one_node_id(conn, scope, label, para="delete_node")
-            if alvo is None:
+            victim_id = await self._one_node_id(conn, scope, label, op="delete_node")
+            if victim_id is None:
                 return False
             cur = await conn.execute(
-                "DELETE FROM knowledge_nodes WHERE id = %s", (alvo,))
+                "DELETE FROM knowledge_nodes WHERE id = %s", (victim_id,))
             return cur.rowcount > 0   # edges cascade via FK ON DELETE CASCADE
 
     async def delete_edges_by_session(self, scope: str, session_id: str) -> int:

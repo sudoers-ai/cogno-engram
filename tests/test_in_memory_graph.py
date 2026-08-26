@@ -119,3 +119,35 @@ async def test_purge_scope_drops_nodes_and_edges_isolated(graph):
 async def test_purge_scope_graph_rejects_blank_scope(graph):
     with pytest.raises(ValueError):
         await graph.purge_scope("")
+
+
+async def test_an_edge_remembers_WHEN_and_both_adapters_answer_the_same():
+    """`created_at` was written on every edge since the table existed and thrown away on the way
+    out: the column is `NOT NULL DEFAULT now()`, and the dataclass had nowhere to put it.
+
+    A contact-graph view needs it for a reason that is not decoration: **a wrong fact with no
+    date is not correctable** — the operator cannot tell whether it is from yesterday or from
+    March, so they cannot judge whether it still holds.
+
+    Parity is asserted here and not left to the Postgres suite because the two adapters have
+    drifted before (label normalisation): the in-memory one must stamp on insert the way the
+    column's `DEFAULT now()` does.
+    """
+    from datetime import datetime, timezone
+
+    from cogno_engram import AUDIENCE_STAFF, GraphEdge, InMemoryGraph
+
+    g = InMemoryGraph()
+    antes = datetime.now(timezone.utc)
+    await g.upsert_edge(GraphEdge("s", "José", "Rex", "OWNS_PET"))
+    lida = (await g.walk("s", "José", audience=AUDIENCE_STAFF))[0]
+
+    assert lida.created_at is not None, "a aresta veio sem data — a coluna existe desde sempre"
+    assert lida.created_at >= antes, "a data não é do momento da inserção"
+
+    # …e uma data que o CHAMADOR trouxe é preservada: um replay ou um teste que fixa a data não
+    # pode vê-la substituída pelo relógio, ou deixa de poder reproduzir o passado.
+    fixa = datetime(2026, 3, 14, 9, 0, tzinfo=timezone.utc)
+    await g.upsert_edge(GraphEdge("s", "José", "Ana", "KNOWS", created_at=fixa))
+    ana = [e for e in await g.walk("s", "José", audience=AUDIENCE_STAFF) if e.target == "Ana"][0]
+    assert ana.created_at == fixa, "a data trazida pelo chamador foi sobrescrita"

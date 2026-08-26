@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Added
+
+- **`GraphEdge.created_at` — a aresta passa a lembrar-se de QUANDO.** A coluna existe em
+  `knowledge_edges` desde que a tabela existe (`created_at timestamptz NOT NULL DEFAULT now()`),
+  é escrita em todas as arestas, e a dataclass **deitava-a fora**: a porta perdia-a entre a base
+  e quem lê.
+
+  Não é decoração. Uma vista de grafo por contacto serve para **verificar e corrigir**, e **um
+  facto errado sem data não é corrigível** — quem olha não sabe se é de ontem ou de Março, logo
+  não sabe se ainda vale.
+
+  `None` significa "não veio de um store": quem constrói uma aresta para ESCREVER não pode saber
+  a data, e inventá-la aqui tornaria "quando aprendemos isto?" respondível com o instante em que
+  alguém construiu um objecto.
+
+  Nos **dois** adaptadores, e a paridade é afirmada num teste: o Postgres lê a coluna (pelo
+  construtor único `_edge_from_row`, cujo docstring já dizia que é ali que uma coluna nova deixa
+  de ser carregada em silêncio); o in-memory carimba na PRIMEIRA inserção, como o `DEFAULT now()`
+  faz — e preserva uma data que o chamador traga, senão um replay deixa de poder reproduzir o
+  passado.
+
 ### Changed
 
 - **A base descartável passou a ser o DESTINO por omissão das suítes que fazem `DROP TABLE`.**

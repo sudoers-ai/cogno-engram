@@ -236,6 +236,14 @@ class GraphEdge:
     status: str = EDGE_ACCEPTED
     # WHO MAY READ IT — see the block above. Default is unclassified: staff yes, contact no.
     audience: str = AUDIENCE_UNCLASSIFIED
+    # WHEN the store first recorded it. `None` on an edge that has not been read back from a
+    # store — a caller building one to WRITE cannot know it, and inventing a value here would
+    # make "when did we learn this?" answerable with the moment somebody constructed an object.
+    # The column has existed on `knowledge_edges` since the table did (`created_at timestamptz
+    # NOT NULL DEFAULT now()`); it was written on every edge and then dropped on the way out,
+    # because the dataclass had nowhere to put it. Surfacing it costs nothing and answers a
+    # question the contact-graph view is built to ask.
+    created_at: "Optional[datetime]" = None
 
     def __post_init__(self) -> None:
         """One normalisation, both stores.

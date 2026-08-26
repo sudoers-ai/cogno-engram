@@ -498,7 +498,14 @@ class InMemoryGraph:
                 if existing.status == EDGE_PROPOSED:
                     existing.status = edge.status
                 return
-        self._edges.append(_detached(edge))   # never alias the caller's object
+        # Stamp `created_at` on FIRST insert, the way the Postgres column's `DEFAULT now()`
+        # does — parity, and the direction that matters: a caller who already set one (a test
+        # pinning a date, a replay) keeps it. Without this the two adapters answer the same
+        # read differently, which is exactly how the label normalisation drifted before.
+        novo = _detached(edge)                # never alias the caller's object
+        if novo.created_at is None:
+            novo.created_at = datetime.now(timezone.utc)
+        self._edges.append(novo)
 
     async def find_node(self, scope: str, label: str, *,
                         audience: str) -> Optional[GraphNode]:

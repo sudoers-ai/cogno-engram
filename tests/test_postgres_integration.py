@@ -1330,3 +1330,97 @@ async def test_the_partition_probe_works_on_a_DICT_ROW_connection():
         assert got["n"] == 1, "the schema after the partition loop was never created"
     finally:
         await conn.close()
+
+
+async def test_a_DIFFERENT_modulus_does_not_abort_the_rest_of_the_schema(caplog):
+    """`relkind` says PARTITIONED; it does not say WITH WHAT.
+
+    Measured on the demo box 2026-08-26, immediately after the flat-table fix shipped: the box's
+    `turn_traces` had four children and the host asks for eight, so `turn_traces_p0..p3` were
+    no-ops and `turn_traces_p4` raised `would overlap partition "turn_traces_p0"`. Same class as
+    the flat table, same consequence — the knowledge graph is created after this loop — and the
+    first fix could not see it, because it only asked whether the table was partitioned AT ALL.
+
+    The counts belong in the log: "has 4, asked for 8" is actionable; "would overlap" is not.
+    """
+    if not await _pg_available():
+        pytest.skip("set ENGRAM_TEST_DSN to run")
+    conn = await _connect()
+    try:
+        for tbl in ("knowledge_edges", "knowledge_nodes", "turn_traces", "memories",
+                    "turns", "sessions"):
+            await conn.execute(f"DROP TABLE IF EXISTS {tbl} CASCADE")
+        await ensure_schema(conn, embedding_dim=EMB_DIM, partition_by_scope=True, partitions=4)
+        await conn.execute("DROP TABLE knowledge_edges CASCADE")   # after the loop
+
+        with caplog.at_level("DEBUG", logger="cogno_engram.postgres"):
+            await ensure_schema(conn, embedding_dim=EMB_DIM,
+                                partition_by_scope=True, partitions=8)
+
+        got = await (await conn.execute(
+            "SELECT count(*) FROM information_schema.tables "
+            "WHERE table_name = 'knowledge_edges'")).fetchone()
+        assert got[0] == 1, "the schema after the partition loop was never created"
+        got = await (await conn.execute(
+            "SELECT count(*) FROM pg_inherits WHERE inhparent = to_regclass('turns')")).fetchone()
+        assert got[0] == 4, "the existing partitioning was changed — skipping must not convert"
+        skipped = [r.getMessage() for r in caplog.records if "partitioning_skipped" in r.getMessage()]
+        # ONE line per table, carrying the PRECISE reason. Dropping the early return still
+        # completes the schema — the defensive DDL below catches the overlap — so without this
+        # the return reads as dead code. It is not: falling through runs eight statements that
+        # are all going to be refused and then logs `incompatible_shape` on top of the accurate
+        # `exists_with_4_partitions`, which is the reason an operator would act on buried under
+        # one they cannot.
+        for tbl in ("turns", "memories", "turn_traces"):
+            lines = [m for m in skipped if f"table={tbl} " in m]
+            assert len(lines) == 1, f"expected one skip line for `{tbl}`, got {lines}"
+            assert "reason=exists_with_4_partitions requested=8" in lines[0], (
+                f"the log must carry both counts, and the precise reason; got {lines[0]}")
+
+
+    finally:
+        await conn.close()
+
+
+async def test_an_UNASKABLE_shape_is_caught_by_the_DDL_itself(caplog):
+    """The probes cannot name every shape, so the DDL runs defensively too.
+
+    A table partitioned by LIST with exactly as many children as we ask for passes BOTH probes —
+    it is partitioned, and the count matches — and only the `PARTITION OF ... MODULUS` statement
+    can discover that the strategy is wrong. Without the nested transaction and the downgrade,
+    that raises and the knowledge graph is lost again, for a third distinct shape.
+
+    The fixture's columns come from engram's own `turn_traces` (`LIKE`), never hand-written: an
+    invented table dies on a column that does not exist and measures the fixture.
+    """
+    if not await _pg_available():
+        pytest.skip("set ENGRAM_TEST_DSN to run")
+    conn = await _connect()
+    try:
+        for tbl in ("knowledge_edges", "knowledge_nodes", "turn_traces", "memories",
+                    "turns", "sessions"):
+            await conn.execute(f"DROP TABLE IF EXISTS {tbl} CASCADE")
+        await ensure_schema(conn, embedding_dim=EMB_DIM, partition_by_scope=True, partitions=2)
+        await conn.execute(
+            "CREATE TABLE tt_list (LIKE turn_traces INCLUDING DEFAULTS) PARTITION BY LIST (scope)")
+        await conn.execute("DROP TABLE turn_traces CASCADE")
+        await conn.execute("ALTER TABLE tt_list RENAME TO turn_traces")
+        for name in ("a", "b"):                       # exactly `partitions` children: both probes pass
+            await conn.execute(
+                f"CREATE TABLE turn_traces_{name} PARTITION OF turn_traces FOR VALUES IN ('{name}')")
+        await conn.execute("DROP TABLE knowledge_edges CASCADE")
+
+        with caplog.at_level("DEBUG", logger="cogno_engram.postgres"):
+            await ensure_schema(conn, embedding_dim=EMB_DIM,
+                                partition_by_scope=True, partitions=2)
+
+        got = await (await conn.execute(
+            "SELECT count(*) FROM information_schema.tables "
+            "WHERE table_name = 'knowledge_edges'")).fetchone()
+        assert got[0] == 1, "a LIST-partitioned legacy table still aborted the schema"
+        caught = [r.getMessage() for r in caplog.records
+                  if "partitioning_skipped" in r.getMessage() and "turn_traces" in r.getMessage()]
+        assert any("reason=incompatible_shape" in m for m in caught), (
+            f"the DDL's own refusal must be downgraded to the same event; got {caught}")
+    finally:
+        await conn.close()

@@ -113,6 +113,91 @@ def _mask_pii(text: str) -> str:
     return text
 
 
+_SKIP_REMEDY = (
+    "The rest of the schema was created. To change how `{tbl}` is partitioned, move the data "
+    "deliberately (rename, recreate, INSERT SELECT, drop) — or leave it as it is, which is "
+    "supported: partitioning is throughput, not correctness."
+)
+
+
+async def _partition_existing_table(conn, tbl: str, partitions: int) -> None:
+    """Give ``tbl`` its HASH partitions, and NEVER raise because of the shape it already has.
+
+    Partitioning is THROUGHPUT; every table and column `ensure_schema` creates after this loop
+    is CORRECTNESS. An optimisation must not be fatal to a correctness step behind it — and this
+    one was, twice, in production:
+
+    * a database born FLAT (an older host, or ``partition_by_scope=False``) reached
+      ``PARTITION OF`` with a plain table. `CREATE TABLE IF NOT EXISTS ... PARTITION BY HASH` is
+      a NO-OP when the table exists — Postgres does not check the definition matches — so the
+      error surfaced eleven statements before the knowledge graph. Measured 2026-08-25: a host
+      running with no graph, `/health` reporting `stale`, and a log line about partitioning.
+    * a database partitioned with a DIFFERENT modulus (4 children, host asking for 8) raised
+      ``partition "turn_traces_p4" would overlap partition "turn_traces_p0"``. Measured
+      2026-08-26 on the same box, immediately after the first fix shipped — `relkind` says
+      PARTITIONED, it does not say WITH WHAT.
+
+    So the shape is asked about first, for a message an operator can act on, and then the DDL
+    itself is run defensively, because asking can never cover every shape: LIST/RANGE from a
+    parent product, a different partition KEY, whatever the next database was created by. The
+    two structural errors are downgraded to the same event; anything else (permissions, disk,
+    a real bug) still raises, because those are not "this table has a history".
+
+    Never converts. Moving data is the operator's decision, not the side effect of asking for a
+    schema.
+    """
+    # `SELECT 1` + `is None`, never a value read by position or by name: this runs on BOTH row
+    # factories — `migrate.py` hands it tuples, `PostgresStore._conn` hands it `dict_row` — and
+    # the first cut read `kind[0]`, a `KeyError: 0` under dict_row that produced zero partitions
+    # and no knowledge graph on a FRESH database: the guard breaking the healthy path worse than
+    # the bug it came to fix. The ADD COLUMN guard inside `ensure_schema` — the one that asks
+    # `SELECT 1 FROM information_schema.columns` before altering `knowledge_edges` — answers the
+    # same way for the same reason. (Named by what it QUERIES: the first draft of this sentence
+    # invented a `has_column` helper in an `_ensure_edge_audience` that does not exist, which is
+    # how prose starts asserting symbols nobody can grep.)
+    # `to_regclass` resolves through `search_path`, like the DDL does;
+    # the first cut hardcoded `'public'::regnamespace` and answered "not flat" for a host whose
+    # schema is not public.
+    flat = await (await conn.execute(
+        "SELECT 1 FROM pg_class WHERE oid = to_regclass(%s) AND relkind <> 'p'",
+        (tbl,))).fetchone()
+    if flat is not None:
+        logger.error("stage=schema event=partitioning_skipped table=%s "
+                     "reason=exists_unpartitioned remedy=%s", tbl, _SKIP_REMEDY.format(tbl=tbl))
+        return
+
+    # How many children it HAS, against how many we were asked for. Counting `pg_inherits` says
+    # nothing about the strategy, which is the point: a table with N children when the caller
+    # wants M is a real divergence whatever the strategy is, and the numbers belong in the log.
+    row = await (await conn.execute(
+        "SELECT count(*) FROM pg_inherits WHERE inhparent = to_regclass(%s)",
+        (tbl,))).fetchone()
+    existing = int(list(row.values())[0] if isinstance(row, dict) else row[0]) if row else 0
+    if existing and existing != partitions:
+        logger.error("stage=schema event=partitioning_skipped table=%s "
+                     "reason=exists_with_%d_partitions requested=%d remedy=%s",
+                     tbl, existing, partitions, _SKIP_REMEDY.format(tbl=tbl))
+        return
+
+    for k in range(partitions):
+        try:
+            # A nested transaction so ONE refused statement cannot poison the caller's — psycopg
+            # emits SAVEPOINT when already in a transaction and BEGIN when not, so this is right
+            # for `migrate.py` (autocommit) and for a pooled store connection alike.
+            async with conn.transaction():
+                await conn.execute(
+                    f"CREATE TABLE IF NOT EXISTS {tbl}_p{k} PARTITION OF {tbl} "
+                    f"FOR VALUES WITH (MODULUS {partitions}, REMAINDER {k})")
+        except (psycopg.errors.InvalidObjectDefinition,
+                psycopg.errors.InvalidTableDefinition) as exc:
+            # The shape the probes above could not name — LIST/RANGE, a different key, something
+            # this version has not met. Same event, so an operator greps one string.
+            logger.error("stage=schema event=partitioning_skipped table=%s "
+                         "reason=incompatible_shape detail=%s remedy=%s",
+                         tbl, str(exc).splitlines()[0], _SKIP_REMEDY.format(tbl=tbl))
+            return
+
+
 async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
                         ts_config: str = DEFAULT_TS_CONFIG,
                         partition_by_scope: bool = False, partitions: int = 8) -> None:
@@ -198,61 +283,7 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
     )
     if partition_by_scope:
         for tbl in ("turns", "memories", "turn_traces"):
-            # A table that ALREADY EXISTS unpartitioned is not an error this function may die
-            # on, and that is the whole point of asking first.
-            #
-            # `CREATE TABLE IF NOT EXISTS ... PARTITION BY HASH` above is a NO-OP when the table
-            # exists — Postgres does not check that the definition matches — so a database
-            # created flat (an older host, or a run with `partition_by_scope=False`) reaches
-            # here with a plain `turns`, and `PARTITION OF` then raises
-            # `InvalidObjectDefinition: "turns" is not partitioned`.
-            #
-            # That used to abort the WHOLE call, and everything below this line is created
-            # after it: the knowledge graph, its indexes, and any column added to them later.
-            # Measured 2026-08-25 on a real box — `sessions`/`turns`/`memories`/`turn_traces`
-            # existed and `knowledge_edges` did NOT, because one legacy shape stopped the run
-            # eleven statements early. The host had no graph, `/health` said `stale`, and the
-            # remedy in the logs was a Postgres error about partitioning.
-            #
-            # Partitioning is THROUGHPUT; the tables and columns after it are CORRECTNESS.
-            # An optimisation must never be fatal to a correctness step behind it. So: detect,
-            # say so at ERROR with the remedy, skip THIS table's partitions, keep going.
-            # Converting flat -> partitioned moves data and is a deliberate operator decision,
-            # never something a schema call does behind their back.
-            #
-            # KNOWN GAP, pre-existing and narrower than it looks: `relkind` says PARTITIONED, not
-            # partitioned HOW. A table the parent left partitioned by `LIST(tenant)` still aborts
-            # the call (`InvalidTableDefinition`), and one partitioned by `HASH(session_id)` — the
-            # wrong key — passes silently here and on main alike. `pg_partitioned_table.partstrat`
-            # would separate them; not done here because this commit is about not being fatal,
-            # and widening it would need a second decision about what to do with each strategy.
-            # `SELECT 1` + `is None`, never a value read by position or by name: this function
-            # runs on BOTH row factories — `migrate.py` hands it tuples, `PostgresStore._conn`
-            # hands it `dict_row` — and the first cut of this probe read `kind[0]`, which is a
-            # `KeyError: 0` under dict_row. Measured on a FRESH database: zero partitions and no
-            # knowledge graph, i.e. the guard broke the healthy path worse than the bug it came
-            # to fix. The column check further down already answers this way for the same reason,
-            # and the note at the top of this function records the mirrored crash (reading by
-            # NAME under the tuple factory). Third time, so it is written beside the code now.
-            #
-            # `to_regclass` also resolves through `search_path`, like the DDL above it — the
-            # first cut hardcoded `'public'::regnamespace` and would answer "not flat" (None) for
-            # a host whose schema is not public, silently skipping nothing and re-raising.
-            flat = await (await conn.execute(
-                "SELECT 1 FROM pg_class WHERE oid = to_regclass(%s) AND relkind <> 'p'",
-                (tbl,))).fetchone()
-            if flat is not None:
-                logger.error(
-                    "stage=schema event=partitioning_skipped table=%s reason=exists_unpartitioned "
-                    "remedy=%s", tbl,
-                    f"`{tbl}` predates HASH partitioning. The rest of the schema was created. "
-                    f"To partition it, move the data deliberately (rename, recreate partitioned, "
-                    f"INSERT SELECT, drop) — or keep it flat, which is supported.")
-                continue
-            for k in range(partitions):
-                await conn.execute(
-                    f"CREATE TABLE IF NOT EXISTS {tbl}_p{k} PARTITION OF {tbl} "
-                    f"FOR VALUES WITH (MODULUS {partitions}, REMAINDER {k})")
+            await _partition_existing_table(conn, tbl, partitions)
     await conn.execute(
         f"""
         CREATE TABLE IF NOT EXISTS knowledge_nodes (

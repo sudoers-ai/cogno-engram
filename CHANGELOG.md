@@ -4,6 +4,25 @@
 
 ### Fixed
 
+- **Um módulo diferente abortava o schema tal como uma tabela plana.** O conserto anterior
+  perguntava se a tabela estava particionada; `relkind` diz PARTICIONADA, **não com quê**. Medido
+  na caixa demo a 2026-08-26, logo a seguir a esse merge: `turn_traces` com quatro filhos, o host
+  a pedir oito, `partition "turn_traces_p4" would overlap partition "turn_traces_p0"` — e o grafo
+  de conhecimento vem DEPOIS do laço. Mesma classe, mesma consequência, gatilho diferente.
+
+  Agora há **duas defesas, e cada uma faz o que a outra não faz**: a sonda conta os filhos
+  (`pg_inherits`) e, divergindo do pedido, salta com os DOIS números no evento
+  (`reason=exists_with_4_partitions requested=8` — accionável, ao contrário de "would overlap");
+  e o próprio DDL corre em transacção aninhada, rebaixando `InvalidObjectDefinition` e
+  `InvalidTableDefinition` ao mesmo evento. A segunda existe porque perguntar nunca cobre todas
+  as formas: uma tabela em LIST/RANGE de um produto pai, ou com outra CHAVE de partição, passa
+  nas duas sondas e só a instrução a descobre. Qualquer outro erro (permissões, disco, um bug a
+  sério) continua a levantar — esses não são "esta tabela tem história".
+
+  O laço saiu para `_partition_existing_table`, com a razão inteira num docstring em vez de
+  trinta linhas de comentário dentro do `ensure_schema`.
+
+
 - **`ensure_schema` dizia-se idempotente e não era, contra uma base criada PLANA.**
   `CREATE TABLE IF NOT EXISTS turns (...) PARTITION BY HASH (scope)` é um NO-OP quando a tabela
   já existe — o Postgres não verifica que a definição bate — portanto uma base nascida sem

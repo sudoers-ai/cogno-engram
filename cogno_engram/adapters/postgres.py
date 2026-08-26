@@ -209,7 +209,7 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
             #
             # That used to abort the WHOLE call, and everything below this line is created
             # after it: the knowledge graph, its indexes, and any column added to them later.
-            # Measured 2026-08-26 on a real box — `sessions`/`turns`/`memories`/`turn_traces`
+            # Measured 2026-08-25 on a real box — `sessions`/`turns`/`memories`/`turn_traces`
             # existed and `knowledge_edges` did NOT, because one legacy shape stopped the run
             # eleven statements early. The host had no graph, `/health` said `stale`, and the
             # remedy in the logs was a Postgres error about partitioning.
@@ -219,10 +219,29 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
             # say so at ERROR with the remedy, skip THIS table's partitions, keep going.
             # Converting flat -> partitioned moves data and is a deliberate operator decision,
             # never something a schema call does behind their back.
-            kind = await (await conn.execute(
-                "SELECT relkind FROM pg_class WHERE relname = %s "
-                "AND relnamespace = 'public'::regnamespace", (tbl,))).fetchone()
-            if kind is not None and kind[0] != "p":
+            #
+            # KNOWN GAP, pre-existing and narrower than it looks: `relkind` says PARTITIONED, not
+            # partitioned HOW. A table the parent left partitioned by `LIST(tenant)` still aborts
+            # the call (`InvalidTableDefinition`), and one partitioned by `HASH(session_id)` — the
+            # wrong key — passes silently here and on main alike. `pg_partitioned_table.partstrat`
+            # would separate them; not done here because this commit is about not being fatal,
+            # and widening it would need a second decision about what to do with each strategy.
+            # `SELECT 1` + `is None`, never a value read by position or by name: this function
+            # runs on BOTH row factories — `migrate.py` hands it tuples, `PostgresStore._conn`
+            # hands it `dict_row` — and the first cut of this probe read `kind[0]`, which is a
+            # `KeyError: 0` under dict_row. Measured on a FRESH database: zero partitions and no
+            # knowledge graph, i.e. the guard broke the healthy path worse than the bug it came
+            # to fix. The column check further down already answers this way for the same reason,
+            # and the note at the top of this function records the mirrored crash (reading by
+            # NAME under the tuple factory). Third time, so it is written beside the code now.
+            #
+            # `to_regclass` also resolves through `search_path`, like the DDL above it — the
+            # first cut hardcoded `'public'::regnamespace` and would answer "not flat" (None) for
+            # a host whose schema is not public, silently skipping nothing and re-raising.
+            flat = await (await conn.execute(
+                "SELECT 1 FROM pg_class WHERE oid = to_regclass(%s) AND relkind <> 'p'",
+                (tbl,))).fetchone()
+            if flat is not None:
                 logger.error(
                     "stage=schema event=partitioning_skipped table=%s reason=exists_unpartitioned "
                     "remedy=%s", tbl,

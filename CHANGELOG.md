@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — uma forma legada não pode custar tudo o que vem depois dela (2026-08-26)
+## Unreleased
 
 ### Fixed
 
@@ -12,7 +12,7 @@
   partitioned`.
 
   Isso abortava a chamada INTEIRA, e o grafo de conhecimento é criado **onze instruções depois**.
-  Medido numa caixa real a 2026-08-26: `sessions`/`turns`/`memories`/`turn_traces` existiam e
+  Medido numa caixa real a 2026-08-25: `sessions`/`turns`/`memories`/`turn_traces` existiam e
   `knowledge_edges` **não**, portanto o host corria sem grafo, o `/health` dizia `stale`, e a
   única pista no log era um erro de particionamento. O remédio documentado
   (`python -m cogno_host.migrate`, anunciado como idempotente) nunca podia consertá-lo, porque
@@ -26,8 +26,6 @@
 
   Pinado nos dois sentidos: uma base plana recebe o resto do schema (e a tabela fica plana — o
   salto não converte), e uma base particionada continua a receber as suas partições.
-
-## Unreleased
 
 ### Added
 

@@ -1,10 +1,11 @@
 """
 Integration tests for the Postgres + pgvector adapter.
 
-Gated: they need a real Postgres with the ``vector`` extension. Set
-``ENGRAM_TEST_DSN`` to a scratch database; the suite auto-skips if it is unset
-or unreachable. The fixture DROPs and recreates the engram tables (with a tiny
-embedding dim) so runs are deterministic — point it at a throwaway DB.
+Gated: they need a real Postgres with the ``vector`` extension. They aim at ``engram_test``
+by themselves — on the server ``COGNO_PG_DSN`` already names, else on libpq's defaults — and
+auto-skip when nothing is listening there. The fixture DROPs and recreates the engram tables
+(with a tiny embedding dim) so runs are deterministic, which is why the destination is chosen
+for you rather than typed.
 
 **The database name must contain "test"** or ``tests/conftest.py`` aborts the run: these
 tests do not just delete rows, they leave the schema with a ``vector(8)`` embedding column
@@ -12,15 +13,15 @@ that a real 768-dimension embedder cannot write to. The example below used to sa
 ``/postgres`` — a database that exists on every server, production ones included.
 
     docker run -d --rm --name engram-pg -e POSTGRES_PASSWORD=postgres \
-        -e POSTGRES_DB=engram_test -p 55432:5432 pgvector/pgvector:pg16
-    ENGRAM_TEST_DSN=postgresql://postgres:postgres@localhost:55432/engram_test \
-        python3 -m pytest tests/test_postgres_integration.py
+        -e POSTGRES_DB=engram_test -p 5432:5432 pgvector/pgvector:pg16
+    python3 -m pytest tests/test_postgres_integration.py     # ← no DSN to type
+
+``ENGRAM_TEST_DSN`` still overrides, for a server that is neither of those.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 from uuid import uuid4
 
 import pytest
@@ -44,7 +45,9 @@ from cogno_engram.types import (  # noqa: E402
     TurnRecord,
 )
 
-DSN = os.getenv("ENGRAM_TEST_DSN", "")
+from conftest import resolve_test_dsn  # noqa: E402 — the sibling conftest, on pytest's path
+
+DSN = resolve_test_dsn()      # ENGRAM_TEST_DSN, else `engram_test` on the local server
 EMB_DIM = 8
 
 # (asyncio_mode=auto in pyproject handles the async marker — no module pytestmark)
@@ -801,7 +804,7 @@ async def test_an_existing_database_GETS_the_new_columns_and_keeps_its_edges(pg)
     """
     # Belt AND braces: the fixture already skips, and this refuses to aim a DROP at whatever
     # libpq would pick. A destructive test may not depend on one guard.
-    assert DSN, "refusing to run a schema-dropping test without an explicit ENGRAM_TEST_DSN"
+    assert DSN, "refusing to run a schema-dropping test without a resolved test DSN"
 
     old_schema = """
         DROP SCHEMA public CASCADE; CREATE SCHEMA public;

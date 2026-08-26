@@ -2,7 +2,46 @@
 
 ## Unreleased
 
+### Changed
+
+- **A base descartável passou a ser o DESTINO por omissão das suítes que fazem `DROP TABLE`.**
+  Dono, 2026-08-26: *"Já temos um test só para os testes de integração, isso deveria ser
+  padrão."* A guarda de 2026-08-04 transformou o engano numa recusa, mas continuava a deixar a
+  pessoa **escrever** um DSN — e a forma que causou o estrago é justamente a que a shell já
+  tem à mão (`COGNO_PG_DSN` exportado, um `Ctrl-C`/`Ctrl-V` de distância de `ENGRAM_TEST_DSN`).
+
+  **Antes:** `DSN = os.getenv("ENGRAM_TEST_DSN", "")` em cada módulo; variável por pôr →
+  `pytest.skip`. **Agora:** `resolve_test_dsn()` — `ENGRAM_TEST_DSN` explícito ganha; sem ela,
+  `engram_test` no servidor LOCAL que `COGNO_PG_DSN` já nomeia (ou nos defaults do libpq, que
+  são o que o serviço do CI serve); nada à escuta → `""` → salta exactamente como saltava.
+
+  O que torna isto seguro não é uma verificação, é uma **construção**: o nome da base nunca é
+  trazido de lado nenhum, é **escrito** (`_for_test_database`). Dar a esta função o DSN exacto
+  que causou a perda devolve o descartável — e `test_db_guard.py` pina isso nos dois sentidos,
+  incluindo que TODO default nomeia uma base de teste, seja qual for o ambiente. Um
+  `COGNO_PG_DSN` REMOTO não é adoptado: `engram_test` na instância gerida de alguém não é nossa
+  para criar, quanto mais para largar.
+
+- **A guarda passou a inspeccionar o DSN RESOLVIDO, não a variável crua.** Tem de olhar para a
+  mesma string que os fixtures vão abrir, ou as duas divergem e só uma é verificada. É também a
+  segunda rede sob o parágrafo acima: um erro em `_for_test_database` não destrói nada, porque
+  o `pytest_collection_modifyitems` volta a recusar o nome.
+
+- **`test_it_refuses_during_COLLECTION_and_not_once_a_test_is_running`** — `--collect-only` não
+  abre ligação nenhuma, portanto se o aborto na mesma dispara, disparou primeiro. A distinção é
+  a guarda inteira (uma verificação dentro de um fixture já deixou o `pytest` chegar ao ponto em
+  que a instrução seguinte é `DROP TABLE`) e era invisível a qualquer asserção que só olhasse o
+  código de saída de uma corrida completa.
+
+- **O teste de convenção deixou de poder passar em vazio.** Ele varre os módulos que leem o DSN;
+  como esses deixaram de nomear a variável directamente, o termo de busca é o que pode
+  envelhecer em silêncio — agora afirma também que a varredura ainda os encontra (≥5).
+
 ### Fixed
+
+- **`README.md` ensinava `ENGRAM_TEST_DSN=…@localhost:55432/postgres`** — uma base que existe em
+  TODOS os servidores, produção incluída, e que a própria guarda recusa. O comando documentado
+  abortava. Agora não há DSN para escrever: `-e POSTGRES_DB=engram_test` no contentor e `pytest`.
 
 - **Um módulo diferente abortava o schema tal como uma tabela plana.** O conserto anterior
   perguntava se a tabela estava particionada; `relkind` diz PARTICIONADA, **não com quê**. Medido

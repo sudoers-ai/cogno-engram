@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+### Fixed
+
+- **`ensure_schema` dizia-se idempotente e não era, contra uma base criada PLANA.**
+  `CREATE TABLE IF NOT EXISTS turns (...) PARTITION BY HASH (scope)` é um NO-OP quando a tabela
+  já existe — o Postgres não verifica que a definição bate — portanto uma base nascida sem
+  partições (host antigo, ou `partition_by_scope=False`) chegava ao laço de partições com uma
+  tabela plana, e o `PARTITION OF` levantava `InvalidObjectDefinition: "turns" is not
+  partitioned`.
+
+  Isso abortava a chamada INTEIRA, e o grafo de conhecimento é criado **onze instruções depois**.
+  Medido numa caixa real a 2026-08-25: `sessions`/`turns`/`memories`/`turn_traces` existiam e
+  `knowledge_edges` **não**, portanto o host corria sem grafo, o `/health` dizia `stale`, e a
+  única pista no log era um erro de particionamento. O remédio documentado
+  (`python -m cogno_host.migrate`, anunciado como idempotente) nunca podia consertá-lo, porque
+  era exactamente a chamada que morria.
+
+  **Particionamento é DÉBITO; as tabelas e colunas depois dele são CORRECÇÃO.** Uma optimização
+  não pode ser fatal a um passo de correcção atrás dela. Agora a tabela é perguntada antes: se
+  existir não-particionada, sai um `ERROR` que nomeia a tabela e o remédio
+  (`event=partitioning_skipped`), salta as partições DESSA tabela e continua. Converter plana →
+  particionada mexe dados e é decisão do operador, nunca efeito colateral de pedir um schema.
+
+  Pinado nos dois sentidos: uma base plana recebe o resto do schema (e a tabela fica plana — o
+  salto não converte), e uma base particionada continua a receber as suas partições.
+
 ### Added
 
 - **`audience` na ARESTA: o tenant vê tudo, um identity só a sua vida.** Decisão de produto de

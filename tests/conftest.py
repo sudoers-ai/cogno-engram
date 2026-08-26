@@ -47,7 +47,7 @@ def names_a_test_database(dsn: str) -> bool:
 #
 # The database name is the part that is never carried across: `_for_test_database`
 # OVERWRITES it. Handing this function the exact DSN that caused the outage returns the
-# disposable one — which is the property `test_default_dsn.py` pins, in both directions.
+# disposable one — which is the property `tests/test_db_guard.py` pins, in both directions.
 _TEST_DATABASE = "engram_test"
 
 # Only a LOCAL server is adopted implicitly. A `COGNO_PG_DSN` pointing at a managed cloud

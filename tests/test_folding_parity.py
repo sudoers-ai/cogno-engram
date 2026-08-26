@@ -21,7 +21,9 @@ psycopg = pytest.importorskip("psycopg")
 from cogno_engram.adapters.postgres import ensure_schema         # noqa: E402
 from cogno_engram.folding import fold_label                      # noqa: E402
 
-DSN = os.environ.get("ENGRAM_TEST_DSN", "")
+from conftest import resolve_test_dsn  # noqa: E402 — the sibling conftest, on pytest's path
+
+DSN = resolve_test_dsn()      # ENGRAM_TEST_DSN, else `engram_test` on the local server
 
 #: O alfabeto que o acordo COBRE, dito em voz alta: Latin-1 Supplement + Latin Extended-A, onde
 #: vivem os nomes pt/es/en/de/fr/it. Fora dele os dois lados podem divergir (medido: sigma final

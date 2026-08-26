@@ -20,7 +20,9 @@ from cogno_engram.adapters.postgres import (          # noqa: E402
     ensure_schema,
 )
 
-DSN = os.environ.get("ENGRAM_TEST_DSN", "")
+from conftest import resolve_test_dsn  # noqa: E402 — the sibling conftest, on pytest's path
+
+DSN = resolve_test_dsn()      # ENGRAM_TEST_DSN, else `engram_test` on the local server
 
 
 async def _pg_graph():

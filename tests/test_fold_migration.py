@@ -8,7 +8,6 @@ deste ficheiro conta arestas antes e depois.
 
 from __future__ import annotations
 
-import os
 
 import pytest
 
@@ -20,7 +19,9 @@ from cogno_engram.fold_migration import (                                      #
     merge_fold_collisions,
 )
 
-DSN = os.environ.get("ENGRAM_TEST_DSN", "")
+from conftest import resolve_test_dsn  # noqa: E402 — the sibling conftest, on pytest's path
+
+DSN = resolve_test_dsn()      # ENGRAM_TEST_DSN, else `engram_test` on the local server
 
 
 async def _seed_colliding_base(*, extra_edges=()):

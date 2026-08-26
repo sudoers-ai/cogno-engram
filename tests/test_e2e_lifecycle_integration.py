@@ -27,7 +27,9 @@ from cogno_engram.adapters.postgres import (  # noqa: E402
 from cogno_engram.adapters.redis_buffer import RedisConversationBuffer  # noqa: E402
 from cogno_engram.types import AUDIENCE_STAFF, RetrievalQuery, TurnRecord  # noqa: E402
 
-DSN = os.getenv("ENGRAM_TEST_DSN", "")
+from conftest import resolve_test_dsn  # noqa: E402 — the sibling conftest, on pytest's path
+
+DSN = resolve_test_dsn()      # ENGRAM_TEST_DSN, else `engram_test` on the local server
 REDIS_URL = os.getenv("ENGRAM_TEST_REDIS_URL", "")
 EMB_DIM = 8
 

@@ -1180,3 +1180,74 @@ async def test_the_POSTGRES_reads_do_not_leak_one_contact_to_another(graph):
     assert "Maria" in repr(await graph.walk(scope, "Ana", audience=A, max_depth=2))
     for who in (A, B):
         assert "ACCEPTS" in repr(await graph.walk(scope, "Clinica", audience=who, max_depth=2))
+
+
+async def test_a_FLAT_legacy_table_does_not_abort_the_rest_of_the_schema():
+    """One legacy shape must not cost every statement written after it.
+
+    `CREATE TABLE IF NOT EXISTS turns (...) PARTITION BY HASH (scope)` is a NO-OP when `turns`
+    already exists — Postgres does not check the definition matches — so a database created flat
+    (an older host, or a run with `partition_by_scope=False`) reaches the partition loop with a
+    plain table, and `PARTITION OF` raises `InvalidObjectDefinition: "turns" is not partitioned`.
+
+    That used to abort the WHOLE call, and the knowledge graph is created ELEVEN statements
+    later. Measured on a real box 2026-08-26: `sessions`/`turns`/`memories`/`turn_traces` existed
+    and `knowledge_edges` did NOT, so the host ran with no graph, `/health` said `stale`, and the
+    only clue in the log was a Postgres error about partitioning. The documented remedy
+    (`python -m cogno_host.migrate`, advertised as idempotent) could never fix it, because it is
+    the very call that died.
+
+    Partitioning is THROUGHPUT; the tables and columns after it are CORRECTNESS.
+    """
+    if not await _pg_available():
+        pytest.skip("set ENGRAM_TEST_DSN to run")
+    conn = await _connect()
+    try:
+        for tbl in ("knowledge_edges", "knowledge_nodes", "turn_traces", "memories",
+                    "turns", "sessions"):
+            await conn.execute(f"DROP TABLE IF EXISTS {tbl} CASCADE")
+        # The box's history: born FLAT.
+        await ensure_schema(conn, embedding_dim=EMB_DIM, partition_by_scope=False)
+        kind = await (await conn.execute(
+            "SELECT relkind FROM pg_class WHERE relname = 'turns' "
+            "AND relnamespace = 'public'::regnamespace")).fetchone()
+        assert kind[0] == "r", "fixture is wrong: `turns` must start UNPARTITIONED"
+        await conn.execute("DROP TABLE knowledge_edges CASCADE")   # the statement after the loop
+
+        # Now the run a deployer makes: partitioned. It must not die on the legacy shape.
+        await ensure_schema(conn, embedding_dim=EMB_DIM, partition_by_scope=True, partitions=4)
+
+        got = await (await conn.execute(
+            "SELECT count(*) FROM information_schema.tables "
+            "WHERE table_name = 'knowledge_edges'")).fetchone()
+        assert got[0] == 1, "the schema after the partition loop was never created"
+        # …and `turns` is untouched: skipping is not converting. Moving the data is the
+        # operator's call, never a side effect of asking for a schema.
+        kind = await (await conn.execute(
+            "SELECT relkind FROM pg_class WHERE relname = 'turns' "
+            "AND relnamespace = 'public'::regnamespace")).fetchone()
+        assert kind[0] == "r"
+    finally:
+        await conn.close()
+
+
+async def test_a_PARTITIONED_table_still_gets_its_partitions():
+    """The other half: the skip must be about the legacy shape, not about giving up on
+    partitioning. Without this, deleting the whole loop passes the test above."""
+    if not await _pg_available():
+        pytest.skip("set ENGRAM_TEST_DSN to run")
+    conn = await _connect()
+    try:
+        for tbl in ("knowledge_edges", "knowledge_nodes", "turn_traces", "memories",
+                    "turns", "sessions"):
+            await conn.execute(f"DROP TABLE IF EXISTS {tbl} CASCADE")
+        await ensure_schema(conn, embedding_dim=EMB_DIM, partition_by_scope=True, partitions=4)
+        got = await (await conn.execute(
+            # `relkind='r'` matters: without it this counts the partitions' INDEXES too and
+            # answers 21 for four partitions — a number that looks like a bug in the code
+            # instead of one in the question.
+            "SELECT count(*) FROM pg_class WHERE relname LIKE 'turns\\_p%' "
+            "AND relkind = 'r' AND relnamespace = 'public'::regnamespace")).fetchone()
+        assert got[0] == 4, f"expected 4 partitions of `turns`, found {got[0]}"
+    finally:
+        await conn.close()

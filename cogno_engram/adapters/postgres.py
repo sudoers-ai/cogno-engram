@@ -169,10 +169,12 @@ async def _partition_existing_table(conn, tbl: str, partitions: int) -> None:
     # How many children it HAS, against how many we were asked for. Counting `pg_inherits` says
     # nothing about the strategy, which is the point: a table with N children when the caller
     # wants M is a real divergence whatever the strategy is, and the numbers belong in the log.
-    row = await (await conn.execute(
-        "SELECT count(*) FROM pg_inherits WHERE inhparent = to_regclass(%s)",
-        (tbl,))).fetchone()
-    existing = int(list(row.values())[0] if isinstance(row, dict) else row[0]) if row else 0
+    # One row per child and COUNT THE ROWS — not `count(*)` read out of the row, which is the
+    # row-factory sniff the rule above forbids and which this function had, twenty-six lines
+    # below the rule, until the review put them side by side. A rule that the code beneath it
+    # breaks is worse than no rule: the next reader trusts it.
+    existing = len(await (await conn.execute(
+        "SELECT 1 FROM pg_inherits WHERE inhparent = to_regclass(%s)", (tbl,))).fetchall())
     if existing and existing != partitions:
         logger.error("stage=schema event=partitioning_skipped table=%s "
                      "reason=exists_with_%d_partitions requested=%d remedy=%s",

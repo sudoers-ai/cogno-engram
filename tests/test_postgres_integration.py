@@ -19,6 +19,7 @@ that a real 768-dimension embedder cannot write to. The example below used to sa
 
 from __future__ import annotations
 
+import logging
 import os
 from uuid import uuid4
 
@@ -28,6 +29,7 @@ psycopg = pytest.importorskip("psycopg")
 from psycopg.rows import dict_row  # noqa: E402
 
 from cogno_engram.adapters.postgres import (  # noqa: E402
+    _partition_existing_table,
     PostgresKnowledgeGraph,
     PostgresStore,
     ensure_schema,
@@ -1364,7 +1366,13 @@ async def test_a_DIFFERENT_modulus_does_not_abort_the_rest_of_the_schema(caplog)
         got = await (await conn.execute(
             "SELECT count(*) FROM pg_inherits WHERE inhparent = to_regclass('turns')")).fetchone()
         assert got[0] == 4, "the existing partitioning was changed — skipping must not convert"
-        skipped = [r.getMessage() for r in caplog.records if "partitioning_skipped" in r.getMessage()]
+        # `caplog.at_level("DEBUG")` captura TUDO, portanto filtrar pela mensagem não diz nada
+        # sobre o nível: `logger.error -> logger.debug` sobrevivia. O nível É o contrato aqui —
+        # uma partição saltada é divergência real, e o operador encontra-a a grepar erros.
+        records = [r for r in caplog.records if "partitioning_skipped" in r.getMessage()]
+        assert records and all(r.levelno == logging.ERROR for r in records), (
+            f"skips must be ERROR; got {[(r.levelname, r.getMessage()[:40]) for r in records]}")
+        skipped = [r.getMessage() for r in records]
         # ONE line per table, carrying the PRECISE reason. Dropping the early return still
         # completes the schema — the defensive DDL below catches the overlap — so without this
         # the return reads as dead code. It is not: falling through runs eight statements that
@@ -1418,9 +1426,81 @@ async def test_an_UNASKABLE_shape_is_caught_by_the_DDL_itself(caplog):
             "SELECT count(*) FROM information_schema.tables "
             "WHERE table_name = 'knowledge_edges'")).fetchone()
         assert got[0] == 1, "a LIST-partitioned legacy table still aborted the schema"
-        caught = [r.getMessage() for r in caplog.records
-                  if "partitioning_skipped" in r.getMessage() and "turn_traces" in r.getMessage()]
-        assert any("reason=incompatible_shape" in m for m in caught), (
-            f"the DDL's own refusal must be downgraded to the same event; got {caught}")
+        recs = [r for r in caplog.records
+                if "partitioning_skipped" in r.getMessage() and "turn_traces" in r.getMessage()]
+        # UMA linha, e a ERROR. Sem o `len == 1`, trocar o `return` do `except` por `pass`
+        # sobrevive: as oito instruções seguintes falham todas e logam oito vezes a mesma coisa,
+        # e um `any(...)` fica contente com isso.
+        assert len(recs) == 1, f"expected ONE skip line for `turn_traces`, got {len(recs)}"
+        assert recs[0].levelno == logging.ERROR, f"got {recs[0].levelname}"
+        assert "reason=incompatible_shape" in recs[0].getMessage(), (
+            f"the DDL's own refusal must be downgraded to the same event; got {recs[0].getMessage()}")
     finally:
         await conn.close()
+
+class _NetProbe:
+    """A connection just real enough to drive `_partition_existing_table`'s two probes and then
+    fail the `PARTITION OF` with whatever error the test names."""
+
+    def __init__(self, boom: BaseException, *, children: int = 2) -> None:
+        self._boom, self._children, self.attempts = boom, children, 0
+
+    async def execute(self, sql, params=None):          # noqa: ANN001 — a stand-in, not a port
+        outer = self
+
+        class _Cur:
+            async def fetchone(self):
+                return None if "relkind <> 'p'" in sql else (1,)
+
+            async def fetchall(self):
+                return [(1,)] * outer._children
+
+        if "PARTITION OF" in sql:
+            outer.attempts += 1
+            raise outer._boom
+        return _Cur()
+
+    def transaction(self):
+        class _Tx:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *exc):
+                return False
+        return _Tx()
+
+
+@pytest.mark.parametrize("exc, swallowed", [
+    (psycopg.errors.InvalidObjectDefinition("would overlap"), True),
+    (psycopg.errors.InvalidTableDefinition("wrong strategy"), True),
+    (psycopg.errors.InsufficientPrivilege("permission denied"), False),
+    (psycopg.errors.DiskFull("no space left"), False),
+    (RuntimeError("a real bug"), False),
+])
+async def test_the_net_catches_legacy_shapes_and_NOTHING_else(exc, swallowed, caplog):
+    """The net must stay narrow, and only a test of the net itself can say so.
+
+    `InvalidObjectDefinition` and `InvalidTableDefinition` mean "this table has a history". A
+    permission error, a full disk or a genuine bug are not that, and swallowing them turns a
+    schema call into a best-effort no-op that reports success over a database it never fixed.
+
+    Driven through a stand-in rather than a restricted Postgres role, because that recipe cannot
+    reach the loop: measured, `CREATE TABLE IF NOT EXISTS sessions` — well before the partitions
+    — already needs CREATE on the schema, so a restricted role dies there. The first version of
+    this test was written that way and passed while proving nothing: `pytest.raises` was
+    satisfied by a LATER statement, and widening the `except` to `Exception` left it green.
+    """
+    caplog.set_level("DEBUG", logger="cogno_engram.postgres")
+    conn = _NetProbe(exc)
+    if swallowed:
+        await _partition_existing_table(conn, "turns", 2)
+        assert conn.attempts == 1, "the loop must stop at the refused statement, not retry it"
+        msgs = [r.getMessage() for r in caplog.records if "partitioning_skipped" in r.getMessage()]
+        assert len(msgs) == 1 and "reason=incompatible_shape" in msgs[0]
+        assert all(r.levelno == logging.ERROR for r in caplog.records
+                   if "partitioning_skipped" in r.getMessage())
+    else:
+        with pytest.raises(type(exc)):
+            await _partition_existing_table(conn, "turns", 2)
+        assert not [r for r in caplog.records if "partitioning_skipped" in r.getMessage()], (
+            "a non-legacy failure was reported as a legacy shape — the net is too wide")

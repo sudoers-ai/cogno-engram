@@ -281,3 +281,113 @@ async def test_a_CHANGED_fold_rule_rebuilds_the_index_that_stores_it(monkeypatch
 # à suíte. O estreitamento continua certo — o erro de colisão manda o operador FUNDIR NÓS, que é
 # destrutivo, e rotular qualquer falha assim mandava-o destruir dados para resolver outra coisa —
 # mas quem o remover não é apanhado aqui. Registado em vez de disfarçado.
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("erro,rotula_como_colisao", [
+    ("UniqueViolation", True),
+    ("InsufficientPrivilege", False),
+    ("LockNotAvailable", False),
+])
+async def test_only_a_UNIQUE_violation_is_reported_as_a_label_collision(erro, rotula_como_colisao):
+    """O erro de colisão manda o operador FUNDIR NÓS — destrutivo. Rotular qualquer falha assim
+    manda-o destruir dados para resolver outra coisa.
+
+    **Eu tinha declarado esta propriedade como não-testável e estava ERRADO.** Escrevi que as
+    falhas não-`UniqueViolation` do `CREATE INDEX` eram inalcançáveis, depois de tentar três vias
+    que de facto não chegam lá (função com volatilidade errada — o `ensure_schema` repara antes;
+    nome ocupado — `IF NOT EXISTS` engole; ICU em falta — falha um passo acima). A revisão
+    encontrou a quarta: privilégios. Uma falta de privilégio no próprio `CREATE INDEX` propaga.
+    Registar a lacuna foi certo; concluir que era intransponível foi cedo demais.
+
+    O erro é INJECTADO na declaração exacta, através de um espião que delega tudo o resto — assim
+    o que corre é o `except` verdadeiro do `ensure_schema`, não uma imitação dele."""
+    if not DSN:
+        pytest.skip("set ENGRAM_TEST_DSN to run")
+    import contextlib
+
+    classe = getattr(psycopg.errors, erro)
+
+    class _Espiao:
+        """Delega tudo; levanta na declaração do índice do fold."""
+
+        def __init__(self, conn):
+            self._conn = conn
+
+        def __getattr__(self, nome):
+            return getattr(self._conn, nome)
+
+        async def execute(self, sql, params=None, *a, **kw):
+            if isinstance(sql, str) and "uq_nodes_scope_fold_type" in sql and "CREATE" in sql:
+                raise classe(f"injectado: {erro}")
+            return await self._conn.execute(sql, params, *a, **kw)
+
+    conn = await psycopg.AsyncConnection.connect(DSN, autocommit=True)
+    await ensure_schema(conn, embedding_dim=8)
+    escopo = f"inj/{os.urandom(4).hex()}"
+    await conn.execute("DROP INDEX IF EXISTS uq_nodes_scope_fold_type")
+    await conn.execute(
+        "INSERT INTO knowledge_nodes (scope, label, node_type) VALUES (%s,%s,%s), (%s,%s,%s)",
+        (escopo, "José", "PERSON", escopo, "Jose", "PERSON"))
+
+    with pytest.raises(Exception) as caiu:            # noqa: B017 — a MENSAGEM é o teste
+        await ensure_schema(_Espiao(conn), embedding_dim=8)
+
+    await conn.execute("DELETE FROM knowledge_nodes WHERE scope = %s", (escopo,))
+    with contextlib.suppress(Exception):
+        await ensure_schema(conn, embedding_dim=8)
+    await conn.close()
+
+    msg = str(caiu.value)
+    if rotula_como_colisao:
+        assert "ignorar acentos" in msg and "José" in msg, (
+            f"uma violação de unicidade É colisão e tinha de nomear os rótulos:\n{msg}")
+    else:
+        assert "ignorar acentos" not in msg and "À MÃO" not in msg, (
+            f"{erro} não é colisão — o operador seria mandado FUNDIR NÓS, que é destrutivo, "
+            f"para resolver outra coisa:\n{msg}")
+        assert erro.lower()[:8] in msg.lower() or "injectado" in msg, (
+            f"o erro real tem de sobreviver, não ser substituído:\n{msg}")
+
+
+@pytest.mark.asyncio
+async def test_the_diagnostic_names_the_labels_on_a_NON_autocommit_connection_too():
+    """`ensure_schema` é API pública e recebe as duas espécies de conexão.
+
+    Sem autocommit, o `CREATE INDEX` que falha ENVENENA a transacção: toda consulta seguinte dá
+    `InFailedSqlTransaction`, o diagnóstico degradava para lista vazia, e o operador recebia
+    exactamente a chave dobrada (`Key (scope, engram_fold(label), node_type)=(t, jose, PERSON)`)
+    que este módulo diz que ele não precisa. A mensagem era honesta — dizia "não consegui
+    listá-los" — e inútil.
+
+    Também com `dict_row`, que é o que o adaptador usa: as duas condições juntas são as do caminho
+    real."""
+    if not DSN:
+        pytest.skip("set ENGRAM_TEST_DSN to run")
+    from psycopg.rows import dict_row
+
+    prep = await psycopg.AsyncConnection.connect(DSN, autocommit=True)
+    await ensure_schema(prep, embedding_dim=8)
+    escopo = f"tx/{os.urandom(4).hex()}"
+    await prep.execute("DROP INDEX IF EXISTS uq_nodes_scope_fold_type")
+    await prep.execute(
+        "INSERT INTO knowledge_nodes (scope, label, node_type) VALUES (%s,%s,%s), (%s,%s,%s)",
+        (escopo, "José", "PERSON", escopo, "Jose", "PERSON"))
+    await prep.close()
+
+    conn = await psycopg.AsyncConnection.connect(DSN, row_factory=dict_row)   # SEM autocommit
+    with pytest.raises(RuntimeError) as caiu:
+        await ensure_schema(conn, embedding_dim=8)
+    await conn.rollback()
+    await conn.close()
+
+    limpa = await psycopg.AsyncConnection.connect(DSN, autocommit=True)
+    await limpa.execute("DELETE FROM knowledge_nodes WHERE scope = %s", (escopo,))
+    await ensure_schema(limpa, embedding_dim=8)
+    await limpa.close()
+
+    msg = str(caiu.value)
+    assert "José" in msg and "Jose" in msg, (
+        f"sob transacção envenenada o diagnóstico perdeu os rótulos e o operador fica com a "
+        f"chave dobrada:\n{msg}")
+    assert "Não consegui listá-los" not in msg, "degradou quando podia ter respondido"

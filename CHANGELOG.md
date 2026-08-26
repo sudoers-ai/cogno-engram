@@ -122,6 +122,26 @@ stops satisfying it under mypy/`isinstance` until it implements both.
 
 ### Fixed
 
+- **Duas regressões que a própria dobragem introduziu, achadas em revisão adversarial:**
+  - **O rótulo ACENTUADO perdia-se.** `ON CONFLICT` nunca escrevia `label`, portanto a primeira
+    grafia a chegar ficava para sempre — e como o argumento desta funcionalidade é que "o contacto
+    escreve o nome sem acento metade das vezes", a grafia SEM acento é a que chega primeiro com
+    mais frequência. O contrário exacto do que o módulo promete. Agora a grafia com diacríticos
+    SOBE e nunca desce (`folding.has_diacritics`, uma definição, os dois adaptadores).
+  - **`delete_node` apagava DOIS nós.** `José` como PERSON e `Jose` como CONCEPT coexistem
+    legalmente depois da migração, mas o comando recebe só um RÓTULO — e apagava ambos, com as
+    arestas de ambos atrás por `ON DELETE CASCADE`. O `cogno-ui` chama-o com um id que o host
+    converte em rótulo: o operador clicava num nó e perdia outro. `set_edge_status` e
+    `set_edge_audience` alargavam igual, e a segunda é um controlo de PRIVACIDADE. Os três passam
+    por `_one_node_id`: rótulo exacto ganha, ambíguo RECUSA. E `_resolve_node_id` (que cria a
+    ligação, não destrói) passa a preferir o exacto de forma determinística em vez de `LIMIT 1`
+    sem ordem.
+
+- **O diagnóstico de colisão funciona também sem autocommit.** `ensure_schema` é API pública e
+  recebe as duas espécies de conexão; sem autocommit o CREATE falhado envenenava a transacção, o
+  diagnóstico degradava para lista vazia, e o operador recebia a chave dobrada que este módulo diz
+  que ele não precisa. E deixou de truncar em silêncio aos 20 grupos.
+
 - **REQUISITOS NOVOS do adaptador Postgres, e são duros.** `ensure_schema` passa a exigir:
   - a extensão **`unaccent`** disponível e instalável no schema `public` (o `ensure_schema`
     corre o `CREATE EXTENSION`, mas o pacote `postgresql-contrib` tem de estar presente);

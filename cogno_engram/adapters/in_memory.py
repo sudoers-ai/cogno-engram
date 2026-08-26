@@ -19,7 +19,7 @@ from uuid import uuid4
 from dataclasses import replace
 
 
-from cogno_engram.folding import fold_label
+from cogno_engram.folding import fold_label, has_diacritics
 from cogno_engram.types import (
     AUDIENCE_STAFF,
     audience_can_read,
@@ -433,6 +433,12 @@ class InMemoryGraph:
         existing = self._nodes.get(key)
         now = datetime.now(timezone.utc)
         if existing is not None:
+            # A grafia com DIACRÍTICOS sobe, nunca desce — paridade com o `ON CONFLICT` do
+            # Postgres. Sem isto o primeiro a chegar ficava para sempre, e como o contacto
+            # escreve o nome sem acento metade das vezes, `Jose` chegava primeiro e a linha
+            # nunca mais voltava a ser `José`: o contrário do que o `folding` promete.
+            if has_diacritics(node.label) and not has_diacritics(existing.label):
+                existing.label = node.label
             existing.attributes.update(node.attributes)
             if node.embedding is not None:
                 existing.embedding = node.embedding

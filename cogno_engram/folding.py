@@ -76,7 +76,18 @@ def fold_label(label: str) -> str:
     return "".join(_TRANSLIT.get(c, c) for c in sem_marcas)
 
 
-#: O SQL equivalente, e a razão de ser uma FUNÇÃO na base em vez de uma expressão inline.
+def has_diacritics(label: str) -> bool:
+    """O rótulo carrega informação que a dobragem apaga? (acento, cedilha, ligadura, `ł`…)
+
+    É o que decide qual grafia SOBE quando duas colidem: `José` carrega, `Jose` não. Existe
+    como função porque a primeira tentativa escreveu o predicado à mão e escreveu-o ERRADO —
+    `fold_label(x) == x` parece dizer "não tem acento" e diz outra coisa, porque `fold_label`
+    também baixa a caixa: `'Jose'` falhava o teste por causa do J maiúsculo. A comparação certa
+    é contra o próprio `casefold`, que isola a diferença que interessa."""
+    return fold_label(label) != label.casefold()
+
+
+#: O SQL equivalente do `fold_label`, e a razão de ser uma FUNÇÃO na base em vez de uma expressão inline.
 #:
 #: O `unaccent` é declarado STABLE, não IMMUTABLE — porque depende de um dicionário que o
 #: administrador pode trocar — e o Postgres RECUSA uma função STABLE dentro de um índice. A forma
@@ -91,3 +102,7 @@ CREATE OR REPLACE FUNCTION engram_fold(text) RETURNS text
     LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS
 $$ SELECT public.unaccent('public.unaccent', lower($1 COLLATE "und-x-icu")) $$
 """
+
+
+#: O SQL equivalente de :func:`has_diacritics` — a mesma pergunta, do lado do banco.
+HAS_DIACRITICS_SQL = 'engram_fold({col}) <> lower({col} COLLATE "und-x-icu")'

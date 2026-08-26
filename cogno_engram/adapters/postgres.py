@@ -424,6 +424,12 @@ async def _reconstroi_indice_se_o_fold_mudou(conn, antes: "str | None") -> None:
     (`find_node` não acha um nó que existe) a voltar através do TEMPO, e nenhum teste de base nova
     o apanha porque ali a função e o índice nascem juntos.
 
+    CEITO CONHECIDO: `CREATE OR REPLACE FUNCTION` não pode mudar o NOME de um parâmetro. Uma
+    versão futura que nomeie o argumento (`engram_fold(rotulo text)`) dá `InvalidFunctionDefinition`
+    na própria criação — um passo ACIMA deste, fora do `except` da colisão — e aborta o schema com
+    o erro do Postgres. É recuperável (`DROP FUNCTION` primeiro), mas quem mexer no
+    `FOLD_FUNCTION_SQL` tem de saber.
+
     Só corre quando a definição MUDOU — num deploy normal `CREATE OR REPLACE` reinstala texto
     idêntico e isto é um no-op. Quando corre, `REINDEX` toma `ACCESS EXCLUSIVE` na tabela: é o
     preço de uma regra de identidade nova, e acontece uma vez por mudança dela, não por deploy.
@@ -456,18 +462,33 @@ async def _rotulos_em_conflito(conn) -> "list[str]":
     maneira, portanto qualquer erro AQUI degrada para lista vazia — o erro original propaga na
     mesma."""
     try:
+        # ROLLBACK primeiro, e é o que faz esta função servir de todo: numa conexão SEM
+        # autocommit — e `ensure_schema` é API pública, portanto recebe as duas — o CREATE que
+        # acabou de falhar ENVENENOU a transacção, e toda consulta seguinte dá
+        # `InFailedSqlTransaction`. O diagnóstico degradava para `[]` e o operador recebia
+        # exactamente a chave dobrada que este módulo diz que ele não precisa. Em autocommit o
+        # ROLLBACK é um no-op inofensivo.
+        try:
+            await conn.rollback()
+        except Exception:                            # noqa: BLE001 — autocommit, ou já limpa
+            pass
         cur = await conn.execute(
             "SELECT scope, node_type, string_agg(label, %s ORDER BY label) AS rotulos "
             "FROM knowledge_nodes GROUP BY scope, node_type, engram_fold(label) "
-            "HAVING count(*) > 1 LIMIT 20", (" + ",))
+            "HAVING count(*) > 1 LIMIT 21", (" + ",))
         # nomeadas, não posicionais: esta conexão pode vir com `dict_row` (o adaptador usa-o) e
         # aí `r[0]` levanta `KeyError`. O diagnóstico morreria exactamente no caso em que faz
         # falta — a migração já falhou e é isto que diz ao operador o que fazer.
         linhas = await cur.fetchall()
         def _campo(r, i, nome):
             return r[nome] if isinstance(r, dict) else r[i]
-        return [f"{_campo(r, 0, 'scope')} / {_campo(r, 1, 'node_type')}: {_campo(r, 2, 'rotulos')}"
-                for r in linhas]
+        fora = [f"{_campo(r, 0, 'scope')} / {_campo(r, 1, 'node_type')}: {_campo(r, 2, 'rotulos')}"
+                for r in linhas[:20]]
+        if len(linhas) > 20:
+            # truncar em silêncio manda o operador fundir 20, correr outra vez e falhar outra vez
+            fora.append("… e MAIS grupos além destes 20 — corra o relatório completo com "
+                        "`cogno_engram.fold_migration.fold_collisions()`")
+        return fora
     except Exception:                                # noqa: BLE001
         return []
 
@@ -1000,6 +1021,19 @@ class PostgresKnowledgeGraph(_PgBase):
                 """INSERT INTO knowledge_nodes (scope, label, node_type, attributes, embedding)
                    VALUES (%s, %s, %s, %s::jsonb, %s::vector)
                    ON CONFLICT (scope, engram_fold(label), node_type) DO UPDATE SET
+                       -- A grafia com DIACRÍTICOS ganha, e só sobe, nunca desce. Sem isto o
+                       -- primeiro a chegar ficava para sempre — e como o contacto escreve o nome
+                       -- sem acento metade das vezes, "Jose" chegava primeiro e a linha nunca mais
+                       -- voltava a ser "José". Era o contrário exacto do que o `folding` promete:
+                       -- o rótulo original é o que se guarda e se mostra; perder o acento no nome
+                       -- de uma pessoa é o que esta funcionalidade existe para EVITAR.
+                       -- Determinístico e sem oscilar: uma vez acentuado, fica.
+                       label      = CASE
+                           WHEN engram_fold(EXCLUDED.label)
+                                  <> lower(EXCLUDED.label COLLATE "und-x-icu")
+                            AND engram_fold(knowledge_nodes.label)
+                                  =  lower(knowledge_nodes.label COLLATE "und-x-icu")
+                           THEN EXCLUDED.label ELSE knowledge_nodes.label END,
                        attributes = knowledge_nodes.attributes || EXCLUDED.attributes,
                        embedding  = COALESCE(EXCLUDED.embedding, knowledge_nodes.embedding),
                        updated_at = now()
@@ -1010,9 +1044,19 @@ class PostgresKnowledgeGraph(_PgBase):
         return row["id"]
 
     async def _resolve_node_id(self, conn, scope: str, label: str) -> int:
+        """O id do nó a que uma aresta se liga — criando-o se não existir.
+
+        `ORDER BY (label = %s) DESC` e não `LIMIT 1` cru: a dobragem faz `José/PERSON` e
+        `Jose/CONCEPT` casarem os dois, e um `LIMIT 1` sem ordem escolhia à SORTE — duas arestas
+        pedidas para nós diferentes acabavam no mesmo, e qual delas ganhava dependia da ordem
+        física das linhas. Preferir o rótulo exacto é determinístico e é o que quem chama quis
+        dizer. Diferente do `_one_node_id`, que RECUSA quando é ambíguo: aqui a operação é criar
+        uma ligação, não destruir nem mudar privacidade, portanto escolher o melhor palpite é
+        preferível a falhar o turno."""
         cur = await conn.execute(
-            "SELECT id FROM knowledge_nodes WHERE scope = %s AND engram_fold(label) = engram_fold(%s) LIMIT 1",
-            (scope, label))
+            "SELECT id FROM knowledge_nodes WHERE scope = %s AND engram_fold(label) = engram_fold(%s) "
+            " ORDER BY (label = %s) DESC, id LIMIT 1",
+            (scope, label, label))
         row = await cur.fetchone()
         if row:
             return row["id"]
@@ -1177,13 +1221,18 @@ class PostgresKnowledgeGraph(_PgBase):
                               status: str) -> bool:
         _require_scope(scope)
         async with self._conn() as conn:
+            # por ID, não por rótulo dobrado: dois nós que dobram igual mas têm `node_type`
+            # diferente coexistem legalmente, e um UPDATE por rótulo atingia os DOIS. No
+            # `set_edge_audience` isso é uma mudança de PRIVACIDADE numa aresta que ninguém
+            # escolheu.
+            src = await self._one_node_id(conn, scope, source, para="set_edge_status")
+            tgt = await self._one_node_id(conn, scope, target, para="set_edge_status")
+            if src is None or tgt is None:
+                return False
             cur = await conn.execute(
-                """UPDATE knowledge_edges e SET status = %s
-                   FROM knowledge_nodes sn, knowledge_nodes tn
-                   WHERE e.source_id = sn.id AND e.target_id = tn.id
-                     AND e.scope = %s AND engram_fold(sn.label) = engram_fold(%s)
-                     AND engram_fold(tn.label) = engram_fold(%s) AND e.relation = %s""",
-                (require_edge_status(status), scope, source, target, relation))
+                "UPDATE knowledge_edges SET status = %s "
+                " WHERE scope = %s AND source_id = %s AND target_id = %s AND relation = %s",
+                (require_edge_status(status), scope, src, tgt, relation))
         return bool(cur.rowcount)
 
     async def set_edge_audience(self, scope: str, source: str, target: str, relation: str,
@@ -1191,13 +1240,18 @@ class PostgresKnowledgeGraph(_PgBase):
         """Explicit re-classification — the only way back from a migration."""
         _require_scope(scope)
         async with self._conn() as conn:
+            # por ID, não por rótulo dobrado: dois nós que dobram igual mas têm `node_type`
+            # diferente coexistem legalmente, e um UPDATE por rótulo atingia os DOIS. No
+            # `set_edge_audience` isso é uma mudança de PRIVACIDADE numa aresta que ninguém
+            # escolheu.
+            src = await self._one_node_id(conn, scope, source, para="set_edge_audience")
+            tgt = await self._one_node_id(conn, scope, target, para="set_edge_audience")
+            if src is None or tgt is None:
+                return False
             cur = await conn.execute(
-                """UPDATE knowledge_edges e SET audience = %s
-                   FROM knowledge_nodes sn, knowledge_nodes tn
-                   WHERE e.source_id = sn.id AND e.target_id = tn.id
-                     AND e.scope = %s AND engram_fold(sn.label) = engram_fold(%s)
-                     AND engram_fold(tn.label) = engram_fold(%s) AND e.relation = %s""",
-                (sanitize_audience(audience), scope, source, target, relation))
+                "UPDATE knowledge_edges SET audience = %s "
+                " WHERE scope = %s AND source_id = %s AND target_id = %s AND relation = %s",
+                (sanitize_audience(audience), scope, src, tgt, relation))
         return bool(cur.rowcount)
 
     async def neighbors(self, scope: str, label: str, *, audience: str) -> list[GraphNode]:
@@ -1317,11 +1371,51 @@ class PostgresKnowledgeGraph(_PgBase):
                 (scope, label))
             return await cur.fetchone() is not None
 
+    @staticmethod
+    async def _one_node_id(conn, scope: str, label: str, *, para: str) -> "int | None":
+        """O id do ÚNICO nó que este rótulo designa — ou None quando é ambíguo.
+
+        A identidade dobrada ignora acento, mas o `node_type` NÃO faz parte do rótulo: `José`
+        como PERSON e `Jose` como CONCEPT coexistem legalmente depois da migração — a suíte de
+        integração descreve esse par como "exactamente como um tenant lá chega". Um comando por
+        rótulo dobrado atinge portanto os DOIS, e foi medido a atingir: `delete_node('José')`
+        apagava 2 linhas, com as arestas de ambas atrás por `ON DELETE CASCADE`.
+
+        Desempate: o rótulo EXACTO ganha. Sem exacto e com mais de um candidato, devolve None —
+        recusar é o que uma operação destrutiva ou de PRIVACIDADE tem de fazer, porque escolher
+        por quem chamou é escolher errado metade das vezes, em silêncio."""
+        cur = await conn.execute(
+            "SELECT id, label FROM knowledge_nodes "
+            " WHERE scope = %s AND engram_fold(label) = engram_fold(%s)", (scope, label))
+        linhas = await cur.fetchall()
+
+        def _campo(r, i, nome):
+            return r[nome] if isinstance(r, dict) else r[i]
+
+        if not linhas:
+            return None
+        if len(linhas) > 1:
+            exactos = [r for r in linhas if _campo(r, 1, "label") == label]
+            if len(exactos) != 1:
+                logger.warning(
+                    "event=node_reference_ambiguous op=%s scope=%s label=%s matches=%d "
+                    "reason=fold_matches_several_node_types", para, scope, label, len(linhas))
+                return None
+            linhas = exactos
+        return int(_campo(linhas[0], 0, "id"))
+
     async def delete_node(self, scope: str, label: str) -> bool:
+        """Apaga UM nó — nunca mais do que um, mesmo quando a dobragem casa com vários.
+
+        O `cogno-ui` chama isto com um id que o host converte em rótulo, portanto o operador
+        clicava num nó e perdia outro sem aviso. Ver `_one_node_id`."""
         _require_scope(scope)
         async with self._conn() as conn:
+            alvo = await self._one_node_id(conn, scope, label, para="delete_node")
+            if alvo is None:
+                return False
             cur = await conn.execute(
-                "DELETE FROM knowledge_nodes WHERE scope = %s AND engram_fold(label) = engram_fold(%s)", (scope, label))
+                "DELETE FROM knowledge_nodes WHERE id = %s", (alvo,))
             return cur.rowcount > 0   # edges cascade via FK ON DELETE CASCADE
 
     async def delete_edges_by_session(self, scope: str, session_id: str) -> int:

@@ -76,4 +76,20 @@ jobs:
         env:
           ENGRAM_TEST_DSN: postgresql://postgres:postgres@localhost:5432/engram_test
           ENGRAM_TEST_REDIS_URL: redis://localhost:6379/0
-        run: pytest tests/test_postgres_integration.py tests/test_redis_integration.py -q
+        # A suíte INTEIRA, não uma lista de ficheiros. A lista deixou `test_folding_parity.py`
+        # e `test_fold_migration.py` de fora — testes que existem, passam na máquina de quem os
+        # escreveu, e nunca correram aqui. Um ficheiro novo de integração escapava em silêncio;
+        # com a suíte toda, os que não precisam de DSN correm na mesma e os que precisam agora
+        # correm de facto.
+        run: pytest -q
+
+      - name: Integration tests under collation C
+        env:
+          ENGRAM_TEST_REDIS_URL: redis://localhost:6379/0
+        # O collation onde o defeito da identidade de nó vivia — `lower('JOSÉ')` = `'josÉ'`. O
+        # serviço acima corre `en_US.utf8`, onde o bug é INVISÍVEL: sem esta passagem, a
+        # regressão que este trabalho fechou volta sem ninguém ver.
+        run: |
+          PGPASSWORD=postgres psql -h localhost -U postgres -c \
+            "CREATE DATABASE engram_ctest TEMPLATE template0 LC_COLLATE 'C' LC_CTYPE 'C'"
+          ENGRAM_TEST_DSN=postgresql://postgres:postgres@localhost:5432/engram_ctest pytest -q

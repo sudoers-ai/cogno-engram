@@ -32,6 +32,7 @@ from uuid import uuid4
 import psycopg
 from psycopg.rows import dict_row
 
+from cogno_engram.folding import FOLD_FUNCTION_SQL, fold_label
 from cogno_engram.types import (
     AUDIENCE_STAFF,
     AUDIENCE_TENANT,
@@ -65,6 +66,9 @@ DEFAULT_TS_CONFIG = "portuguese"
 # allows a host's custom dictionary (e.g. ``my_schema.unaccent_pt``) while making
 # injection via the config impossible.
 _TS_CONFIG_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$")
+
+
+logger = logging.getLogger("cogno_engram.postgres")
 
 
 def _validate_ts_config(ts_config: str) -> str:
@@ -215,6 +219,12 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
     """
     ts_config = _validate_ts_config(ts_config)  # interpolated into the tsvector DDL
     await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+    # `unaccent` + o wrapper IMMUTABLE por baixo da identidade de nó: `José` e `Jose` são a mesma
+    # pessoa (decisão de produto). Tem de vir ANTES dos índices — a UNIQUE de nós usa a função.
+    await conn.execute("CREATE EXTENSION IF NOT EXISTS unaccent")
+    fold_before = await _installed_fold_definition(conn)
+    await conn.execute(FOLD_FUNCTION_SQL)
+    await _rebuild_index_if_fold_changed(conn, fold_before)
 
     # sessions / knowledge_* stay unpartitioned (low volume); turns/memories opt in.
     pk = "PRIMARY KEY (id, scope)" if partition_by_scope else "PRIMARY KEY (id)"
@@ -352,9 +362,24 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
 
     # ── indexes (see engram-blueprint indexing strategy) ──
     stmts = [
-        # Case-insensitive node identity (matches the in-memory adapter's dedup).
-        "CREATE UNIQUE INDEX IF NOT EXISTS uq_nodes_scope_label_type "
-        "ON knowledge_nodes (scope, lower(label), node_type)",
+        # Identidade de nó insensível a caixa E a acento — `engram_fold`, a mesma função que o
+        # adaptador in-memory corre em Python (`folding.fold_label`). Era `lower(label)`, que sob
+        # um cluster `LC_COLLATE 'C'` nem sequer dobra maiúsculas acentuadas: `lower('JOSÉ')` dá
+        # `'josÉ'` e o nó gravado como `josé` ficava inalcançável.
+        #
+        # NOME NOVO de propósito: `CREATE INDEX IF NOT EXISTS` com o nome antigo e definição nova
+        # é um no-op SILENCIOSO — a armadilha que o `idx_turns_scope_pattern` já documentou. E o
+        # CREATE vem antes do DROP: se o processo morrer entre os dois, fica-se com os dois
+        # índices (a identidade mais apertada já em vigor) e não sem nenhum.
+        #
+        # ATENÇÃO À MIGRAÇÃO: numa base que já tenha `José` e `Jose` como nós SEPARADOS, este
+        # CREATE FALHA com duplicate key — e é o comportamento correcto. Fundir nós de um grafo de
+        # conhecimento automaticamente perderia arestas de um deles sem ninguém ver; a colisão tem
+        # de ser resolvida por quem sabe qual dos dois é a pessoa. `python -m cogno_host.migrate`
+        # levanta com os rótulos em conflito nomeados.
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_nodes_scope_fold_type "
+        "ON knowledge_nodes (scope, engram_fold(label), node_type)",
+        "DROP INDEX IF EXISTS uq_nodes_scope_label_type",
         # The curation queue reads one status within one scope; the prompt walk reads the other.
         "CREATE INDEX IF NOT EXISTS idx_edges_scope_status ON knowledge_edges (scope, status)",
         "CREATE INDEX IF NOT EXISTS idx_sessions_scope_time ON sessions (scope, started_at DESC)",
@@ -448,7 +473,128 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
         "CREATE INDEX IF NOT EXISTS idx_edges_target ON knowledge_edges (target_id)",
     ]
     for stmt in stmts:
-        await conn.execute(stmt)
+        try:
+            await conn.execute(stmt)
+        except psycopg.errors.UniqueViolation as cause:
+            # SÓ violação de unicidade, e só neste índice. Um `except Exception` aqui rotulava
+            # QUALQUER falha do CREATE — falta de ICU, permissões, função em falta — como
+            # "colisão de rótulos", e mandava o operador fundir nós para resolver um problema que
+            # não era esse. Um diagnóstico errado custa mais do que nenhum.
+            if "uq_nodes_scope_fold_type" not in stmt:
+                raise
+            raise _label_collision_error(await _colliding_labels(conn), cause) from cause
+
+
+async def _installed_fold_definition(conn) -> "str | None":
+    """A definição de `engram_fold` que está INSTALADA, ou None se ainda não existe."""
+    try:
+        cur = await conn.execute(
+            "SELECT pg_get_functiondef(p.oid) FROM pg_proc p JOIN pg_namespace n "
+            "  ON n.oid = p.pronamespace "
+            " WHERE p.proname = 'engram_fold' AND p.pronargs = 1 LIMIT 1")
+        row = await cur.fetchone()
+    except Exception:                                # noqa: BLE001 — ausência não é erro
+        return None
+    if row is None:
+        return None
+    return row[0] if not isinstance(row, dict) else list(row.values())[0]
+
+
+async def _rebuild_index_if_fold_changed(conn, previous: "str | None") -> None:
+    """Se a regra de dobragem mudou, o índice que a GUARDA ficou a mentir — reconstrói.
+
+    `uq_nodes_scope_fold_type` é um índice de EXPRESSÃO: guarda o resultado de `engram_fold`, não
+    o rótulo. `CREATE OR REPLACE FUNCTION` troca a função e o Postgres **não reconstrói o índice
+    nem avisa** — as chaves velhas ficam lá. Medido: depois de mudar a função, uma busca por
+    índice devolve 0 e um seq scan sobre os mesmos dados devolve 1. É o defeito original
+    (`find_node` não acha um nó que existe) a voltar através do TEMPO, e nenhum teste de base nova
+    o apanha porque ali a função e o índice nascem juntos.
+
+    CEITO CONHECIDO: `CREATE OR REPLACE FUNCTION` não pode mudar o NOME de um parâmetro. Uma
+    versão futura que nomeie o argumento (`engram_fold(rotulo text)`) dá `InvalidFunctionDefinition`
+    na própria criação — um passo ACIMA deste, fora do `except` da colisão — e aborta o schema com
+    o erro do Postgres. É recuperável (`DROP FUNCTION` primeiro), mas quem mexer no
+    `FOLD_FUNCTION_SQL` tem de saber.
+
+    Só corre quando a definição MUDOU — num deploy normal `CREATE OR REPLACE` reinstala texto
+    idêntico e isto é um no-op. Quando corre, `REINDEX` toma `ACCESS EXCLUSIVE` na tabela: é o
+    preço de uma regra de identidade nova, e acontece uma vez por mudança dela, não por deploy.
+
+    Se a dobragem nova fizer colidir rótulos que antes eram distintos, o `REINDEX` FALHA — e é o
+    mesmo comportamento correcto da criação inicial, com o mesmo erro nomeado."""
+    if previous is None:
+        return                                       # instalação nova: nada a reconstruir
+    current = await _installed_fold_definition(conn)
+    if current is None or current == previous:
+        return
+    cur = await conn.execute(
+        "SELECT 1 FROM pg_class WHERE relname = 'uq_nodes_scope_fold_type' AND relkind = 'i'")
+    if await cur.fetchone() is None:
+        return                                       # o índice ainda não existe; nasce já certo
+    logger.warning(
+        "event=fold_index_rebuilt index=uq_nodes_scope_fold_type "
+        "reason=engram_fold_definition_changed")
+    try:
+        await conn.execute("REINDEX INDEX uq_nodes_scope_fold_type")
+    except psycopg.errors.UniqueViolation as cause:
+        raise _label_collision_error(await _colliding_labels(conn), cause) from cause
+
+async def _colliding_labels(conn) -> "list[str]":
+    """Os grupos de rótulos que a identidade nova funde — vazio se a leitura falhar.
+
+    O erro do Postgres nomeia a CHAVE dobrada (`Key (scope, engram_fold(label), node_type)=(t,
+    jose, PERSON) is duplicated`), que é precisamente o que o operador não precisa: ele quer saber
+    QUE nós tem de fundir. Um diagnóstico não pode ser o motivo de a migração falhar de outra
+    maneira, portanto qualquer erro AQUI degrada para lista vazia — o erro original propaga na
+    mesma."""
+    try:
+        # ROLLBACK primeiro, e é o que faz esta função servir de todo: numa conexão SEM
+        # autocommit — e `ensure_schema` é API pública, portanto recebe as duas — o CREATE que
+        # acabou de falhar ENVENENOU a transacção, e toda consulta seguinte dá
+        # `InFailedSqlTransaction`. O diagnóstico degradava para `[]` e o operador recebia
+        # exactamente a chave dobrada que este módulo diz que ele não precisa. Em autocommit o
+        # ROLLBACK é um no-op inofensivo.
+        try:
+            await conn.rollback()
+        except Exception:                            # noqa: BLE001 — autocommit, ou já limpa
+            pass
+        cur = await conn.execute(
+            "SELECT scope, node_type, string_agg(label, %s ORDER BY label) AS labels "
+            "FROM knowledge_nodes GROUP BY scope, node_type, engram_fold(label) "
+            "HAVING count(*) > 1 LIMIT 21", (" + ",))
+        # nomeadas, não posicionais: esta conexão pode vir com `dict_row` (o adaptador usa-o) e
+        # aí `r[0]` levanta `KeyError`. O diagnóstico morreria exactamente no caso em que faz
+        # falta — a migração já falhou e é isto que diz ao operador o que fazer.
+        rows = await cur.fetchall()
+        def _field(r, i, name):
+            return r[name] if isinstance(r, dict) else r[i]
+        out = [f"{_field(r, 0, 'scope')} / {_field(r, 1, 'node_type')}: {_field(r, 2, 'labels')}"
+                for r in rows[:20]]
+        if len(rows) > 20:
+            # truncar em silêncio manda o operador fundir 20, correr outra vez e falhar outra vez
+            out.append("… e MAIS grupos além destes 20 — corra o relatório completo com "
+                        "`cogno_engram.fold_migration.fold_collisions()`")
+        return out
+    except Exception:                                # noqa: BLE001
+        return []
+
+
+def _label_collision_error(groups: "list[str]", cause: Exception) -> RuntimeError:
+    """A identidade de nó passou a ignorar acentos e esta base tem nós que agora colidem.
+
+    Falhar é o comportamento CORRECTO, e a alternativa foi considerada e recusada: fundir os nós
+    automaticamente escolheria um dos rótulos e mudaria as arestas do outro de dono, em silêncio,
+    num grafo cujo propósito é dizer factos sobre pessoas. Qual dos dois `José` é a pessoa é
+    conhecimento que esta função não tem."""
+    if not groups:
+        return RuntimeError(
+            "a identidade de nó passa a ignorar acentos (`José` == `Jose`) e esta base tem nós "
+            f"que agora colidem. Não consegui listá-los; o erro original foi: {cause}")
+    return RuntimeError(
+        "a identidade de nó passa a ignorar acentos (`José` == `Jose`) e esta base tem nós que "
+        "agora colidem. Funda-os À MÃO antes de migrar — automaticamente não, porque escolher um "
+        "dos rótulos muda as arestas do outro de dono em silêncio:\n  "
+        + "\n  ".join(groups))
 
 
 class _PgBase:
@@ -469,14 +615,14 @@ class _PgBase:
         # static psycopg row type (tuple) doesn't reflect.
         if self._pool is not None:
             async with self._pool.connection() as conn:
-                prev = conn.row_factory
+                previous_rows = conn.row_factory
                 conn.row_factory = dict_row
                 try:
                     yield conn
                 finally:
                     # restore the pooled connection's factory so a later borrower that expects
                     # tuple rows isn't handed dicts (a shared-pool consumer must not inherit this).
-                    conn.row_factory = prev
+                    conn.row_factory = previous_rows
         else:
             assert self._dsn is not None  # __init__ guarantees dsn when pool is None
             conn = await psycopg.AsyncConnection.connect(
@@ -960,7 +1106,20 @@ class PostgresKnowledgeGraph(_PgBase):
             cur = await conn.execute(
                 """INSERT INTO knowledge_nodes (scope, label, node_type, attributes, embedding)
                    VALUES (%s, %s, %s, %s::jsonb, %s::vector)
-                   ON CONFLICT (scope, lower(label), node_type) DO UPDATE SET
+                   ON CONFLICT (scope, engram_fold(label), node_type) DO UPDATE SET
+                       -- A grafia com DIACRÍTICOS ganha, e só sobe, nunca desce. Sem isto o
+                       -- primeiro a chegar ficava para sempre — e como o contacto escreve o nome
+                       -- sem acento metade das vezes, "Jose" chegava primeiro e a linha nunca mais
+                       -- voltava a ser "José". Era o contrário exacto do que o `folding` promete:
+                       -- o rótulo original é o que se guarda e se mostra; perder o acento no nome
+                       -- de uma pessoa é o que esta funcionalidade existe para EVITAR.
+                       -- Determinístico e sem oscilar: uma vez acentuado, fica.
+                       label      = CASE
+                           WHEN engram_fold(EXCLUDED.label)
+                                  <> lower(EXCLUDED.label COLLATE "und-x-icu")
+                            AND engram_fold(knowledge_nodes.label)
+                                  =  lower(knowledge_nodes.label COLLATE "und-x-icu")
+                           THEN EXCLUDED.label ELSE knowledge_nodes.label END,
                        attributes = knowledge_nodes.attributes || EXCLUDED.attributes,
                        embedding  = COALESCE(EXCLUDED.embedding, knowledge_nodes.embedding),
                        updated_at = now()
@@ -971,25 +1130,35 @@ class PostgresKnowledgeGraph(_PgBase):
         return row["id"]
 
     async def _resolve_node_id(self, conn, scope: str, label: str) -> int:
+        """O id do nó a que uma aresta se liga — criando-o se não existir.
+
+        `ORDER BY (label = %s) DESC` e não `LIMIT 1` cru: a dobragem faz `José/PERSON` e
+        `Jose/CONCEPT` casarem os dois, e um `LIMIT 1` sem ordem escolhia à SORTE — duas arestas
+        pedidas para nós diferentes acabavam no mesmo, e qual delas ganhava dependia da ordem
+        física das linhas. Preferir o rótulo exacto é determinístico e é o que quem chama quis
+        dizer. Diferente do `_one_node_id`, que RECUSA quando é ambíguo: aqui a operação é criar
+        uma ligação, não destruir nem mudar privacidade, portanto escolher o melhor palpite é
+        preferível a falhar o turno."""
         cur = await conn.execute(
-            "SELECT id FROM knowledge_nodes WHERE scope = %s AND lower(label) = lower(%s) LIMIT 1",
-            (scope, label))
+            "SELECT id FROM knowledge_nodes WHERE scope = %s AND engram_fold(label) = engram_fold(%s) "
+            " ORDER BY (label = %s) DESC, id LIMIT 1",
+            (scope, label, label))
         row = await cur.fetchone()
         if row:
             return row["id"]
         # Idempotent insert: two concurrent upsert_edge calls referencing a not-yet-existing
-        # label both miss the SELECT above; a bare INSERT then races the uq(scope, lower(label),
+        # label both miss the SELECT above; a bare INSERT then races the uq(scope, engram_fold(label),
         # node_type) index and the loser raises IntegrityError, failing that turn. ON CONFLICT
         # DO NOTHING makes the loser return no row → re-SELECT the winner's id.
         cur = await conn.execute(
             "INSERT INTO knowledge_nodes (scope, label) VALUES (%s, %s) "
-            "ON CONFLICT (scope, lower(label), node_type) DO NOTHING RETURNING id",
+            "ON CONFLICT (scope, engram_fold(label), node_type) DO NOTHING RETURNING id",
             (scope, label))
         row = await cur.fetchone()
         if row:
             return row["id"]
         cur = await conn.execute(
-            "SELECT id FROM knowledge_nodes WHERE scope = %s AND lower(label) = lower(%s) LIMIT 1",
+            "SELECT id FROM knowledge_nodes WHERE scope = %s AND engram_fold(label) = engram_fold(%s) LIMIT 1",
             (scope, label))
         row = await cur.fetchone()
         return row["id"]
@@ -1040,7 +1209,7 @@ class PostgresKnowledgeGraph(_PgBase):
             cur = await conn.execute(
                 "SELECT n.id, n.scope, n.label, n.node_type, n.attributes, n.created_at, "
                 "n.updated_at FROM knowledge_nodes n "
-                "WHERE n.scope = %s AND lower(n.label) = lower(%s) "
+                "WHERE n.scope = %s AND engram_fold(n.label) = engram_fold(%s) "
                 f"AND {_NODE_VISIBLE} LIMIT 1",
                 (scope, label, audience, audience, audience))
             row = await cur.fetchone()
@@ -1076,7 +1245,7 @@ class PostgresKnowledgeGraph(_PgBase):
                     SELECT n.id AS node_id, 0 AS depth, NULL::bigint AS edge_id,
                            ARRAY[n.id] AS path
                     FROM knowledge_nodes n
-                    WHERE n.scope = %s AND lower(n.label) = lower(%s)
+                    WHERE n.scope = %s AND engram_fold(n.label) = engram_fold(%s)
                     UNION ALL
                     -- carry the visited-node path so a cyclic subgraph expands each node ONCE
                     -- (mirrors the in-memory walk's ``visited`` set); without this a cycle
@@ -1138,13 +1307,18 @@ class PostgresKnowledgeGraph(_PgBase):
                               status: str) -> bool:
         _require_scope(scope)
         async with self._conn() as conn:
+            # por ID, não por rótulo dobrado: dois nós que dobram igual mas têm `node_type`
+            # diferente coexistem legalmente, e um UPDATE por rótulo atingia os DOIS. No
+            # `set_edge_audience` isso é uma mudança de PRIVACIDADE numa aresta que ninguém
+            # escolheu.
+            src = await self._one_node_id(conn, scope, source, op="set_edge_status")
+            tgt = await self._one_node_id(conn, scope, target, op="set_edge_status")
+            if src is None or tgt is None:
+                return False
             cur = await conn.execute(
-                """UPDATE knowledge_edges e SET status = %s
-                   FROM knowledge_nodes sn, knowledge_nodes tn
-                   WHERE e.source_id = sn.id AND e.target_id = tn.id
-                     AND e.scope = %s AND lower(sn.label) = lower(%s)
-                     AND lower(tn.label) = lower(%s) AND e.relation = %s""",
-                (require_edge_status(status), scope, source, target, relation))
+                "UPDATE knowledge_edges SET status = %s "
+                " WHERE scope = %s AND source_id = %s AND target_id = %s AND relation = %s",
+                (require_edge_status(status), scope, src, tgt, relation))
         return bool(cur.rowcount)
 
     async def set_edge_audience(self, scope: str, source: str, target: str, relation: str,
@@ -1152,13 +1326,18 @@ class PostgresKnowledgeGraph(_PgBase):
         """Explicit re-classification — the only way back from a migration."""
         _require_scope(scope)
         async with self._conn() as conn:
+            # por ID, não por rótulo dobrado: dois nós que dobram igual mas têm `node_type`
+            # diferente coexistem legalmente, e um UPDATE por rótulo atingia os DOIS. No
+            # `set_edge_audience` isso é uma mudança de PRIVACIDADE numa aresta que ninguém
+            # escolheu.
+            src = await self._one_node_id(conn, scope, source, op="set_edge_audience")
+            tgt = await self._one_node_id(conn, scope, target, op="set_edge_audience")
+            if src is None or tgt is None:
+                return False
             cur = await conn.execute(
-                """UPDATE knowledge_edges e SET audience = %s
-                   FROM knowledge_nodes sn, knowledge_nodes tn
-                   WHERE e.source_id = sn.id AND e.target_id = tn.id
-                     AND e.scope = %s AND lower(sn.label) = lower(%s)
-                     AND lower(tn.label) = lower(%s) AND e.relation = %s""",
-                (sanitize_audience(audience), scope, source, target, relation))
+                "UPDATE knowledge_edges SET audience = %s "
+                " WHERE scope = %s AND source_id = %s AND target_id = %s AND relation = %s",
+                (sanitize_audience(audience), scope, src, tgt, relation))
         return bool(cur.rowcount)
 
     async def neighbors(self, scope: str, label: str, *, audience: str) -> list[GraphNode]:
@@ -1170,7 +1349,7 @@ class PostgresKnowledgeGraph(_PgBase):
                    JOIN knowledge_edges e ON (e.source_id = n.id OR e.target_id = n.id)
                    JOIN knowledge_nodes nn
                      ON nn.id = CASE WHEN e.source_id = n.id THEN e.target_id ELSE e.source_id END
-                   WHERE n.scope = %s AND lower(n.label) = lower(%s)
+                   WHERE n.scope = %s AND engram_fold(n.label) = engram_fold(%s)
                      -- an unreviewed edge still DISCLOSES its endpoint; see the in-memory twin
                      AND e.status = 'accepted'
                      AND {_EDGE_VISIBLE}""", (scope, label, audience, audience, audience))
@@ -1186,7 +1365,7 @@ class PostgresKnowledgeGraph(_PgBase):
             return None
         edges = await self.walk(scope, label, audience=audience, max_depth=1)
         edges = [e for e in edges
-                 if label.lower() in (e.source.lower(), e.target.lower())]
+                 if fold_label(label) in (fold_label(e.source), fold_label(e.target))]
         return NodeContext(node=node, edges=edges,
                            neighbors=await self.neighbors(scope, label, audience=audience))
 
@@ -1197,8 +1376,11 @@ class PostgresKnowledgeGraph(_PgBase):
         sql = ("SELECT n.id, n.scope, n.label, n.node_type, n.attributes, n.created_at, "
                "n.updated_at FROM knowledge_nodes n WHERE n.scope = %s "
                f"AND {_NODE_VISIBLE}")
-        # two, and in this order: `_NODE_VISIBLE` carries `%s` twice (the staff
-        # short-circuit, then the identity match) and sits immediately after `scope`.
+        # TRÊS, e nesta ordem: `_NODE_VISIBLE` carrega `%s` três vezes — o curto-circuito de
+        # staff, o teste `audience <> ''`, e a igualdade — e vem logo a seguir a `scope`. Dizia
+        # "twice" nos três sítios: o comentário mentia sobre exactamente a coisa que faz alguém
+        # contar mal os parâmetros ao mexer no predicado, e a lista ao lado (que está certa) tem
+        # quatro elementos, não três.
         params: list = [scope, audience, audience, audience]
         if node_type is not None:
             sql += " AND n.node_type = %s"
@@ -1217,18 +1399,21 @@ class PostgresKnowledgeGraph(_PgBase):
                           label: Optional[str] = None) -> int:
         """How many nodes this scope holds, or how many carry ``label``.
 
-        `lower(label)` on both sides, matching `find_node` and the `walk` seed — the unique index
-        `uq_nodes_scope_label_type` is on `(scope, lower(label), node_type)`, so this is the
+        `engram_fold(label)` on both sides, matching `find_node` and the `walk` seed — the unique
+        index `uq_nodes_scope_fold_type` is on `(scope, engram_fold(label), node_type)`, so this is the
         expression the planner already has an index for.
         """
         _require_scope(scope)
         sql = ("SELECT count(*) AS n FROM knowledge_nodes n WHERE n.scope = %s "
                f"AND {_NODE_VISIBLE}")
-        # two, and in this order: `_NODE_VISIBLE` carries `%s` twice (the staff
-        # short-circuit, then the identity match) and sits immediately after `scope`.
+        # TRÊS, e nesta ordem: `_NODE_VISIBLE` carrega `%s` três vezes — o curto-circuito de
+        # staff, o teste `audience <> ''`, e a igualdade — e vem logo a seguir a `scope`. Dizia
+        # "twice" nos três sítios: o comentário mentia sobre exactamente a coisa que faz alguém
+        # contar mal os parâmetros ao mexer no predicado, e a lista ao lado (que está certa) tem
+        # quatro elementos, não três.
         params: list = [scope, audience, audience, audience]
         if label is not None:
-            sql += " AND lower(n.label) = lower(%s)"
+            sql += " AND engram_fold(n.label) = engram_fold(%s)"
             params.append(label.strip())
         async with self._conn() as conn:
             cur = await conn.execute(sql, params)
@@ -1242,8 +1427,11 @@ class PostgresKnowledgeGraph(_PgBase):
         sql = ("SELECT n.id, n.scope, n.label, n.node_type, n.attributes, n.created_at, "
                "n.updated_at FROM knowledge_nodes n WHERE n.scope = %s "
                f"AND {_NODE_VISIBLE}")
-        # two, and in this order: `_NODE_VISIBLE` carries `%s` twice (the staff
-        # short-circuit, then the identity match) and sits immediately after `scope`.
+        # TRÊS, e nesta ordem: `_NODE_VISIBLE` carrega `%s` três vezes — o curto-circuito de
+        # staff, o teste `audience <> ''`, e a igualdade — e vem logo a seguir a `scope`. Dizia
+        # "twice" nos três sítios: o comentário mentia sobre exactamente a coisa que faz alguém
+        # contar mal os parâmetros ao mexer no predicado, e a lista ao lado (que está certa) tem
+        # quatro elementos, não três.
         params: list = [scope, audience, audience, audience]
         if after_id is not None:
             sql += " AND n.id > %s"
@@ -1265,15 +1453,55 @@ class PostgresKnowledgeGraph(_PgBase):
             cur = await conn.execute(
                 """SELECT 1 FROM knowledge_edges e
                    JOIN knowledge_nodes n ON n.id IN (e.source_id, e.target_id)
-                   WHERE e.scope = %s AND lower(n.label) = lower(%s) LIMIT 1""",
+                   WHERE e.scope = %s AND engram_fold(n.label) = engram_fold(%s) LIMIT 1""",
                 (scope, label))
             return await cur.fetchone() is not None
 
+    @staticmethod
+    async def _one_node_id(conn, scope: str, label: str, *, op: str) -> "int | None":
+        """O id do ÚNICO nó que este rótulo designa — ou None quando é ambíguo.
+
+        A identidade dobrada ignora acento, mas o `node_type` NÃO faz parte do rótulo: `José`
+        como PERSON e `Jose` como CONCEPT coexistem legalmente depois da migração — a suíte de
+        integração descreve esse par como "exactamente como um tenant lá chega". Um comando por
+        rótulo dobrado atinge portanto os DOIS, e foi medido a atingir: `delete_node('José')`
+        apagava 2 linhas, com as arestas de ambas atrás por `ON DELETE CASCADE`.
+
+        Desempate: o rótulo EXACTO ganha. Sem exacto e com mais de um candidato, devolve None —
+        recusar é o que uma operação destrutiva ou de PRIVACIDADE tem de fazer, porque escolher
+        por quem chamou é escolher errado metade das vezes, em silêncio."""
+        cur = await conn.execute(
+            "SELECT id, label FROM knowledge_nodes "
+            " WHERE scope = %s AND engram_fold(label) = engram_fold(%s)", (scope, label))
+        rows = await cur.fetchall()
+
+        def _field(r, i, name):
+            return r[name] if isinstance(r, dict) else r[i]
+
+        if not rows:
+            return None
+        if len(rows) > 1:
+            exact = [r for r in rows if _field(r, 1, "label") == label]
+            if len(exact) != 1:
+                logger.warning(
+                    "event=node_reference_ambiguous op=%s scope=%s label=%s matches=%d "
+                    "reason=fold_matches_several_node_types", op, scope, label, len(rows))
+                return None
+            rows = exact
+        return int(_field(rows[0], 0, "id"))
+
     async def delete_node(self, scope: str, label: str) -> bool:
+        """Apaga UM nó — nunca mais do que um, mesmo quando a dobragem casa com vários.
+
+        O `cogno-ui` chama isto com um id que o host converte em rótulo, portanto o operador
+        clicava num nó e perdia outro sem aviso. Ver `_one_node_id`."""
         _require_scope(scope)
         async with self._conn() as conn:
+            victim_id = await self._one_node_id(conn, scope, label, op="delete_node")
+            if victim_id is None:
+                return False
             cur = await conn.execute(
-                "DELETE FROM knowledge_nodes WHERE scope = %s AND lower(label) = lower(%s)", (scope, label))
+                "DELETE FROM knowledge_nodes WHERE id = %s", (victim_id,))
             return cur.rowcount > 0   # edges cascade via FK ON DELETE CASCADE
 
     async def delete_edges_by_session(self, scope: str, session_id: str) -> int:

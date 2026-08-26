@@ -166,6 +166,82 @@ stops satisfying it under mypy/`isinstance` until it implements both.
 
 ### Fixed
 
+- **Duas regressões que a própria dobragem introduziu, achadas em revisão adversarial:**
+  - **O rótulo ACENTUADO perdia-se.** `ON CONFLICT` nunca escrevia `label`, portanto a primeira
+    grafia a chegar ficava para sempre — e como o argumento desta funcionalidade é que "o contacto
+    escreve o nome sem acento metade das vezes", a grafia SEM acento é a que chega primeiro com
+    mais frequência. O contrário exacto do que o módulo promete. Agora a grafia com diacríticos
+    SOBE e nunca desce (`folding.has_diacritics`, uma definição, os dois adaptadores).
+  - **`delete_node` apagava DOIS nós.** `José` como PERSON e `Jose` como CONCEPT coexistem
+    legalmente depois da migração, mas o comando recebe só um RÓTULO — e apagava ambos, com as
+    arestas de ambos atrás por `ON DELETE CASCADE`. O `cogno-ui` chama-o com um id que o host
+    converte em rótulo: o operador clicava num nó e perdia outro. `set_edge_status` e
+    `set_edge_audience` alargavam igual, e a segunda é um controlo de PRIVACIDADE. Os três passam
+    por `_one_node_id`: rótulo exacto ganha, ambíguo RECUSA. E `_resolve_node_id` (que cria a
+    ligação, não destrói) passa a preferir o exacto de forma determinística em vez de `LIMIT 1`
+    sem ordem.
+
+- **O diagnóstico de colisão funciona também sem autocommit.** `ensure_schema` é API pública e
+  recebe as duas espécies de conexão; sem autocommit o CREATE falhado envenenava a transacção, o
+  diagnóstico degradava para lista vazia, e o operador recebia a chave dobrada que este módulo diz
+  que ele não precisa. E deixou de truncar em silêncio aos 20 grupos.
+
+- **REQUISITOS NOVOS do adaptador Postgres, e são duros.** `ensure_schema` passa a exigir:
+  - a extensão **`unaccent`** disponível e instalável no schema `public` (o `ensure_schema`
+    corre o `CREATE EXTENSION`, mas o pacote `postgresql-contrib` tem de estar presente);
+  - suporte a **ICU** — a função de dobragem usa `COLLATE "und-x-icu"`, e sem ele o Postgres
+    responde `collation "und-x-icu" for encoding "UTF8" does not exist`. Falha **cedo e alto**,
+    na criação da função e portanto no primeiro `ensure_schema`, não numa consulta meses depois.
+
+  Nenhum dos dois é exótico em PG ≥ 15 (a imagem `pgvector/pgvector:pg16` tem ambos), mas um
+  requisito que só existe no código é um requisito que alguém descobre em produção.
+
+- **Ferramenta de fusão para as colisões que a identidade nova cria**
+  (`cogno_engram/fold_migration.py`): `fold_collisions()` devolve o relatório — que nós, que
+  rótulos, quantas arestas cada um — e `merge_fold_collisions()` aplica, **com `dry_run=True` por
+  omissão**. O `ensure_schema` continua a recusar-se a fundir sozinho, e isso está certo; mas
+  parar aí deixava o operador com um traceback e um `psql`, e o SQL que ele escreveria à pressa é
+  exactamente o perigoso: em Postgres as arestas referenciam `source_id`/`target_id` com
+  `ON DELETE CASCADE`, portanto **apagar o nó duplicado leva as arestas dele consigo, sem aviso**.
+  A ferramenta reponta primeiro e apaga depois, remove as que passariam a duplicar ou a apontar
+  para si próprias, e guarda o rótulo perdido em `attributes.aliases` — perder a grafia é perder
+  informação, e é o alias que permite desfazer a fusão à mão.
+
+  Sem esta ferramenta o estado depois de uma migração recusada é pior do que parece, medido: o
+  índice antigo de pé, a função criada, o índice novo ausente — e o código novo a ler isso faz
+  **todo `upsert_node` levantar** até alguém fundir à mão. A ferramenta é o que separa "migração
+  recusada com instrução" de "grafo morto para escrita".
+
+- **`José` e `Jose` passam a ser a mesma pessoa — e `find_node` deixa de perder o nó sob collation
+  `C`.** Decisão de produto do dono: num CRM que recebe WhatsApp, o contacto escreve o nome sem
+  acento metade das vezes, e um grafo que trate os dois como nós distintos parte a vida da pessoa
+  em duas.
+
+  O defeito por baixo era outro e mais estreito: a identidade de nó era `lower(label)` no Postgres
+  e `label.lower()` no Python, e **as duas discordavam**. Num cluster `LC_COLLATE 'C'` o `lower()`
+  do Postgres nem sequer dobra maiúsculas acentuadas — `lower('JOSÉ')` dá `'josÉ'` — logo
+  `find_node(scope, "JOSÉ")` devolvia `None` para um nó gravado como `josé`, enquanto o adaptador
+  in-memory acertava. Medido: 7 de 14 rótulos falhavam sob `C`, 0 sob `en_US.utf8`.
+
+  Agora há **uma** definição, `cogno_engram/folding.py::fold_label`, e as duas metades correm-na:
+  o Python directamente, o Postgres pela função `engram_fold` que o `ensure_schema` cria. Três
+  camadas, todas necessárias e todas medidas: `casefold()` (trata `ß`→`ss`, que `lower` não),
+  NFD + remoção de marcas combinantes (tira o acento), e uma tabela de transliteração de 15
+  entradas **derivada do `unaccent` do Postgres** (`æ`→`ae`, `ø`→`o`, `ł`→`l` — caracteres sem
+  decomposição combinante, que o passo 2 deixaria intactos).
+
+  `tests/test_folding_parity.py` re-deriva a tabela contra um Postgres a sério e falha se deixar
+  de bater: uma cópia de um dicionário que vive noutro processo apodrece em silêncio, e apodrecer
+  aqui significa os dois adaptadores darem respostas diferentes à mesma pergunta. O alfabeto
+  coberto está DECLARADO — Latin-1 Supplement + Latin Extended-A, onde vivem os nomes
+  pt/es/en/de/fr/it. Fora dele os dois lados podem divergir (medido: sigma final grego).
+
+  **A migração pode FALHAR, e isso é o comportamento certo.** Numa base que já tenha `José` e
+  `Jose` como nós separados, o índice novo recusa-se a nascer — e o `ensure_schema` levanta com os
+  rótulos em conflito NOMEADOS, em vez da chave dobrada que o Postgres reporta. Fundir
+  automaticamente escolheria um dos rótulos e mudaria as arestas do outro de dono, em silêncio,
+  num grafo cujo propósito é dizer factos sobre pessoas.
+
 - **O teste de plano do índice da subárvore ficava VERMELHO em código correcto.** Ele afirmava o
   NOME do índice; num cluster com collation `C` (`initdb --locale=C`, `postgres:alpine`, qualquer
   base criada `LC_COLLATE 'C'`) a UNIQUE pré-existente já serve ambos os ramos do OR, não há Seq

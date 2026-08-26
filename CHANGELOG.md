@@ -122,6 +122,32 @@ stops satisfying it under mypy/`isinstance` until it implements both.
 
 ### Fixed
 
+- **REQUISITOS NOVOS do adaptador Postgres, e são duros.** `ensure_schema` passa a exigir:
+  - a extensão **`unaccent`** disponível e instalável no schema `public` (o `ensure_schema`
+    corre o `CREATE EXTENSION`, mas o pacote `postgresql-contrib` tem de estar presente);
+  - suporte a **ICU** — a função de dobragem usa `COLLATE "und-x-icu"`, e sem ele o Postgres
+    responde `collation "und-x-icu" for encoding "UTF8" does not exist`. Falha **cedo e alto**,
+    na criação da função e portanto no primeiro `ensure_schema`, não numa consulta meses depois.
+
+  Nenhum dos dois é exótico em PG ≥ 15 (a imagem `pgvector/pgvector:pg16` tem ambos), mas um
+  requisito que só existe no código é um requisito que alguém descobre em produção.
+
+- **Ferramenta de fusão para as colisões que a identidade nova cria**
+  (`cogno_engram/fold_migration.py`): `fold_collisions()` devolve o relatório — que nós, que
+  rótulos, quantas arestas cada um — e `merge_fold_collisions()` aplica, **com `dry_run=True` por
+  omissão**. O `ensure_schema` continua a recusar-se a fundir sozinho, e isso está certo; mas
+  parar aí deixava o operador com um traceback e um `psql`, e o SQL que ele escreveria à pressa é
+  exactamente o perigoso: em Postgres as arestas referenciam `source_id`/`target_id` com
+  `ON DELETE CASCADE`, portanto **apagar o nó duplicado leva as arestas dele consigo, sem aviso**.
+  A ferramenta reponta primeiro e apaga depois, remove as que passariam a duplicar ou a apontar
+  para si próprias, e guarda o rótulo perdido em `attributes.aliases` — perder a grafia é perder
+  informação, e é o alias que permite desfazer a fusão à mão.
+
+  Sem esta ferramenta o estado depois de uma migração recusada é pior do que parece, medido: o
+  índice antigo de pé, a função criada, o índice novo ausente — e o código novo a ler isso faz
+  **todo `upsert_node` levantar** até alguém fundir à mão. A ferramenta é o que separa "migração
+  recusada com instrução" de "grafo morto para escrita".
+
 - **`José` e `Jose` passam a ser a mesma pessoa — e `find_node` deixa de perder o nó sob collation
   `C`.** Decisão de produto do dono: num CRM que recebe WhatsApp, o contacto escreve o nome sem
   acento metade das vezes, e um grafo que trate os dois como nós distintos parte a vida da pessoa

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -63,6 +64,9 @@ DEFAULT_TS_CONFIG = "portuguese"
 # allows a host's custom dictionary (e.g. ``my_schema.unaccent_pt``) while making
 # injection via the config impossible.
 _TS_CONFIG_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)?$")
+
+
+logger = logging.getLogger("cogno_engram.postgres")
 
 
 def _validate_ts_config(ts_config: str) -> str:
@@ -129,7 +133,9 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
     # `unaccent` + o wrapper IMMUTABLE por baixo da identidade de nó: `José` e `Jose` são a mesma
     # pessoa (decisão de produto). Tem de vir ANTES dos índices — a UNIQUE de nós usa a função.
     await conn.execute("CREATE EXTENSION IF NOT EXISTS unaccent")
+    definicao_antes = await _definicao_do_fold(conn)
     await conn.execute(FOLD_FUNCTION_SQL)
+    await _reconstroi_indice_se_o_fold_mudou(conn, definicao_antes)
 
     # sessions / knowledge_* stay unpartitioned (low volume); turns/memories opt in.
     pk = "PRIMARY KEY (id, scope)" if partition_by_scope else "PRIMARY KEY (id)"
@@ -383,11 +389,63 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
     for stmt in stmts:
         try:
             await conn.execute(stmt)
-        except Exception as erro:                    # noqa: BLE001 — re-levantado, nunca engolido
+        except psycopg.errors.UniqueViolation as erro:
+            # SÓ violação de unicidade, e só neste índice. Um `except Exception` aqui rotulava
+            # QUALQUER falha do CREATE — falta de ICU, permissões, função em falta — como
+            # "colisão de rótulos", e mandava o operador fundir nós para resolver um problema que
+            # não era esse. Um diagnóstico errado custa mais do que nenhum.
             if "uq_nodes_scope_fold_type" not in stmt:
                 raise
             raise _colisao_de_rotulos(await _rotulos_em_conflito(conn), erro) from erro
 
+
+async def _definicao_do_fold(conn) -> "str | None":
+    """A definição de `engram_fold` que está INSTALADA, ou None se ainda não existe."""
+    try:
+        cur = await conn.execute(
+            "SELECT pg_get_functiondef(p.oid) FROM pg_proc p JOIN pg_namespace n "
+            "  ON n.oid = p.pronamespace "
+            " WHERE p.proname = 'engram_fold' AND p.pronargs = 1 LIMIT 1")
+        linha = await cur.fetchone()
+    except Exception:                                # noqa: BLE001 — ausência não é erro
+        return None
+    if linha is None:
+        return None
+    return linha[0] if not isinstance(linha, dict) else list(linha.values())[0]
+
+
+async def _reconstroi_indice_se_o_fold_mudou(conn, antes: "str | None") -> None:
+    """Se a regra de dobragem mudou, o índice que a GUARDA ficou a mentir — reconstrói.
+
+    `uq_nodes_scope_fold_type` é um índice de EXPRESSÃO: guarda o resultado de `engram_fold`, não
+    o rótulo. `CREATE OR REPLACE FUNCTION` troca a função e o Postgres **não reconstrói o índice
+    nem avisa** — as chaves velhas ficam lá. Medido: depois de mudar a função, uma busca por
+    índice devolve 0 e um seq scan sobre os mesmos dados devolve 1. É o defeito original
+    (`find_node` não acha um nó que existe) a voltar através do TEMPO, e nenhum teste de base nova
+    o apanha porque ali a função e o índice nascem juntos.
+
+    Só corre quando a definição MUDOU — num deploy normal `CREATE OR REPLACE` reinstala texto
+    idêntico e isto é um no-op. Quando corre, `REINDEX` toma `ACCESS EXCLUSIVE` na tabela: é o
+    preço de uma regra de identidade nova, e acontece uma vez por mudança dela, não por deploy.
+
+    Se a dobragem nova fizer colidir rótulos que antes eram distintos, o `REINDEX` FALHA — e é o
+    mesmo comportamento correcto da criação inicial, com o mesmo erro nomeado."""
+    if antes is None:
+        return                                       # instalação nova: nada a reconstruir
+    depois = await _definicao_do_fold(conn)
+    if depois is None or depois == antes:
+        return
+    cur = await conn.execute(
+        "SELECT 1 FROM pg_class WHERE relname = 'uq_nodes_scope_fold_type' AND relkind = 'i'")
+    if await cur.fetchone() is None:
+        return                                       # o índice ainda não existe; nasce já certo
+    logger.warning(
+        "event=fold_index_rebuilt index=uq_nodes_scope_fold_type "
+        "reason=engram_fold_definition_changed")
+    try:
+        await conn.execute("REINDEX INDEX uq_nodes_scope_fold_type")
+    except psycopg.errors.UniqueViolation as erro:
+        raise _colisao_de_rotulos(await _rotulos_em_conflito(conn), erro) from erro
 
 async def _rotulos_em_conflito(conn) -> "list[str]":
     """Os grupos de rótulos que a identidade nova funde — vazio se a leitura falhar.
@@ -399,10 +457,17 @@ async def _rotulos_em_conflito(conn) -> "list[str]":
     mesma."""
     try:
         cur = await conn.execute(
-            "SELECT scope, node_type, string_agg(label, %s ORDER BY label) "
+            "SELECT scope, node_type, string_agg(label, %s ORDER BY label) AS rotulos "
             "FROM knowledge_nodes GROUP BY scope, node_type, engram_fold(label) "
             "HAVING count(*) > 1 LIMIT 20", (" + ",))
-        return [f"{r[0]} / {r[1]}: {r[2]}" for r in await cur.fetchall()]
+        # nomeadas, não posicionais: esta conexão pode vir com `dict_row` (o adaptador usa-o) e
+        # aí `r[0]` levanta `KeyError`. O diagnóstico morreria exactamente no caso em que faz
+        # falta — a migração já falhou e é isto que diz ao operador o que fazer.
+        linhas = await cur.fetchall()
+        def _campo(r, i, nome):
+            return r[nome] if isinstance(r, dict) else r[i]
+        return [f"{_campo(r, 0, 'scope')} / {_campo(r, 1, 'node_type')}: {_campo(r, 2, 'rotulos')}"
+                for r in linhas]
     except Exception:                                # noqa: BLE001
         return []
 
@@ -1171,8 +1236,11 @@ class PostgresKnowledgeGraph(_PgBase):
         sql = ("SELECT n.id, n.scope, n.label, n.node_type, n.attributes, n.created_at, "
                "n.updated_at FROM knowledge_nodes n WHERE n.scope = %s "
                f"AND {_NODE_VISIBLE}")
-        # two, and in this order: `_NODE_VISIBLE` carries `%s` twice (the staff
-        # short-circuit, then the identity match) and sits immediately after `scope`.
+        # TRÊS, e nesta ordem: `_NODE_VISIBLE` carrega `%s` três vezes — o curto-circuito de
+        # staff, o teste `audience <> ''`, e a igualdade — e vem logo a seguir a `scope`. Dizia
+        # "twice" nos três sítios: o comentário mentia sobre exactamente a coisa que faz alguém
+        # contar mal os parâmetros ao mexer no predicado, e a lista ao lado (que está certa) tem
+        # quatro elementos, não três.
         params: list = [scope, audience, audience, audience]
         if node_type is not None:
             sql += " AND n.node_type = %s"
@@ -1198,8 +1266,11 @@ class PostgresKnowledgeGraph(_PgBase):
         _require_scope(scope)
         sql = ("SELECT count(*) AS n FROM knowledge_nodes n WHERE n.scope = %s "
                f"AND {_NODE_VISIBLE}")
-        # two, and in this order: `_NODE_VISIBLE` carries `%s` twice (the staff
-        # short-circuit, then the identity match) and sits immediately after `scope`.
+        # TRÊS, e nesta ordem: `_NODE_VISIBLE` carrega `%s` três vezes — o curto-circuito de
+        # staff, o teste `audience <> ''`, e a igualdade — e vem logo a seguir a `scope`. Dizia
+        # "twice" nos três sítios: o comentário mentia sobre exactamente a coisa que faz alguém
+        # contar mal os parâmetros ao mexer no predicado, e a lista ao lado (que está certa) tem
+        # quatro elementos, não três.
         params: list = [scope, audience, audience, audience]
         if label is not None:
             sql += " AND engram_fold(n.label) = engram_fold(%s)"
@@ -1216,8 +1287,11 @@ class PostgresKnowledgeGraph(_PgBase):
         sql = ("SELECT n.id, n.scope, n.label, n.node_type, n.attributes, n.created_at, "
                "n.updated_at FROM knowledge_nodes n WHERE n.scope = %s "
                f"AND {_NODE_VISIBLE}")
-        # two, and in this order: `_NODE_VISIBLE` carries `%s` twice (the staff
-        # short-circuit, then the identity match) and sits immediately after `scope`.
+        # TRÊS, e nesta ordem: `_NODE_VISIBLE` carrega `%s` três vezes — o curto-circuito de
+        # staff, o teste `audience <> ''`, e a igualdade — e vem logo a seguir a `scope`. Dizia
+        # "twice" nos três sítios: o comentário mentia sobre exactamente a coisa que faz alguém
+        # contar mal os parâmetros ao mexer no predicado, e a lista ao lado (que está certa) tem
+        # quatro elementos, não três.
         params: list = [scope, audience, audience, audience]
         if after_id is not None:
             sql += " AND n.id > %s"

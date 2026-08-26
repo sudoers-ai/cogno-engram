@@ -167,3 +167,117 @@ async def test_the_OLD_case_only_index_is_gone_and_the_new_one_is_there():
         "o índice antigo (só-caixa) sobreviveu — a base paga escrita por um índice que já não "
         "decide identidade, e a UNIQUE nova fica com uma vizinha que discorda dela")
     assert "uq_nodes_scope_fold_type" in indices, f"o índice novo não está lá: {indices}"
+
+
+@pytest.mark.asyncio
+async def test_the_two_sides_agree_on_whole_LABELS_not_just_characters():
+    """A paridade por caractere não chega, e a lacuna é concreta.
+
+    Os testes acima comparam caractere a caractere. Um defeito que só apareça na COMPOSIÇÃO —
+    normalização em ordem diferente, um `strip` a mais de um lado, uma sequência de dois
+    combinantes — sobrevive a todos eles e parte um nome inteiro (`Łódź`, `São Gonçalo do Amarante`)
+    sem tocar em nenhum caractere isolado.
+
+    Os rótulos abaixo são o domínio a sério: nomes pt-BR/es com acento, o nome do próprio dono nas
+    duas grafias em que a base viva o tem, e as formas Unicode compostas E decompostas do mesmo
+    nome — que é o caso que um teste por caractere nunca constrói."""
+    conn = await _pg()
+    rotulos = [
+        "José", "Jose", "JOSÉ", "josé",
+        "Vinicius Vale", "Vinícius Vale",          # o par que existe na base viva
+        "Hernani", "Hernaní",
+        "São Gonçalo do Amarante", "Sao Goncalo do Amarante",
+        "Łódź", "Añez", "Müller", "D'Ávila", "Conceição",
+        "André Castro", "Clínica veterinária", "Funcionário",
+        unicodedata.normalize("NFC", "José"),      # composta
+        unicodedata.normalize("NFD", "José"),      # decomposta — mesmo nome, bytes diferentes
+        "  José  ", "JOSÉ MARIA da SILVA",
+    ]
+    cur = await conn.execute(
+        "SELECT v, engram_fold(v) FROM unnest(%s::text[]) v", (rotulos,))
+    do_banco = {linha[0]: linha[1] for linha in await cur.fetchall()}
+    await conn.close()
+
+    divergem = {r: (fold_label(r), do_banco[r]) for r in rotulos if fold_label(r) != do_banco[r]}
+    assert not divergem, (
+        f"os dois adaptadores dobram RÓTULOS diferente — o mesmo nome encontraria nós diferentes "
+        f"conforme o adaptador: { {r: f'py={p!r} pg={g!r}' for r, (p, g) in divergem.items()} }")
+
+    # e o que o produto PROMETE: as formas do mesmo nome caem todas na mesma chave
+    for grupo in (["José", "Jose", "JOSÉ", "josé",
+                   unicodedata.normalize("NFD", "José")],
+                  ["Vinicius Vale", "Vinícius Vale"],
+                  ["São Gonçalo do Amarante", "Sao Goncalo do Amarante"]):
+        chaves = {fold_label(r) for r in grupo}
+        assert len(chaves) == 1, f"{grupo} devia ser uma só pessoa/lugar, deu {chaves}"
+
+
+@pytest.mark.asyncio
+async def test_a_CHANGED_fold_rule_rebuilds_the_index_that_stores_it(monkeypatch):
+    """O defeito original a voltar através do TEMPO — e o que nenhuma base nova apanha.
+
+    `uq_nodes_scope_fold_type` é um índice de EXPRESSÃO: guarda o RESULTADO de `engram_fold`, não
+    o rótulo. No dia em que a tabela de transliteração crescer — e o módulo já prevê que cresça —
+    o `CREATE OR REPLACE FUNCTION` do deploy troca a função e o Postgres **não reconstrói o índice
+    nem avisa**. As chaves velhas ficam lá e `find_node` deixa de achar um nó que existe.
+
+    O cenário é encenado como acontece: instalação com a regra v1, índice construído com v1, e
+    depois um deploy que instala v2 — trocando o `FOLD_FUNCTION_SQL` que o `ensure_schema` usa,
+    que é literalmente o que um `_TRANSLIT` novo faria.
+
+    **A primeira versão deste teste não discriminava**: mudava a função à mão e deixava o
+    `ensure_schema` repor a original, portanto o índice — construído com a original — voltava a
+    bater por acidente e apagar a reconstrução sobrevivia. Encenar a v2 e DEIXÁ-LA é o que torna
+    a asserção capaz de falhar."""
+    from cogno_engram.adapters import postgres as pgmod
+
+    conn = await _pg()
+    escopo = f"drift/{os.urandom(4).hex()}"
+    await conn.execute(
+        "INSERT INTO knowledge_nodes (scope, label, node_type) VALUES (%s,%s,%s)",
+        (escopo, "Ørsted", "PERSON"))
+
+    async def _acha_pelo_indice(alvo: str) -> int:
+        await conn.execute("SET enable_seqscan = off")
+        cur = await conn.execute(
+            "SELECT count(*) FROM knowledge_nodes "
+            " WHERE scope = %s AND engram_fold(label) = %s", (escopo, alvo))
+        n = int((await cur.fetchone())[0])
+        await conn.execute("SET enable_seqscan = on")
+        return n
+
+    assert await _acha_pelo_indice("orsted") == 1, "o nó tinha de ser achável com a regra v1"
+
+    # o deploy da v2: `Ø` passa a dobrar para `oe`, como faria uma entrada nova em `_TRANSLIT`
+    v2 = ('CREATE OR REPLACE FUNCTION engram_fold(text) RETURNS text '
+          '  LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS '
+          '$$ SELECT replace(public.unaccent(\'public.unaccent\', '
+          '                  lower($1 COLLATE "und-x-icu")), \'o\', \'oe\') $$')
+    monkeypatch.setattr(pgmod, "FOLD_FUNCTION_SQL", v2)
+    await ensure_schema(conn, embedding_dim=8)
+
+    achou = await _acha_pelo_indice("oersted")
+    await conn.execute("DELETE FROM knowledge_nodes WHERE scope = %s", (escopo,))
+    await conn.execute("REINDEX INDEX uq_nodes_scope_fold_type")
+    await conn.close()
+
+    assert achou == 1, (
+        "o índice ficou com as chaves da regra ANTIGA: a dobragem mudou, o Postgres não "
+        "reconstruiu nem avisou, e uma busca pelo valor novo não acha um nó que existe — o "
+        "defeito original, através do tempo")
+
+
+# NÃO há aqui um teste a fixar que uma falha NÃO-colisão escapa sem ser rotulada como colisão, e
+# a ausência é medida, não esquecida. Tentei encenar três falhas do `CREATE UNIQUE INDEX` que não
+# fossem `UniqueViolation` e as três são inalcançáveis por construção:
+#
+#   * função com volatilidade errada (`STABLE`) — o `ensure_schema` reinstala a função certa
+#     ANTES de chegar ao índice, portanto a via repara-se sozinha;
+#   * nome já ocupado por uma tabela — `CREATE INDEX IF NOT EXISTS` aceita-o em silêncio (NOTICE,
+#     sem erro), medido;
+#   * ICU em falta — falha na criação da FUNÇÃO, um passo acima, e nunca chega ao `except`.
+#
+# Consequência assumida: apagar o `psycopg.errors.` do `except` (voltando a `Exception`) sobrevive
+# à suíte. O estreitamento continua certo — o erro de colisão manda o operador FUNDIR NÓS, que é
+# destrutivo, e rotular qualquer falha assim mandava-o destruir dados para resolver outra coisa —
+# mas quem o remover não é apanhado aqui. Registado em vez de disfarçado.

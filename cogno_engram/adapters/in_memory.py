@@ -622,17 +622,20 @@ class InMemoryGraph:
                           label: Optional[str] = None) -> int:
         """How many nodes this scope holds, or how many carry ``label`` (case-insensitively).
 
-        Case-insensitive because that is how every other node read matches: `find_node` and
-        `walk` both compare `lower(label)`, so a count that were case-SENSITIVE would answer a
-        different question from the one the caller is about to act on.
+        Dobrado por `folding.fold_label`, como TODA leitura de nó — `find_node` e `walk`
+        incluídas. Usava `casefold()`, que dobra caixa mas não acento nem transliteração: o host
+        usa este método como GUARDA (`memory.py:536`, "existe exactamente 1?") e ele respondia a
+        uma pergunta diferente da que o `find_node` ao lado responde. Uma definição de identidade
+        que vive num sítio e é re-derivada noutro é a forma de defeito que este módulo veio
+        fechar; escapou à varredura porque a varredura procurava `.lower()`.
         """
         _require_scope(scope)
-        want = label.strip().casefold() if label is not None else None
+        want = fold_label(label.strip()) if label is not None else None
         visible = self._visible_labels(scope, audience)
         return sum(1 for (s, lbl), n in self._nodes.items()
                    if s == scope and lbl in visible
                    and (want is None
-                        or (n.label or "").strip().casefold() == want))
+                        or fold_label((n.label or "").strip()) == want))
 
     async def scan_nodes(self, scope: str, *, audience: str,
                          after_id: Optional[int] = None,

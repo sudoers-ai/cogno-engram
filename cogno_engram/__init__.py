@@ -23,6 +23,7 @@ from cogno_engram.types import (
     HybridWeights,
     MemoryRecord,
     NodeContext,
+    GraphStats,
     RetrievalQuery,
     Session,
     SessionSummary,
@@ -54,7 +55,7 @@ __all__ = [
     # ports
     "MemoryStore", "SupportsVectorSearch", "ConversationBuffer", "KnowledgeGraph",
     # types
-    "Session", "TurnRecord", "TurnTrace", "MemoryRecord", "GraphNode", "GraphEdge", "NodeContext",
+    "Session", "TurnRecord", "TurnTrace", "MemoryRecord", "GraphNode", "GraphEdge", "NodeContext", "GraphStats",
     "RetrievalQuery", "HybridWeights", "SessionSummary",
     "DEFAULT_CONFIDENCE", "VALID_NODE_TYPES",
     # reference adapters

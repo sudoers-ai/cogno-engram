@@ -64,6 +64,10 @@ def _reads(kg):
         "scan_nodes": lambda a: kg.scan_nodes(TENANT, audience=a, limit=100),
         "find_nodes_by_embedding": lambda a: kg.find_nodes_by_embedding(
             TENANT, [0.1, 0.2], audience=a, limit=100),
+        # An AGGREGATE is still a read, and the least obvious one: it returns no rows of its
+        # own, so nothing about it looks like disclosure — but `top_connected` carries whole
+        # nodes, and a total that counts another contact's nodes discloses their existence.
+        "graph_stats": lambda a: kg.graph_stats(TENANT, audience=a, top=100),
     }
 
 

@@ -4,6 +4,39 @@
 
 ### Added
 
+- **`KnowledgeGraph.graph_stats(scope, *, audience, top=5)` — o resumo do grafo em DUAS leituras
+  agregadas, em vez de `1 + 3N`.** O chamador (a rota `knowledge_stats` do host) precisava de
+  quatro números — total de nós, total de arestas, histograma por tipo, e os mais ligados — e
+  **nada no porto sabia responder "qual é o grau de cada nó" em bloco**. Então listava todos os
+  nós e pedia `get_node_context` para cada um; esse ajudante é ele próprio
+  `find_node` + `walk` + `neighbors`, logo o custo real era `1 + 3N`.
+
+  Medido contra Postgres real, ligações por chamada:
+
+  | nós | antes | depois |
+  |----:|------:|-------:|
+  |  10 |    31 |      1 |
+  |  50 |   151 |      1 |
+  | 100 |   301 |      1 |
+
+  Na caixa viva são **388 nós → 1165 ligações por cada abertura da página**, e crescia com o
+  grafo. O `test_the_cost_stops_growing_with_the_graph` mede **duas** dimensões e não uma: um
+  custo constante que por acaso igualasse o de um grafo não provava nada — é a INCLINAÇÃO que
+  interessa.
+
+  **É mudança de CUSTO, não de SIGNIFICADO**, e essa é a parte difícil de provar: um PR de
+  desempenho que mexe num número em silêncio é pior que a versão lenta. Por isso o teste
+  principal **não afirma os números** — recalcula-os pelo caminho antigo, nó a nó, e exige que
+  os dois concordem. As regras que ficam intactas: nós contados pela regra de audiência
+  (DERIVADA para leitor não-staff, logo um órfão é só-staff), arestas DISTINTAS por
+  `(source, target, relation)` e **só ACEITES** — porque o grau antigo vinha do `walk`, e o
+  `walk` não atravessa outro estado.
+
+  A sonda de fuga de audiência (`test_audience_leak.py`) passou a cobri-lo, e **foi ela que
+  apanhou a omissão**: um agregado não devolve linhas próprias e por isso não parece divulgação
+  — mas `top_connected` carrega nós inteiros, e um total que conta os nós de outro contacto
+  divulga que ele existe.
+
 - **`GraphEdge.created_at` — a aresta passa a lembrar-se de QUANDO.** A coluna existe em
   `knowledge_edges` desde que a tabela existe (`created_at timestamptz NOT NULL DEFAULT now()`),
   é escrita em todas as arestas, e a dataclass **deitava-a fora**: a porta perdia-a entre a base

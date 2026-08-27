@@ -44,6 +44,7 @@ from cogno_engram.types import (
     sanitize_edge_status,
     GraphEdge,
     GraphNode,
+    GraphStats,
     HybridWeights,
     MemoryRecord,
     NodeContext,
@@ -1385,6 +1386,80 @@ class PostgresKnowledgeGraph(_PgBase):
                  if fold_label(label) in (fold_label(e.source), fold_label(e.target))]
         return NodeContext(node=node, edges=edges,
                            neighbors=await self.neighbors(scope, label, audience=audience))
+
+    async def graph_stats(self, scope: str, *, audience: str, top: int = 5) -> GraphStats:
+        """The whole dashboard summary in TWO aggregated reads, replacing ``1 + 3N``.
+
+        The caller (the host's ``knowledge_stats``) listed every node and then asked
+        ``get_node_context`` for each; that helper is ``find_node`` + ``walk`` + ``neighbors``,
+        so the real cost was **1165 queries for the 388 nodes of the live box**, on every page
+        open, growing with the graph. Nothing in the port could answer "how connected is each
+        node" in bulk, which is why the caller had no better way to write it.
+
+        **The semantics are the old ones, deliberately** — this is a cost change, not a meaning
+        change, and a performance PR that quietly moves a number is the worst kind:
+
+        * nodes counted by ``_NODE_VISIBLE`` — DERIVED for a non-staff reader, so an orphan is
+          staff-only, exactly as ``list_nodes`` answered;
+        * edges DISTINCT on ``(source_id, target_id, relation)`` and **ACCEPTED only**, because
+          the old degree came from ``walk``, and ``walk`` traverses no other status;
+        * degree counts both ends, since half the relations point AT the node.
+
+        Two reads and not one because the by-type histogram and the degree ranking group by
+        different things; forcing them together buys nothing and costs readability.
+        """
+        _require_scope(scope)
+        async with self._conn() as conn:
+            cur = await conn.execute(
+                f"SELECT n.node_type, count(*) AS c FROM knowledge_nodes n "
+                f"WHERE n.scope = %s AND {_NODE_VISIBLE} GROUP BY n.node_type",
+                (scope, audience, audience, audience))
+            by_type = {r["node_type"]: int(r["c"]) for r in await cur.fetchall()}
+
+            # `vis` is the DISTINCT visible+accepted edge set — the same set the old code
+            # rebuilt as a Python `set` of `(source, target, relation)` across N contexts.
+            # `deg` unrolls it to one row per endpoint so a LEFT JOIN gives every visible node
+            # its degree INCLUDING zero (a node no visible edge touches is still staff-visible,
+            # and dropping it here would silently shorten the ranking).
+            cur = await conn.execute(
+                f"""WITH vis AS (
+                        SELECT DISTINCT e.source_id, e.target_id, e.relation
+                          FROM knowledge_edges e
+                         WHERE e.scope = %s AND e.status = %s AND {_EDGE_VISIBLE}
+                    ), deg AS (
+                        SELECT source_id AS nid FROM vis
+                        UNION ALL
+                        SELECT target_id AS nid FROM vis
+                    )
+                    SELECT n.id, n.scope, n.label, n.node_type, n.attributes,
+                           count(d.nid) AS degree,
+                           (SELECT count(*) FROM vis) AS total_edges
+                      FROM knowledge_nodes n
+                      LEFT JOIN deg d ON d.nid = n.id
+                     WHERE n.scope = %s AND {_NODE_VISIBLE}
+                     GROUP BY n.id, n.scope, n.label, n.node_type, n.attributes
+                     ORDER BY degree DESC, n.label
+                     LIMIT %s""",
+                (scope, EDGE_ACCEPTED, audience, audience, audience,
+                 scope, audience, audience, audience, max(0, top)))
+            rows = await cur.fetchall()
+
+        # NO VISIBLE NODE ⟹ NO VISIBLE EDGE, and that is an invariant rather than a guess —
+        # which is why this is a `0` and not a third query. Every accepted, visible edge has
+        # endpoints that are nodes of this scope, and for a non-staff reader a visible edge is
+        # exactly what MAKES its endpoints visible (`_NODE_VISIBLE` is derived from it); for
+        # staff every node of the scope is visible, so an empty ranking means an empty scope.
+        # Probed against real SQL on the three ways to get here — empty scope, orphans only, and
+        # an accepted edge belonging to ANOTHER contact — and all three give zero edges:
+        # `test_no_visible_node_means_no_visible_edge`. The first cut asked a third query "not
+        # to report a zero we did not measure"; the zero is measured, by the invariant.
+        total_edges = int(rows[0]["total_edges"]) if rows else 0
+        return GraphStats(
+            total_nodes=sum(by_type.values()), total_edges=total_edges, by_type=by_type,
+            top_connected=[(GraphNode(scope=r["scope"], label=r["label"],
+                                      node_type=r["node_type"],
+                                      attributes=r["attributes"], id=r["id"]),
+                            int(r["degree"])) for r in rows])
 
     async def list_nodes(self, scope: str, *, audience: str,
                          node_type: Optional[str] = None,

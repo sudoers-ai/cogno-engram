@@ -126,3 +126,25 @@ async def test_top_is_a_CUT_not_the_whole_list():
     assert len(two.top_connected) == 2
     assert none.top_connected == []
     assert none.total_nodes == two.total_nodes == 5
+
+
+async def test_TIES_keep_the_store_order_not_alphabetical():
+    """A tie-break is behaviour, and this method was supposed to change only COST.
+
+    The caller's previous version ranked over whatever ``list_nodes`` gave it — ``ORDER BY id``,
+    i.e. insertion order. The first cut of this method sorted ties by LABEL, which is equally
+    deterministic and quietly different: the host's own `test_knowledge_walk_and_stats_shape`
+    failed because two nodes of degree 1 had swapped places. Caught by a test nobody wrote for
+    this change, which is the only reason it was not shipped as "a rewrite, tests still pass".
+    """
+    kg = InMemoryGraph()
+    scope = "t/ties"
+    # Inserted in an order the alphabet disagrees with, so the two rules cannot both pass.
+    for label in ("Zeta", "Alfa"):
+        await kg.upsert_node(GraphNode(scope, label, "PERSON"))
+    await kg.upsert_node(GraphNode(scope, "Hub", "ORG"))
+    await kg.upsert_edge(GraphEdge(scope, "Zeta", "Hub", "AT", audience=AUDIENCE_TENANT))
+    await kg.upsert_edge(GraphEdge(scope, "Alfa", "Hub", "AT", audience=AUDIENCE_TENANT))
+    st = await kg.graph_stats(scope, audience=AUDIENCE_STAFF, top=10)
+    tied = [n.label for n, d in st.top_connected if d == 1]
+    assert tied == ["Zeta", "Alfa"], "empate segue a ordem do store (id), não o alfabeto"

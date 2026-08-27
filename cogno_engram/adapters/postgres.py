@@ -1229,8 +1229,15 @@ class PostgresKnowledgeGraph(_PgBase):
         # list in the dashboard shows it, and staff may search it — but it spends one of the
         # caller's few slots and returns nothing. BOTH ends count: half the relations point AT
         # the person (``Rex OWNED_BY José``), so ``source_id`` alone would halve the recall.
+        # `status = 'accepted'` is not decoration: `walk` (below) traverses ACCEPTED edges only,
+        # so counting an unreviewed one here picks a node the caller cannot walk from — the very
+        # thing this filter exists to prevent, and a PESSIMISATION, because it evicts a nearer
+        # candidate for a farther one that also goes nowhere. Reachable by design: the host
+        # writes proximity relations as PROPOSED (`propose_relations`), which is exactly the
+        # class of edge a turn wants. Anything the walk will not traverse is not "related".
         related = (" AND EXISTS (SELECT 1 FROM knowledge_edges e "
-                   "WHERE e.source_id = n.id OR e.target_id = n.id)") if related_only else ""
+                   "WHERE (e.source_id = n.id OR e.target_id = n.id) "
+                   f"AND e.status = '{EDGE_ACCEPTED}')") if related_only else ""
         async with self._conn() as conn:
             cur = await conn.execute(
                 "SELECT n.id, n.scope, n.label, n.node_type, n.attributes "

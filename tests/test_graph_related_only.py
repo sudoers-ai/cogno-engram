@@ -17,7 +17,8 @@ from __future__ import annotations
 import pytest
 
 from cogno_engram.adapters.in_memory import InMemoryGraph
-from cogno_engram.types import AUDIENCE_STAFF, GraphEdge, GraphNode
+from cogno_engram.types import (AUDIENCE_STAFF, EDGE_ACCEPTED, EDGE_PROPOSED,
+                                GraphEdge, GraphNode)
 
 pytestmark = pytest.mark.asyncio
 
@@ -86,3 +87,68 @@ async def test_related_only_is_scoped():
               await kg.find_nodes_by_embedding("t/a", [1.0, 0.0], audience=AUDIENCE_STAFF,
                                                limit=5, related_only=True)}
     assert labels == set(), "t/b's edge leaked across the scope boundary"
+
+
+# ── the two blind spots the first cut shipped with ──────────────────────────────────────
+
+
+async def test_related_only_ignores_an_UNREVIEWED_edge():
+    """`walk` traverses ACCEPTED edges only, so a `proposed` edge does not make a node walkable.
+
+    Reachable by design, not a corner case: the host writes proximity relations as PROPOSED
+    (`propose_relations`), which is exactly the class of edge a turn wants. Counting one here
+    is worse than missing it — see the pessimisation test below.
+    """
+    kg = InMemoryGraph()
+    scope = "t/unreviewed"
+    await kg.upsert_node(GraphNode(scope, "jose", "PERSON", embedding=[1.0, 0.0]))
+    await kg.upsert_node(GraphNode(scope, "pedro", "PERSON", embedding=[0.9, 0.1]))
+    await kg.upsert_edge(GraphEdge(scope, "jose", "pedro", "PARENT_OF", status=EDGE_PROPOSED))
+    out = await kg.find_nodes_by_embedding(scope, [1.0, 0.0], audience=AUDIENCE_STAFF,
+                                           limit=5, related_only=True)
+    assert out == [], "an unreviewed edge must not make a node look walkable"
+
+
+async def test_counting_an_unreviewed_edge_would_be_a_PESSIMISATION():
+    """Not merely a miss: it EVICTS a nearer candidate for a farther one that also goes nowhere.
+
+    Unfiltered the search returns `jose` + `lonely`; counting the proposed edge would return
+    `jose` + `pedro` — `pedro` is FARTHER from the probe than `lonely`, and neither walks. The
+    filter would have made the answer strictly worse than no filter at all.
+    """
+    kg = InMemoryGraph()
+    scope = "t/pess"
+    await kg.upsert_node(GraphNode(scope, "jose", "PERSON", embedding=[1.0, 0.0]))
+    await kg.upsert_node(GraphNode(scope, "lonely", "CONCEPT", embedding=[0.99, 0.01]))
+    await kg.upsert_node(GraphNode(scope, "pedro", "PERSON", embedding=[0.5, 0.5]))
+    await kg.upsert_node(GraphNode(scope, "ana", "PERSON", embedding=[0.4, 0.6]))
+    await kg.upsert_edge(GraphEdge(scope, "jose", "pedro", "PARENT_OF", status=EDGE_PROPOSED))
+    await kg.upsert_edge(GraphEdge(scope, "pedro", "ana", "KNOWS", status=EDGE_ACCEPTED))
+    out = await kg.find_nodes_by_embedding(scope, [1.0, 0.0], audience=AUDIENCE_STAFF,
+                                           limit=2, related_only=True)
+    labels = [n.label for n in out]
+    assert "jose" not in labels, (
+        "`jose` has only a PROPOSED edge — picking it spends a slot on a node that cannot walk")
+    assert labels == ["pedro", "ana"]
+
+
+async def test_the_filter_runs_BEFORE_the_slice():
+    """THE SLOT COMPETITION IS THE WHOLE FEATURE — and the first cut never tested it.
+
+    Every test in the original PR used `limit=5` against <= 4 nodes, so the limit never bit and
+    a filter applied AFTER the slice passed all of them (measured: 396 green). The real caller
+    asks for `limit=2`. Here three isolated nodes sit NEARER the probe than the one connected
+    node, so a post-slice filter returns [] — the feature 100% dead with the board 100% green.
+    """
+    kg = InMemoryGraph()
+    scope = "t/slots"
+    for i in range(3):
+        await kg.upsert_node(GraphNode(scope, f"iso-{i}", "CONCEPT", embedding=[1.0, 0.0]))
+    await kg.upsert_node(GraphNode(scope, "joined", "CONCEPT", embedding=[0.7, 0.3]))
+    await kg.upsert_node(GraphNode(scope, "friend", "CONCEPT", embedding=[0.0, 1.0]))
+    await kg.upsert_edge(GraphEdge(scope, "joined", "friend", "KNOWS"))
+    out = await kg.find_nodes_by_embedding(scope, [1.0, 0.0], audience=AUDIENCE_STAFF,
+                                           limit=2, related_only=True)
+    labels = {n.label for n in out}
+    assert labels == {"joined", "friend"}, (
+        "the filter must narrow the CANDIDATES, not the already-chosen slots")

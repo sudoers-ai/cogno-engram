@@ -1221,13 +1221,21 @@ class PostgresKnowledgeGraph(_PgBase):
                          created_at=row["created_at"], updated_at=row["updated_at"])
 
     async def find_nodes_by_embedding(self, scope: str, embedding: list[float],
-                                      *, audience: str, limit: int = 5) -> list[GraphNode]:
+                                      *, audience: str, limit: int = 5,
+                                      related_only: bool = False) -> list[GraphNode]:
         _require_scope(scope)
+        # The EXISTS is the whole feature: a caller that will WALK from these nodes wants
+        # candidates that can be walked from. An isolated node is a legitimate row — the node
+        # list in the dashboard shows it, and staff may search it — but it spends one of the
+        # caller's few slots and returns nothing. BOTH ends count: half the relations point AT
+        # the person (``Rex OWNED_BY José``), so ``source_id`` alone would halve the recall.
+        related = (" AND EXISTS (SELECT 1 FROM knowledge_edges e "
+                   "WHERE e.source_id = n.id OR e.target_id = n.id)") if related_only else ""
         async with self._conn() as conn:
             cur = await conn.execute(
                 "SELECT n.id, n.scope, n.label, n.node_type, n.attributes "
                 "FROM knowledge_nodes n WHERE n.scope = %s AND n.embedding IS NOT NULL "
-                f"AND {_NODE_VISIBLE} "
+                f"AND {_NODE_VISIBLE}{related} "
                 "ORDER BY n.embedding <=> %s::vector LIMIT %s",
                 (scope, audience, audience, audience, _vec(embedding), limit))
             rows = await cur.fetchall()

@@ -169,9 +169,15 @@ class KnowledgeGraph(Protocol):
     async def upsert_edge(self, edge: GraphEdge) -> None: ...
     async def find_node(self, scope: str, label: str, *,
                         audience: str) -> Optional[GraphNode]: ...
+    # ``related_only`` restricts the candidates to nodes that participate in at least one edge.
+    # A PARAMETER, and never a default, for a reason with a name: the caller that reads this
+    # port to check the query still EXECUTES (the host's boot schema probe, which passes a zero
+    # vector) would, under a filtered default, get an empty list from a graph with no edges yet
+    # and be unable to tell "schema broken" from "graph is new". A default here decides for
+    # every future reader; a parameter costs the two current ones one keyword.
     async def find_nodes_by_embedding(self, scope: str, embedding: list[float],
-                                      *, audience: str,
-                                      limit: int = 5) -> list[GraphNode]: ...
+                                      *, audience: str, limit: int = 5,
+                                      related_only: bool = False) -> list[GraphNode]: ...
     # Returns ACCEPTED edges only, and deliberately has no flag to say otherwise: a walk feeds
     # the prompt, and "show me the unreviewed ones too" is a curation question, not a retrieval
     # one. A keyword that could turn the filter off is a keyword someone eventually passes.

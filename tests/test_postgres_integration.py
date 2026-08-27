@@ -384,6 +384,54 @@ async def test_node_embedding_search(graph):
     assert out and out[0].label == "alpha"
 
 
+async def test_node_embedding_search_default_keeps_isolated(graph):
+    """The DEFAULT must not filter — see ``tests/test_graph_related_only.py`` for why.
+
+    Duplicated against the real SQL on purpose: the in-memory twin cannot catch a typo in the
+    ``EXISTS`` subquery, and the SQL is where the whole change lives.
+    """
+    scope = f"t/{uuid4()}"
+    await graph.upsert_node(GraphNode(scope, "lonely", "CONCEPT", embedding=_emb(1.0, 0.0)))
+    out = await graph.find_nodes_by_embedding(scope, _emb(1.0, 0.0), limit=5,
+                                              audience=AUDIENCE_STAFF)
+    assert {n.label for n in out} == {"lonely"}
+
+
+async def test_node_embedding_search_related_only(graph):
+    """Both ENDS of an edge count — ``source_id`` alone would pass ``joined`` and drop ``rex``."""
+    scope = f"t/{uuid4()}"
+    await graph.upsert_node(GraphNode(scope, "lonely", "CONCEPT", embedding=_emb(1.0, 0.0)))
+    await graph.upsert_node(GraphNode(scope, "joined", "CONCEPT", embedding=_emb(1.0, 0.0)))
+    await graph.upsert_node(GraphNode(scope, "rex", "ANIMAL", embedding=_emb(1.0, 0.0)))
+    await graph.upsert_node(GraphNode(scope, "other", "CONCEPT", embedding=_emb(0.0, 1.0)))
+    await graph.upsert_edge(GraphEdge(scope, "joined", "other", "KNOWS"))
+    await graph.upsert_edge(GraphEdge(scope, "other", "rex", "OWNS"))
+    out = await graph.find_nodes_by_embedding(scope, _emb(1.0, 0.0), limit=5,
+                                              audience=AUDIENCE_STAFF, related_only=True)
+    labels = {n.label for n in out}
+    # The filter selects on RELATEDNESS, not on distance: ``other`` is far from the probe but
+    # has edges, and with limit=5 over 4 nodes nothing is dropped for being far. The first
+    # draft of this test asserted ``== {"joined", "rex"}`` and failed for that reason.
+    assert "lonely" not in labels
+    assert {"joined", "rex"} <= labels
+
+
+async def test_related_only_does_not_cross_scopes(graph):
+    """An edge in another tenant's scope must not rescue this tenant's isolated node.
+
+    The ``EXISTS`` joins on node IDs, which are globally unique, so this passes by
+    construction — it is here so a future rewrite that matches on LABEL fails loudly.
+    """
+    a, b = f"t/{uuid4()}", f"t/{uuid4()}"
+    await graph.upsert_node(GraphNode(a, "shared-name", "CONCEPT", embedding=_emb(1.0, 0.0)))
+    await graph.upsert_node(GraphNode(b, "shared-name", "CONCEPT", embedding=_emb(1.0, 0.0)))
+    await graph.upsert_node(GraphNode(b, "friend", "CONCEPT", embedding=_emb(0.0, 1.0)))
+    await graph.upsert_edge(GraphEdge(b, "shared-name", "friend", "KNOWS"))
+    out = await graph.find_nodes_by_embedding(a, _emb(1.0, 0.0), limit=5,
+                                              audience=AUDIENCE_STAFF, related_only=True)
+    assert out == []
+
+
 async def test_delete_edges_by_session_prunes(graph):
     scope = f"t/{uuid4()}"
     await _build_jose_rex(graph, scope)

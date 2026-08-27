@@ -38,6 +38,7 @@ from cogno_engram.adapters.postgres import (  # noqa: E402
 from cogno_engram.types import (  # noqa: E402
     AUDIENCE_STAFF,
     AUDIENCE_TENANT,
+    EDGE_ACCEPTED,
     EDGE_PROPOSED,
     audience_for,
     GraphEdge,
@@ -858,6 +859,66 @@ async def test_pg_reassertion_merges_and_promotes_but_never_demotes(graph):
     await graph.upsert_edge(GraphEdge(scope, "José", "Pedro", "PARENT_OF", status="proposed"))
     assert (await graph.walk(scope, "José", audience=AUDIENCE_STAFF))[0].status == "accepted"
     assert await graph.pending_edges(scope, audience=AUDIENCE_STAFF) == []
+
+
+async def test_pg_a_proposal_re_proposed_still_MERGES_what_it_learned(graph):
+    """The half of the attributes gate that no test held, found by mutation.
+
+    The gate reads *"a PROPOSAL may not modify a VERDICT"*: when the stored edge is `accepted`
+    and the incoming one is `proposed`, the stored attributes stand. Every branch around it was
+    covered except the one where **both** sides are proposals — and there the answer must be the
+    opposite: two extractions of the same unreviewed edge are peers, so the second one's detail
+    must MERGE. Nothing asserted that, so widening the gate's left side to hold on any stored
+    status passed the whole suite while silently discarding what a re-extraction learned.
+
+    It matters because `proposed` is where an edge waits to be reviewed: a human curating this
+    edge would see the first extraction's note and never the second's.
+    """
+    scope = "tenant:acme|identity:jose"
+    await graph.upsert_edge(GraphEdge(scope, "José", "Pedro", "PARENT_OF",
+                                      attributes={"note": "joga futebol"}, status="proposed"))
+    await graph.upsert_edge(GraphEdge(scope, "José", "Pedro", "PARENT_OF",
+                                      attributes={"age": 8}, status="proposed"))
+    pending = await graph.pending_edges(scope, audience=AUDIENCE_STAFF)
+    assert len(pending) == 1
+    assert pending[0].attributes == {"note": "joga futebol", "age": 8}
+    assert pending[0].status == "proposed"        # peers merge; neither promotes the other
+
+
+async def test_pg_an_edge_written_without_a_status_column_is_ACCEPTED(pg):
+    """The DDL default, which the adapter's own writes never exercise.
+
+    `upsert_edge` always sends a sanitized status, so the `DEFAULT` on `knowledge_edges.status`
+    is dead code from this package's point of view — and a mutation of it passed all 440 tests.
+    It is not dead from the DATABASE's: a host backfill, an admin SQL statement or a restore
+    that omits the column gets whatever that default says. If it ever drifted out of the
+    vocabulary, `sanitize_edge_status` would map the value to `proposed` on the way back out and
+    those edges would leave the walk — a graph that quietly forgets rows nobody touched.
+
+    The migration path (`ALTER TABLE … DEFAULT`) is covered by the test above; this is the
+    fresh-table twin, and the two are separate statements that can drift apart.
+    """
+    assert pg, "refusing to write into a database without a resolved test DSN"
+    scope = "tenant:acme|identity:default-status"
+    async with await psycopg.AsyncConnection.connect(
+            pg, row_factory=dict_row, autocommit=True) as conn:
+        await conn.execute("DELETE FROM knowledge_nodes WHERE scope = %s", (scope,))
+        cur = await conn.execute(
+            "INSERT INTO knowledge_nodes (scope, label) VALUES (%s, 'Ana'), (%s, 'Rita') "
+            "RETURNING id", (scope, scope))
+        ids = [r["id"] for r in await cur.fetchall()]
+        # every column EXCEPT status — the shape a writer that predates curation produces
+        await conn.execute(
+            "INSERT INTO knowledge_edges (scope, source_id, target_id, relation) "
+            "VALUES (%s, %s, %s, 'FRIEND_OF')", (scope, ids[0], ids[1]))
+        cur = await conn.execute(
+            "SELECT status FROM knowledge_edges WHERE scope = %s", (scope,))
+        assert (await cur.fetchone())["status"] == EDGE_ACCEPTED
+
+        # and the consequence, which is the reason the value matters: it is SPOKEN
+        kg = PostgresKnowledgeGraph(dsn=pg)
+        assert [e.target for e in await kg.walk(scope, "Ana", audience=AUDIENCE_STAFF)] == ["Rita"]
+        await conn.execute("DELETE FROM knowledge_nodes WHERE scope = %s", (scope,))
 
 
 async def test_pg_verdict_on_an_absent_edge_is_reported(graph):

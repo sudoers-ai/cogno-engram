@@ -874,6 +874,17 @@ class PostgresStore(_PgBase):
         total = crow["c"] if crow else 0
         return [self._row_to_turn(r) for r in rows], int(total)
 
+    async def memory_scopes(self) -> list[str]:
+        """Every scope with a memory row. NO `_require_scope` — see the port for the argument.
+
+        `DISTINCT scope` over `memories`, not over `turns`: the two disagree, and the difference
+        is the point. A scope can hold memories and no turns (a consolidated session whose rows
+        were pruned), and — the case that matters — a scope can outlive the tenant that owned it.
+        """
+        async with self._conn() as conn:
+            cur = await conn.execute("SELECT DISTINCT scope FROM memories ORDER BY scope")
+            return [r["scope"] for r in await cur.fetchall()]
+
     async def admin_scopes(self, scope_prefix: str) -> list[str]:
         _require_scope(scope_prefix)
         like = self._subtree_like(scope_prefix)

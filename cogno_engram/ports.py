@@ -113,6 +113,12 @@ class MemoryStore(Protocol):
     async def scan_memories(self, scope: str, *, after_id: Optional[str] = None,
                             limit: int = 1000) -> list[MemoryRecord]: ...
     async def memory_count(self, scope: str) -> int: ...
+    # EVERY scope holding a memory, including scopes no tenant owns any more. The ONE
+    # enumeration with no scope argument, and the exception is argued: retention cannot be
+    # driven per tenant, because the scope whose tenant row is gone is exactly the one that most
+    # needs pruning — nobody owns it and nothing else will visit it. Maintenance only; a caller
+    # serving a request must keep passing a scope. See `maintenance.memory_scopes`.
+    async def memory_scopes(self) -> list[str]: ...
     # `dry_run` answers "how many WOULD go" with the SAME predicate that decides what goes —
     # not a second query a caller writes. Retention is irreversible, and a rule whose effect is
     # only readable by watching it act is not a rule anyone can approve.

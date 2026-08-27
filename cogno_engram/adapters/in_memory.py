@@ -25,6 +25,7 @@ from cogno_engram.types import (
     audience_can_read,
     sanitize_audience,
     EDGE_ACCEPTED,
+    GraphStats,
     EDGE_PROPOSED,
     require_edge_status,
     GraphEdge,
@@ -660,6 +661,45 @@ class InMemoryGraph:
                    if s == scope and lbl in visible
                    and (want is None
                         or fold_label((n.label or "").strip()) == want))
+
+    async def graph_stats(self, scope: str, *, audience: str, top: int = 5) -> GraphStats:
+        """The dashboard summary in one pass — the twin of the Postgres aggregate.
+
+        The point of the method is the CALLER's cost, not this one's: in memory a loop is a loop.
+        It exists here so the two stores answer the same question the same way, which is what
+        ``tests/test_graph_stats_parity.py`` pins.
+
+        Edges are counted DISTINCT by ``(source, target, relation)`` and only when ACCEPTED,
+        because the caller's previous version summed what ``walk`` returned and ``walk`` skips
+        every other status.
+
+        **Deduplication is on the RAW labels — a decision taken on 2026-08-27, not an
+        inheritance.** Folding would give the same number today (the edges come from one store),
+        so the key was left raw to keep this change to COST alone; folding it is a semantic
+        change and gets its own PR. Saying "the same as the caller did" would be provenance
+        dressed as a reason — and that is the exact shape `José`/`Jose` had before it was a defect.
+        """
+        _require_scope(scope)
+        visible = self._visible_labels(scope, audience)
+        nodes = [n for (sc, lbl), n in self._nodes.items() if sc == scope and lbl in visible]
+        by_type: dict = {}
+        for n in nodes:
+            by_type[n.node_type] = by_type.get(n.node_type, 0) + 1
+        seen: set = set()
+        degree: dict = {}
+        for e in self._readable(scope, audience):
+            if e.status != EDGE_ACCEPTED:
+                continue
+            key = (e.source, e.target, e.relation)
+            if key in seen:
+                continue
+            seen.add(key)
+            for lbl in (fold_label(e.source), fold_label(e.target)):
+                degree[lbl] = degree.get(lbl, 0) + 1
+        ranked = sorted(nodes, key=lambda n: (-degree.get(fold_label(n.label), 0), n.label))
+        return GraphStats(
+            total_nodes=len(nodes), total_edges=len(seen), by_type=by_type,
+            top_connected=[(n, degree.get(fold_label(n.label), 0)) for n in ranked[:max(0, top)]])
 
     async def scan_nodes(self, scope: str, *, audience: str,
                          after_id: Optional[int] = None,

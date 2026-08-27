@@ -300,6 +300,29 @@ class NodeContext:
     neighbors: list[GraphNode] = field(default_factory=list)
 
 
+@dataclass
+class GraphStats:
+    """The dashboard's whole graph summary, from ONE aggregated read per shape.
+
+    It exists because the caller that needed it was rebuilding it a node at a time: the host's
+    ``knowledge_stats`` listed every node and then asked ``get_node_context`` for each — and that
+    helper is itself ``find_node`` + ``walk`` + ``neighbors``, so the true cost was ``1 + 3N``
+    (1165 queries for the 388 nodes of the live box, on every page open) and it grows with the
+    graph. Nothing in the port could answer "how connected is each node" in bulk, so there was no
+    other way to write it.
+
+    The counts follow the SAME visibility rules the one-at-a-time version did, and that is the
+    part worth stating: ``total_nodes``/``by_type`` count nodes the audience may see (for a
+    non-staff reader that is DERIVED — a node is visible when some visible edge touches it), and
+    degree counts DISTINCT ``(source, target, relation)`` accepted edges the audience may see,
+    because an unreviewed edge is not walkable and the old code counted what ``walk`` returned.
+    """
+    total_nodes: int = 0
+    total_edges: int = 0
+    by_type: dict = field(default_factory=dict)
+    top_connected: list = field(default_factory=list)   # [(GraphNode, degree)], most connected first
+
+
 def require_edge_status(raw: object) -> str:
     """A VERDICT, validated — raises on anything that is not one. Not the same question as
     :func:`sanitize_edge_status`, and a review had to point out that reusing it was wrong.

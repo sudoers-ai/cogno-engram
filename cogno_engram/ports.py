@@ -27,6 +27,7 @@ from typing import Optional, Protocol, runtime_checkable
 from cogno_engram.types import (
     GraphEdge,
     GraphNode,
+    GraphStats,
     HybridWeights,
     MemoryRecord,
     NodeContext,
@@ -211,6 +212,16 @@ class KnowledgeGraph(Protocol):
     # refusing to answer whenever the page came back full.
     async def count_nodes(self, scope: str, *, audience: str,
                           label: Optional[str] = None) -> int: ...
+    # The whole dashboard summary in ONE aggregated read per shape, because there was no way
+    # to ask "how connected is each node" in bulk. The caller (the host's `knowledge_stats`)
+    # was rebuilding it a node at a time — `list_nodes` then `get_node_context` per node, and
+    # that helper is itself `find_node` + `walk` + `neighbors`, so the real cost was `1 + 3N`:
+    # 1165 queries for the 388 nodes of the live box, on every page open, growing with the graph.
+    # Visibility follows the one-at-a-time version EXACTLY: nodes by the audience rule (DERIVED
+    # for a non-staff reader), degree over DISTINCT accepted edges the audience may see — an
+    # unreviewed edge is not walkable, and the old code counted what `walk` returned.
+    async def graph_stats(self, scope: str, *, audience: str,
+                          top: int = 5) -> GraphStats: ...
     # The graph half of the maintenance walk — see ``MemoryStore.scan_memories``.
     async def scan_nodes(self, scope: str, *, audience: str,
                          after_id: Optional[int] = None,

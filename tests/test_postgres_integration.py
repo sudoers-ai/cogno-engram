@@ -37,7 +37,9 @@ from cogno_engram.adapters.postgres import (  # noqa: E402
 )
 from cogno_engram.types import (  # noqa: E402
     AUDIENCE_STAFF,
+    AUDIENCE_TENANT,
     EDGE_PROPOSED,
+    audience_for,
     GraphEdge,
     GraphNode,
     HybridWeights,
@@ -1610,3 +1612,161 @@ async def test_the_edge_carries_the_date_the_STORE_stamped(pg):
     # e a mesma data chega pela outra porta, senão as duas leituras discordam sobre o mesmo facto
     ctx = await kg.get_node_context("s", "José", audience=AUDIENCE_STAFF)
     assert ctx.edges[0].created_at == lida.created_at
+
+
+# ── graph_stats: same answer, and the QUERY COUNT is the point ────────────
+
+
+async def _stats_shape(graph, scope, audience):
+    """The four numbers the dashboard asks for, recomputed the way the caller used to."""
+    nodes = await graph.list_nodes(scope, audience=audience, limit=100000)
+    by_type: dict = {}
+    for n in nodes:
+        by_type[n.node_type] = by_type.get(n.node_type, 0) + 1
+    edge_keys: set = set()
+    degree: dict = {}
+    for n in nodes:
+        ctx = await graph.get_node_context(scope, n.label, audience=audience)
+        es = ctx.edges if ctx else []
+        degree[n.label] = len(es)
+        for e in es:
+            edge_keys.add((e.source, e.target, e.relation))
+    ranked = sorted(degree.items(), key=lambda kv: (-kv[1], kv[0]))[:5]
+    return len(nodes), len(edge_keys), by_type, ranked
+
+
+class _CountingGraph(PostgresKnowledgeGraph):
+    """Counts the round trips. The claim of this change is a COUNT, so the test asserts a count.
+
+    Wrapping ``_conn`` and not the cursor is deliberate: the old cost was one connection-and-query
+    per node, and counting connections is what makes ``1 + 3N`` visible as a number instead of a
+    story about SQL.
+    """
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.trips = 0
+
+    def _conn(self):
+        self.trips += 1
+        return super()._conn()
+
+
+@pytest.mark.asyncio
+async def test_graph_stats_says_what_the_node_by_node_version_said(graph):
+    """Equivalence against the OLD algorithm, on real SQL — not against constants."""
+    scope = f"t/{uuid4().hex[:8]}"
+    for label, ntype in [("Acme", "ORG"), ("Ana", "PERSON"), ("Bruno", "PERSON"),
+                         ("Solo", "CONCEPT")]:
+        await graph.upsert_node(GraphNode(scope, label, ntype, embedding=_emb(1.0)))
+    await graph.upsert_edge(GraphEdge(scope, "Ana", "Acme", "WORKS_AT", audience=AUDIENCE_TENANT))
+    await graph.upsert_edge(GraphEdge(scope, "Bruno", "Acme", "WORKS_AT", audience=AUDIENCE_TENANT))
+    await graph.upsert_edge(GraphEdge(scope, "Ana", "Bruno", "KNOWS",
+                                      status=EDGE_PROPOSED, audience=AUDIENCE_TENANT))
+    for audience in (AUDIENCE_STAFF, AUDIENCE_TENANT):
+        want_n, want_e, want_by_type, want_top = await _stats_shape(graph, scope, audience)
+        got = await graph.graph_stats(scope, audience=audience)
+        assert got.total_nodes == want_n, audience
+        assert got.total_edges == want_e, audience
+        assert got.by_type == want_by_type, audience
+        assert [(n.label, d) for n, d in got.top_connected] == want_top, audience
+
+
+@pytest.mark.asyncio
+async def test_the_cost_stops_growing_with_the_graph(pg):
+    """THE CLAIM, asserted as a number: the old shape is ``1 + 3N``, the new one is constant.
+
+    Without this the PR would be "we rewrote it and the tests still pass" — which is exactly what
+    a rewrite that kept the N+1 would also report. The two node counts exist so the test can see
+    the SLOPE: a constant that happens to equal one graph's cost proves nothing.
+    """
+    counting = _CountingGraph(dsn=pg)
+    scope = f"t/{uuid4().hex[:8]}"
+    await counting.upsert_node(GraphNode(scope, "Hub", "ORG", embedding=_emb(1.0)))
+    trips_by_size = {}
+    for size in (4, 12):
+        while len([n for n in await counting.list_nodes(scope, audience=AUDIENCE_STAFF,
+                                                        limit=1000)]) < size:
+            i = len(await counting.list_nodes(scope, audience=AUDIENCE_STAFF, limit=1000))
+            await counting.upsert_node(GraphNode(scope, f"n{i}", "PERSON", embedding=_emb(1.0)))
+            await counting.upsert_edge(GraphEdge(scope, f"n{i}", "Hub", "AT",
+                                                 audience=AUDIENCE_TENANT))
+        counting.trips = 0
+        await counting.graph_stats(scope, audience=AUDIENCE_STAFF)
+        trips_by_size[size] = counting.trips
+
+        counting.trips = 0
+        await _stats_shape(counting, scope, AUDIENCE_STAFF)
+        old = counting.trips
+        assert old > trips_by_size[size], (
+            f"com {size} nós o caminho antigo custou {old} viagens e o novo "
+            f"{trips_by_size[size]} — se não for maior, o oráculo deixou de medir o defeito")
+
+    assert trips_by_size[4] == trips_by_size[12], (
+        f"o custo tem de ser CONSTANTE: {trips_by_size} — se cresce com o grafo, "
+        f"o N+1 mudou de sítio em vez de desaparecer")
+
+
+@pytest.mark.asyncio
+async def test_no_visible_node_means_no_visible_edge(graph):
+    """The INVARIANT that lets `graph_stats` return 0 edges without asking a third query.
+
+    Named because a branch covered by accident is not covered: the first cut of this method ran
+    an extra query "not to report a zero we did not measure" — and the zero IS measured, by the
+    structure. Every accepted, visible edge has endpoints that are nodes of this scope, and for a
+    non-staff reader a visible edge is exactly what MAKES its endpoints visible; for staff every
+    node of the scope is visible. So an empty ranking cannot hide a non-empty edge set.
+
+    The three ways to reach an empty ranking, all asserted rather than argued.
+    """
+    empty = f"t/{uuid4().hex[:8]}"
+    st = await graph.graph_stats(empty, audience=AUDIENCE_STAFF)
+    assert (st.total_nodes, st.total_edges, st.top_connected) == (0, 0, [])
+
+    orphans = f"t/{uuid4().hex[:8]}"
+    for label in ("A", "B"):
+        await graph.upsert_node(GraphNode(orphans, label, "PERSON", embedding=_emb(1.0)))
+    st = await graph.graph_stats(orphans, audience=audience_for("x"))
+    assert (st.total_nodes, st.total_edges) == (0, 0), "órfãos não são visíveis a um contacto"
+    st = await graph.graph_stats(orphans, audience=AUDIENCE_STAFF)
+    assert (st.total_nodes, st.total_edges) == (2, 0), "mas são nós reais para o staff"
+
+    other = f"t/{uuid4().hex[:8]}"
+    for label in ("C", "D"):
+        await graph.upsert_node(GraphNode(other, label, "PERSON", embedding=_emb(1.0)))
+    await graph.upsert_edge(GraphEdge(other, "C", "D", "KNOWS", audience=audience_for("outro")))
+    st = await graph.graph_stats(other, audience=audience_for("x"))
+    assert (st.total_nodes, st.total_edges) == (0, 0), (
+        "a aresta de OUTRO contacto não pode aparecer no total deste — é o mesmo total "
+        "que divulgaria que o outro existe")
+    st = await graph.graph_stats(other, audience=AUDIENCE_STAFF)
+    assert (st.total_nodes, st.total_edges) == (2, 1)
+
+
+@pytest.mark.asyncio
+async def test_the_total_does_not_count_ANOTHER_contacts_edge(graph):
+    """The mixed case, and the only one that discriminates — found because a mutation survived.
+
+    Removing `_EDGE_VISIBLE` from the edge count passed the WHOLE integration suite (206 tests).
+    Not because the filter is useless: because no test had a scope where the reader can see SOME
+    node and there is ALSO an edge they may not see. `test_no_visible_node_means_no_visible_edge`
+    tried, but with nothing visible the invariant path returns 0 without ever reading the count —
+    the assertion was true for the wrong reason, which is the same defect it was written to stop.
+
+    Here Ana sees her own edge (so she is a visible node and the ranking is non-empty) while
+    Bruno's edge sits in the same scope. A total that counted it would disclose that Bruno
+    exists — the aggregate's own way of leaking, with no row of his ever leaving the database.
+    """
+    scope = f"t/{uuid4().hex[:8]}"
+    for label in ("Ana", "Acme", "Bruno"):
+        await graph.upsert_node(GraphNode(scope, label, "PERSON", embedding=_emb(1.0)))
+    await graph.upsert_edge(GraphEdge(scope, "Ana", "Acme", "WORKS_AT", audience=audience_for("ana")))
+    await graph.upsert_edge(GraphEdge(scope, "Bruno", "Acme", "WORKS_AT", audience=audience_for("bruno")))
+
+    ana = await graph.graph_stats(scope, audience=audience_for("ana"), top=10)
+    assert ana.total_nodes > 0, "sem nó visível o invariante curto-circuita e o teste não mede"
+    assert ana.total_edges == 1, "a aresta do Bruno não é da Ana e não entra no total dela"
+    assert "Bruno" not in [n.label for n, _ in ana.top_connected]
+
+    staff = await graph.graph_stats(scope, audience=AUDIENCE_STAFF, top=10)
+    assert staff.total_edges == 2, "o staff vê as duas — senão o teste passaria por não contar nada"

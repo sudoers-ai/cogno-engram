@@ -12,3 +12,14 @@ htmlcov/
 .venv/
 venv/
 *.db
+
+# Local secrets. The rule matches the FAMILY, not one filename.
+#
+# `.env*` rather than `.env` + `.env.*`: the narrower pair misses `.env-backup` and `.envbak`,
+# and those are the names a person actually types when setting a config aside. A pattern that
+# covers only the name you thought of leaves the next copy exposed — and a secret committed
+# once stays in history after any `git rm`.
+#
+# The negation keeps a template committable if one is ever added.
+.env*
+!.env.example

@@ -696,7 +696,10 @@ class InMemoryGraph:
             seen.add(key)
             for lbl in (fold_label(e.source), fold_label(e.target)):
                 degree[lbl] = degree.get(lbl, 0) + 1
-        ranked = sorted(nodes, key=lambda n: (-degree.get(fold_label(n.label), 0), n.label))
+        # Ties keep the store's own order (`id`), which is what the caller's previous version
+        # inherited from `list_nodes` (`ORDER BY id`). Sorting ties by LABEL is equally
+        # deterministic and quietly different — see the Postgres twin.
+        ranked = sorted(nodes, key=lambda n: (-degree.get(fold_label(n.label), 0), n.id or 0))
         return GraphStats(
             total_nodes=len(nodes), total_edges=len(seen), by_type=by_type,
             top_connected=[(n, degree.get(fold_label(n.label), 0)) for n in ranked[:max(0, top)]])

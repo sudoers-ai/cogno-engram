@@ -1438,7 +1438,12 @@ class PostgresKnowledgeGraph(_PgBase):
                       LEFT JOIN deg d ON d.nid = n.id
                      WHERE n.scope = %s AND {_NODE_VISIBLE}
                      GROUP BY n.id, n.scope, n.label, n.node_type, n.attributes
-                     ORDER BY degree DESC, n.label
+                     -- `n.id` and not `n.label`: the previous version ranked over whatever
+                     -- `list_nodes` returned, which is `ORDER BY id`. Ranking by label instead
+                     -- reorders TIES, and `test_knowledge_walk_and_stats_shape` caught it — two
+                     -- nodes of degree 1 swapped places. A tie-break is behaviour, and this
+                     -- change is meant to cost less, not to mean anything different.
+                     ORDER BY degree DESC, n.id
                      LIMIT %s""",
                 (scope, EDGE_ACCEPTED, audience, audience, audience,
                  scope, audience, audience, audience, max(0, top)))

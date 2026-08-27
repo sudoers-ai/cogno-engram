@@ -4,6 +4,12 @@
 
 ### Added
 
+- **`graph_stats`: o desempate segue a ordem do store (`id`), não o alfabeto.** O chamador
+  anterior ordenava sobre o que o `list_nodes` devolvia — `ORDER BY id`. O primeiro corte
+  desempatava por rótulo, igualmente determinístico e silenciosamente diferente: dois nós de
+  grau 1 trocavam de lugar, e foi um teste do HOST que não foi escrito para esta mudança que o
+  apanhou. **Um desempate é comportamento, e esta mudança é de custo.**
+
 - **`KnowledgeGraph.graph_stats(scope, *, audience, top=5)` — o resumo do grafo em DUAS leituras
   agregadas, em vez de `1 + 3N`.** O chamador (a rota `knowledge_stats` do host) precisava de
   quatro números — total de nós, total de arestas, histograma por tipo, e os mais ligados — e

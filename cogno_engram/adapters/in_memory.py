@@ -253,6 +253,10 @@ class InMemoryStore:
         turns.sort(key=lambda t: (t.created_at or _now()), reverse=True)
         return turns[offset:offset + limit], len(turns)
 
+    async def memory_scopes(self) -> "list[str]":
+        """Twin of the Postgres one — scopes with MEMORIES, tenant-owned or not."""
+        return sorted({m.scope for m in self._memories})
+
     async def admin_scopes(self, scope_prefix: str) -> list[str]:
         _require_scope(scope_prefix)
         return sorted({t.scope for t in self._turns if self._under(t.scope, scope_prefix)})

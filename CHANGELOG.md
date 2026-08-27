@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased — a retenção passa a ver os scopes que nenhum tenant possui (2026-08-27)
+
+### Added
+
+- **`MemoryStore.memory_scopes()` / `maintenance.memory_scopes(store)`** — todos os scopes com
+  memória, **incluindo os que já não têm dono**.
+
+  **Não é uma excepção ao guarda de scope: é uma pergunta que o guarda nunca cobriu.**
+  O `_require_scope` existe para impedir uma **leitura ATRAVÉS de scopes** — que uma consulta
+  devolva conteúdo de vários contactos porque alguém passou vazio. **Enumerar CHAVES é outra
+  pergunta**, e a fronteira que as mantém separadas é absoluta:
+
+  > **identificadores à saída, NUNCA conteúdo.** Nem uma memória, nem um rótulo, nem uma
+  > contagem por categoria. Uma lista de chaves e nada mais.
+
+  `test_devolve_CHAVES_e_nunca_conteudo` prende-a, com controlo positivo (o segredo **está** na
+  loja, logo a asserção mede a fronteira e não uma loja vazia) e com mutação: fazer o método
+  devolver o conteúdo mata seis testes.
+
+  **A razão de existir, inteira:** a retenção **não pode ser guiada por tenant**, porque o scope
+  cujo tenant desapareceu é precisamente **o que mais precisa de ser podado** — ninguém o possui,
+  ninguém vai pedi-lo, e mais nada o visita. Medido na caixa viva a 27/08: **14 scopes têm
+  memórias, 13 têm tenant vivo**, e o que falta é `default/guest` com **29 memórias de
+  VISITANTES** (pessoas que nunca se registaram), **com categorias que incluem `pii`**.
+  **A regra salta exactamente quem tem menos base para ser retido.**
+
+  Vive em `maintenance`, com nome próprio, e **não pede scope** — se algum dia passar a pedir,
+  deixa de poder ver o órfão, que é a única razão de existir. Um teste prende também isso.
+
 ## Unreleased — a poda pode CONTAR antes de apagar (2026-08-27)
 
 ### Added

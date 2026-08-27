@@ -24,6 +24,42 @@ from cogno_engram.types import MemoryRecord
 
 logger = logging.getLogger("cogno_engram.maintenance")
 
+async def memory_scopes(store: MemoryStore) -> "list[str]":
+    """EVERY scope that holds a memory — including the ones no tenant owns any more.
+
+    **It is not an exception to the scope guard — it is a question the guard never covered.**
+    ``_require_scope`` exists to stop a READ ACROSS scopes: a query returning one contact's
+    content because somebody passed nothing. **Enumerating scope KEYS is a different question**,
+    and the boundary that keeps it different is absolute:
+
+        **identifiers out. NEVER content.** Not a memory, not a label, not a per-category count.
+        A list of keys and nothing else — pinned by ``test_devolve_CHAVES_e_nunca_conteudo``.
+
+    The day this returns content it IS a hole, and that test is what says so.
+
+    **COUNT IT; DO NOT LOG THE LIST.** This is the only result in the library that crosses
+    tenants. The keys are ``tenant/identity``, so the list does not reveal what anyone said —
+    but it does reveal **which identities exist**, across every tenant, in one line. For the
+    janitor that is exactly what it needs; in a log it is a cross-tenant roster nobody asked
+    for. The retention loop already records ``scopes=13`` rather than the names, and this line
+    is what makes that correct by design instead of by luck — a `log.info(scopes)` added during
+    a debugging session is not a decision anybody would think twice about.
+
+    **The reason this exists anyway is the reason retention needs it.** Retention cannot be
+    driven per tenant, because the scope whose tenant row is GONE is precisely the one that most
+    needs pruning — nobody owns it, nobody will ask for it, and nothing else will ever visit it.
+    Measured 2026-08-27 on the live box: 14 scopes hold memories, 13 have a live tenant, and the
+    odd one out is ``default/guest`` with 29 memories of VISITORS — people who never registered,
+    spoke once and left — whose categories include ``pii``. **A retention rule driven by tenants
+    skips exactly whoever has least basis to be retained.**
+
+    So it lives HERE, in maintenance, with a name that says what it is, and not on the read path
+    beside ``load_memories``. Callers that serve a request should keep using a scope; this one
+    serves the janitor.
+    """
+    return await store.memory_scopes()
+
+
 async def prune_memories(
     store: MemoryStore,
     scope: str,

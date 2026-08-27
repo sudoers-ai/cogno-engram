@@ -312,7 +312,7 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
         """
     )
     await conn.execute(
-        """
+        f"""
         CREATE TABLE IF NOT EXISTS knowledge_edges (
             id             bigserial PRIMARY KEY,
             scope          text NOT NULL,
@@ -321,8 +321,8 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
             relation       text NOT NULL,
             confidence     real NOT NULL DEFAULT 1.0,
             source_session text NOT NULL DEFAULT '',
-            attributes     jsonb NOT NULL DEFAULT '{}',
-            status         text NOT NULL DEFAULT 'accepted',
+            attributes     jsonb NOT NULL DEFAULT '{{}}',
+            status         text NOT NULL DEFAULT '{EDGE_ACCEPTED}',
             -- WHO MAY READ IT. '' = unclassified (staff only), 'tenant' = everyone in the
             -- tenant, 'identity:<id>' = that contact's own life. See `types.audience_can_read`.
             audience       text NOT NULL DEFAULT '',
@@ -347,7 +347,7 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
         ("attributes",
          "ALTER TABLE knowledge_edges ADD COLUMN IF NOT EXISTS attributes jsonb NOT NULL DEFAULT '{}'"),
         ("status",
-         "ALTER TABLE knowledge_edges ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT 'accepted'"),
+         f"ALTER TABLE knowledge_edges ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT '{EDGE_ACCEPTED}'"),
         # The DEFAULT backfills every existing edge as UNCLASSIFIED, not as `tenant`: staff keeps
         # seeing them and no contact does. An upgrade must not hand a contact rows nobody has
         # classified — `maintenance.classify_edge_audience` is the deliberate act that assigns
@@ -1199,7 +1199,7 @@ class PostgresKnowledgeGraph(_PgBase):
             src = await self._resolve_node_id(conn, edge.scope, edge.source)
             tgt = await self._resolve_node_id(conn, edge.scope, edge.target)
             await conn.execute(
-                """INSERT INTO knowledge_edges
+                f"""INSERT INTO knowledge_edges
                    (scope, source_id, target_id, relation, confidence, source_session,
                     attributes, status, audience)
                    VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s)
@@ -1213,14 +1213,14 @@ class PostgresKnowledgeGraph(_PgBase):
                        -- the whole edge unreviewed had its relation held and its free text
                        -- SPOKEN. Reviewed means reviewed as it stood.
                        attributes     = CASE
-                           WHEN knowledge_edges.status = 'accepted' AND EXCLUDED.status = 'proposed'
+                           WHEN knowledge_edges.status = '{EDGE_ACCEPTED}' AND EXCLUDED.status = '{EDGE_PROPOSED}'
                            THEN knowledge_edges.attributes
                            ELSE knowledge_edges.attributes || EXCLUDED.attributes END,
                        -- a re-assertion PROMOTES a proposal and never demotes a verdict;
                        -- `rejected` is sticky on purpose (see the in-memory twin: this path
                        -- cannot tell a deliberate correction from the LLM re-emitting the same
                        -- edge, so `set_edge_status` is the only way back)
-                       status         = CASE WHEN knowledge_edges.status = 'proposed'
+                       status         = CASE WHEN knowledge_edges.status = '{EDGE_PROPOSED}'
                                              THEN EXCLUDED.status ELSE knowledge_edges.status END,
                        -- a re-assertion may NARROW the audience but never widen it: the same
                        -- reasoning as `status`, and the direction that cannot leak. An edge
@@ -1304,7 +1304,7 @@ class PostgresKnowledgeGraph(_PgBase):
                         WHERE (e.source_id = w.node_id OR e.target_id = w.node_id)
                           AND e.scope = %s
                           -- an unreviewed edge must not decide what the walk can REACH either
-                          AND e.status = 'accepted'
+                          AND e.status = '{EDGE_ACCEPTED}'
                           -- ...and neither may an edge this reader is not allowed to see: an
                           -- invisible edge that still ROUTED the traversal would disclose the
                           -- neighbour it leads to.
@@ -1397,7 +1397,7 @@ class PostgresKnowledgeGraph(_PgBase):
                      ON nn.id = CASE WHEN e.source_id = n.id THEN e.target_id ELSE e.source_id END
                    WHERE n.scope = %s AND engram_fold(n.label) = engram_fold(%s)
                      -- an unreviewed edge still DISCLOSES its endpoint; see the in-memory twin
-                     AND e.status = 'accepted'
+                     AND e.status = '{EDGE_ACCEPTED}'
                      AND {_EDGE_VISIBLE}""", (scope, label, audience, audience, audience))
             rows = await cur.fetchall()
         return [GraphNode(scope=r["scope"], label=r["label"], node_type=r["node_type"],

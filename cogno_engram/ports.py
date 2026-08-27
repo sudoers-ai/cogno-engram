@@ -169,9 +169,18 @@ class KnowledgeGraph(Protocol):
     async def upsert_edge(self, edge: GraphEdge) -> None: ...
     async def find_node(self, scope: str, label: str, *,
                         audience: str) -> Optional[GraphNode]: ...
+    # ``related_only`` restricts the candidates to nodes that participate in at least one edge.
+    # A PARAMETER, and never a default, because THE TWO CALLERS WANT OPPOSITE THINGS. One walks
+    # from these nodes and wants candidates it can walk from; the other is a boot schema probe
+    # that exists to check the query still EXECUTES, and must therefore run the SIMPLEST form
+    # of it — a filtering default would silently make it exercise a join against
+    # ``knowledge_edges`` that it never asked for. Add the readers that legitimately want
+    # isolated nodes (a staff search, the dashboard's node list) and a default is a silent
+    # behaviour change for every deployment that upgrades. A default decides for all of them;
+    # a parameter costs the one caller that wants it a single keyword.
     async def find_nodes_by_embedding(self, scope: str, embedding: list[float],
-                                      *, audience: str,
-                                      limit: int = 5) -> list[GraphNode]: ...
+                                      *, audience: str, limit: int = 5,
+                                      related_only: bool = False) -> list[GraphNode]: ...
     # Returns ACCEPTED edges only, and deliberately has no flag to say otherwise: a walk feeds
     # the prompt, and "show me the unreviewed ones too" is a curation question, not a retrieval
     # one. A keyword that could turn the filter off is a keyword someone eventually passes.

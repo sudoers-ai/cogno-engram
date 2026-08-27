@@ -515,12 +515,19 @@ class InMemoryGraph:
         return self._nodes.get((scope, fold_label(label)))
 
     async def find_nodes_by_embedding(self, scope: str, embedding: list[float],
-                                      *, audience: str, limit: int = 5) -> list[GraphNode]:
+                                      *, audience: str, limit: int = 5,
+                                      related_only: bool = False) -> list[GraphNode]:
         _require_scope(scope)
         visible = self._visible_labels(scope, audience)
+        related: set = set()
+        if related_only:
+            related = {fold_label(lbl)
+                       for e in self._edges if e.scope == scope
+                       for lbl in (e.source, e.target)}
         scored = [(_cosine(embedding, n.embedding), n)
                   for n in self._nodes.values()
-                  if n.scope == scope and n.embedding and fold_label(n.label) in visible]
+                  if n.scope == scope and n.embedding and fold_label(n.label) in visible
+                  and (not related_only or fold_label(n.label) in related)]
         scored.sort(key=lambda pair: pair[0], reverse=True)
         return [n for _, n in scored[:limit]]
 

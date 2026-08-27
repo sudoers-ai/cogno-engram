@@ -36,11 +36,11 @@ async def _graph_with_one_of_each():
 async def test_default_still_returns_isolated_nodes():
     """THE DEFAULT IS TODAY'S BEHAVIOUR — this test dies the day that stops being true.
 
-    Not a style preference. The host's boot schema probe calls this port with a ZERO vector
-    for one purpose: to confirm the query executes. Under a filtering default it would get an
-    empty list from a graph that simply has no edges yet, and could not tell a broken schema
-    from a new deployment. A default decides for every future reader; a parameter costs the
-    two current callers one keyword.
+    Not a style preference: the two callers want opposite things. ``_graph_context`` walks
+    from these nodes and wants ones it can walk from; the boot schema probe exists to confirm
+    the query EXECUTES and must run its simplest form, not a caller-specific variant that
+    silently joins ``knowledge_edges``. Other readers — a staff search, the dashboard node
+    list — legitimately want the isolated nodes. A default decides for all of them.
     """
     kg, scope = await _graph_with_one_of_each()
     labels = {n.label for n in

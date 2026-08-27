@@ -1,5 +1,36 @@
 # Changelog
 
+## Unreleased — o tipo do nó é normalizado na FRONTEIRA (2026-08-27)
+
+### Fixed
+
+- **`GraphNode.__post_init__` dobra a CAIXA do `node_type`.** O índice único do Postgres é
+  `(scope, engram_fold(label), node_type)`: a metade do RÓTULO é dobrada, a do TIPO não era.
+  `Rex/PERSON` e `Rex/person` seriam **duas linhas para uma coisa** — a mesma forma do
+  `José`/`Jose`, com metade do trabalho já feito. **Uma identidade meio-dobrada é pior que uma
+  crua, porque parece resolvida.**
+
+  **Na FRONTEIRA e não num terceiro ajudante:** o `graph_context.ingest_entities` e o `hypnos` já
+  normalizavam, e os dois estão certos — mas são caminhos de conveniência, não a porta. A forma
+  DOCUMENTADA de entrar é construir um `GraphNode` e chamar `upsert_node`, que recebia o valor
+  cru; e esta é uma lib **pública**, cujos consumidores não são só o nosso host.
+
+  **PREVENÇÃO, não reparação, e a distinção é medida** — na caixa viva, às **03:26 de 27/08**:
+  394 nós, **zero** fora de maiúsculas, **zero** pares que difiram só na caixa do tipo, com
+  **controlo positivo** (a mesma forma de consulta encontra 10 grupos de mesmo-rótulo/tipos
+  diferentes, logo sabe encontrar). Não há nada para migrar, e é isso que a torna barata hoje:
+  **com uma única linha em minúsculas a resposta inverteria** — normalizar só na ESCRITA e migrar
+  primeiro —, porque o `__post_init__` corre também quando os adaptadores constroem um nó A PARTIR
+  DE UMA LINHA, e um objecto que discorda da sua linha faz um ler-modificar-gravar criar uma
+  SEGUNDA linha em vez de actualizar a primeira.
+
+  **Só a caixa.** Um tipo desconhecido é dobrado mas **não coagido** a `CONCEPT`: coagir aqui
+  reescreveria um valor à SAÍDA da base, que é uma decisão diferente e com perda. Os ajudantes de
+  escrita já coagem contra `VALID_NODE_TYPES` — é o trabalho deles.
+
+  **Não resolve os 10 grupos** de `Ernany/CONCEPT` vs `Ernany/PERSON`: isso é desacordo semântico
+  sobre o que a coisa É, outro eixo, e continua parqueado.
+
 ## Unreleased
 
 ### Added

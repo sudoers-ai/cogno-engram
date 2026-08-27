@@ -106,6 +106,34 @@ class MemoryRecord:
 
 @dataclass
 class GraphNode:
+    """A typed node. ``node_type`` is CASE-NORMALISED here, at the boundary.
+
+    **Why here and not in the helpers.** ``graph_context.ingest_entities`` and ``hypnos`` both
+    upper-case the type before building a node, and both do it correctly — but they are two
+    convenience paths, not the door. The DOCUMENTED way in is to build a ``GraphNode`` and call
+    ``upsert_node``, which takes the value raw; and this is a PUBLIC library, so its callers are
+    not only our own host. Normalising in a third helper would be a third copy of the rule.
+
+    **Why it matters more than a style nit.** The Postgres unique index is
+    ``(scope, engram_fold(label), node_type)``: the LABEL half is folded and the TYPE half is
+    not. ``Rex/PERSON`` and ``Rex/person`` would be two rows for one thing — the same shape as
+    ``José``/``Jose``, with half the work already done. **A half-folded identity is worse than a
+    raw one, because it looks solved.**
+
+    **PREVENTION, not repair, and that distinction is measured.** On 2026-08-27 the live box had
+    ZERO rows outside upper case and ZERO pairs differing only in the type's case — verified with
+    a POSITIVE CONTROL (the same query shape finds 10 groups of same-label/different-type, so it
+    knows how to find things). There is nothing to migrate, which is exactly why this is cheap
+    today: with one lower-case row already stored the answer would invert — normalise on WRITE
+    only, and migrate first — because ``__post_init__`` also runs when the ADAPTERS build a node
+    from a row, and an object that disagrees with its row makes read-modify-write create a
+    SECOND row instead of updating the first.
+
+    **Case only.** An unknown type is left alone: coercing it to ``CONCEPT`` here would rewrite a
+    value on the way OUT of the database, which is a different (and lossy) decision from folding
+    case. The write helpers already coerce against :data:`VALID_NODE_TYPES`; that is their job.
+    """
+
     scope: str
     label: str
     node_type: str = "CONCEPT"
@@ -114,6 +142,14 @@ class GraphNode:
     id: Optional[int] = None
     created_at: Optional[datetime] = None      # set by the adapter, not the caller
     updated_at: Optional[datetime] = None
+
+    def __post_init__(self) -> None:
+        # Total and never raising: a node whose type is unusable must still be a node — the
+        # graph losing a row is worse than the row carrying an odd label.
+        try:
+            self.node_type = str(self.node_type or "CONCEPT").strip().upper() or "CONCEPT"
+        except Exception:                                   # noqa: BLE001 — see above
+            self.node_type = "CONCEPT"
 
 
 # ── Edge curation ──────────────────────────────────────────────────────────

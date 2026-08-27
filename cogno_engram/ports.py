@@ -113,9 +113,13 @@ class MemoryStore(Protocol):
     async def scan_memories(self, scope: str, *, after_id: Optional[str] = None,
                             limit: int = 1000) -> list[MemoryRecord]: ...
     async def memory_count(self, scope: str) -> int: ...
+    # `dry_run` answers "how many WOULD go" with the SAME predicate that decides what goes —
+    # not a second query a caller writes. Retention is irreversible, and a rule whose effect is
+    # only readable by watching it act is not a rule anyone can approve.
     async def delete_memories(self, scope: str, *, older_than: Optional[datetime] = None,
                               category: Optional[str] = None,
-                              max_confidence: Optional[float] = None) -> int: ...
+                              max_confidence: Optional[float] = None,
+                              dry_run: bool = False) -> int: ...
     # Right-to-be-forgotten: hard-delete EVERY row this store owns for a scope — sessions, turns,
     # turn_traces, and memories. For when the host offboards an identity/scope entirely (a
     # deleted contact must not leave stale recall behind that re-pollutes a later re-onboarding).

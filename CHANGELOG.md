@@ -1,5 +1,37 @@
 # Changelog
 
+## Unreleased — a poda pode CONTAR antes de apagar (2026-08-27)
+
+### Added
+
+- **`prune_memories(..., dry_run=True)` e `MemoryStore.delete_memories(..., dry_run=True)`**:
+  devolvem quantas memórias **iriam** sair, sem tocar em nenhuma.
+
+  **Porquê agora:** o `prune_memories` existe e está testado **desde sempre, e ninguém o chama** —
+  varrido no host com controlo positivo (a mesma varredura encontra
+  `from cogno_engram import maintenance` no `reembed.py`, portanto sabe achar). **A memória só
+  cresce; nada sai por idade.** Ligá-lo é barato — a função difícil estava feita. O que faltava
+  era poder **aprovar** a regra: retenção é irreversível, e ninguém deve descobrir o que uma
+  regra de 120 dias remove **vendo-a remover**.
+
+  **UM predicado, dois verbos.** O filtro é construído uma vez e só a cláusula da frente muda
+  (`SELECT count(*)` em vez de `DELETE`). Contar com uma consulta à parte seria **re-derivar a
+  regra que decide um apagamento**, e as duas divergiriam no dia em que um filtro fosse
+  acrescentado — a forma de defeito que este repositório passa a vida a encontrar. Aqui *"o que
+  iria"* e *"o que foi"* não podem discordar, e `test_the_dry_run_number_is_EXACTLY_what_the_real_run_removes`
+  prende-o.
+
+  **`dry_run` é opt-in nos DOIS níveis**, e o segundo foi apanhado por uma mutação sobrevivente:
+  virar o default do ADAPTADOR passava os dez primeiros testes, porque o ajudante passa sempre o
+  valor explicitamente. Mas `delete_memories` é porta pública — um chamador directo veria a
+  faxina **parar em silêncio**, a devolver números certos e a não limpar nada.
+  `test_the_PORTS_default_is_also_to_delete` fecha-o.
+
+  **E o tecto de confiança ganhou a frase que faltava:** sem `max_confidence`, isto apaga um
+  facto CONFIRMADO por ser velho — perda de dados vestida com a palavra "limpeza". O teste tem
+  o seu próprio controlo (`test_WITHOUT_the_ceiling_the_confirmed_fact_would_go`), que prova que
+  mede o tecto e não a idade.
+
 ## Unreleased — o tipo do nó é normalizado na FRONTEIRA (2026-08-27)
 
 ### Fixed

@@ -32,20 +32,29 @@ async def prune_memories(
     max_confidence: Optional[float] = None,
     category: Optional[str] = None,
     now: Optional[datetime] = None,
+    dry_run: bool = False,
 ) -> int:
     """Delete memories older than ``older_than`` (optionally only low-confidence /
-    a single category). Returns the number deleted.
+    a single category). Returns the number deleted — or, with ``dry_run``, how many WOULD go.
 
     A sensible default for bounding growth: ``prune_memories(store, scope,
     older_than=timedelta(days=180), max_confidence=0.75)`` keeps durable facts
     (confidence ~1.0) while clearing stale, low-value inferences.
+
+    **``max_confidence`` is not decoration.** Without it this deletes a CONFIRMED fact because
+    it is old, which is data loss wearing the word "cleanup". A retention rule that cannot tell
+    "stale inference" from "what the person told us" should not run.
+
+    **``dry_run`` reads the same predicate that would act.** Counting with a separate query
+    would re-derive the rule that decides a deletion, and the two would drift the first time a
+    filter is added. Retention is irreversible: the number has to be readable BEFORE it is armed.
     """
     now = now or datetime.now(timezone.utc)
     cutoff = now - older_than
     deleted = await store.delete_memories(scope, older_than=cutoff, category=category,
-                                          max_confidence=max_confidence)
-    logger.info("stage=maintenance event=prune_memories scope=%s removed=%d category=%s",
-                scope, deleted, category or "*")
+                                          max_confidence=max_confidence, dry_run=dry_run)
+    logger.info("stage=maintenance event=prune_memories scope=%s %s=%d category=%s",
+                scope, "would_remove" if dry_run else "removed", deleted, category or "*")
     return deleted
 
 async def reembed_memories(

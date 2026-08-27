@@ -1016,9 +1016,23 @@ class PostgresStore(_PgBase):
 
     async def delete_memories(self, scope: str, *, older_than: Optional[datetime] = None,
                               category: Optional[str] = None,
-                              max_confidence: Optional[float] = None) -> int:
+                              max_confidence: Optional[float] = None,
+                              dry_run: bool = False) -> int:
+        """Delete matching memories and return how many — or, with ``dry_run``, how many WOULD go.
+
+        **ONE predicate, two verbs.** The filter is built once and only the leading clause
+        changes. A caller that counted with its own query would be re-deriving the rule that
+        decides a deletion, and the two would drift the day a filter is added — the exact shape
+        of defect this codebase keeps finding. Here "what would go" and "what went" cannot
+        disagree, because they are the same WHERE.
+
+        ``dry_run`` exists because retention is irreversible and a first run must be readable
+        before it is armed: nobody should learn what a 120-day rule removes by watching it
+        remove it.
+        """
         _require_scope(scope)
-        sql = "DELETE FROM memories WHERE scope = %s"
+        head = "SELECT count(*) FROM memories" if dry_run else "DELETE FROM memories"
+        sql = f"{head} WHERE scope = %s"
         params: list = [scope]
         if older_than is not None:
             sql += " AND created_at < %s"
@@ -1031,6 +1045,9 @@ class PostgresStore(_PgBase):
             params.append(max_confidence)
         async with self._conn() as conn:
             cur = await conn.execute(sql, params)
+            if dry_run:
+                row = await cur.fetchone()
+                return int((row or {}).get("count") or 0)
             return cur.rowcount
 
     async def purge_scope(self, scope: str) -> int:

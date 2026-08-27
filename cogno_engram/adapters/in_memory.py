@@ -331,7 +331,9 @@ class InMemoryStore:
 
     async def delete_memories(self, scope: str, *, older_than: Optional[datetime] = None,
                               category: Optional[str] = None,
-                              max_confidence: Optional[float] = None) -> int:
+                              max_confidence: Optional[float] = None,
+                              dry_run: bool = False) -> int:
+        """Twin of the Postgres one: ONE predicate, two verbs — see it for why."""
         _require_scope(scope)
 
         def keep(m: MemoryRecord) -> bool:
@@ -345,9 +347,12 @@ class InMemoryStore:
                 return True
             return False   # matches all active filters → delete
 
-        before = len(self._memories)
-        self._memories = [m for m in self._memories if keep(m)]
-        return before - len(self._memories)
+        survivors = [m for m in self._memories if keep(m)]
+        going = len(self._memories) - len(survivors)
+        if dry_run:
+            return going
+        self._memories = survivors
+        return going
 
     async def purge_scope(self, scope: str) -> int:
         _require_scope(scope)

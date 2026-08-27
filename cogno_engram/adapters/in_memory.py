@@ -521,8 +521,12 @@ class InMemoryGraph:
         visible = self._visible_labels(scope, audience)
         related: set = set()
         if related_only:
+            # ACCEPTED only — `walk` skips every other status, so an unreviewed edge does not
+            # make a node walkable. See the Postgres twin for why this is a pessimisation and
+            # not merely a miss.
             related = {fold_label(lbl)
-                       for e in self._edges if e.scope == scope
+                       for e in self._edges
+                       if e.scope == scope and e.status == EDGE_ACCEPTED
                        for lbl in (e.source, e.target)}
         scored = [(_cosine(embedding, n.embedding), n)
                   for n in self._nodes.values()

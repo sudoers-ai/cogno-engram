@@ -37,6 +37,7 @@ from cogno_engram.adapters.postgres import (  # noqa: E402
 )
 from cogno_engram.types import (  # noqa: E402
     AUDIENCE_STAFF,
+    EDGE_PROPOSED,
     GraphEdge,
     GraphNode,
     HybridWeights,
@@ -414,6 +415,39 @@ async def test_node_embedding_search_related_only(graph):
     # draft of this test asserted ``== {"joined", "rex"}`` and failed for that reason.
     assert "lonely" not in labels
     assert {"joined", "rex"} <= labels
+
+
+async def test_related_only_ignores_an_UNREVIEWED_edge(graph):
+    """`walk` traverses ACCEPTED edges only — an unreviewed edge must not look walkable.
+
+    Against the real SQL because the twin cannot catch a missing clause in the EXISTS.
+    """
+    scope = f"t/{uuid4()}"
+    await graph.upsert_node(GraphNode(scope, "jose", "PERSON", embedding=_emb(1.0, 0.0)))
+    await graph.upsert_node(GraphNode(scope, "pedro", "PERSON", embedding=_emb(0.9, 0.1)))
+    await graph.upsert_edge(GraphEdge(scope, "jose", "pedro", "PARENT_OF",
+                                      status=EDGE_PROPOSED))
+    out = await graph.find_nodes_by_embedding(scope, _emb(1.0, 0.0), limit=5,
+                                              audience=AUDIENCE_STAFF, related_only=True)
+    assert out == []
+
+
+async def test_the_filter_runs_BEFORE_the_slice(graph):
+    """The slot competition IS the feature: three isolated nodes NEARER than the connected one.
+
+    The original cut used `limit=5` against <= 4 nodes everywhere, so a filter applied after
+    the slice passed the whole suite. The real caller asks for `limit=2`.
+    """
+    scope = f"t/{uuid4()}"
+    for i in range(3):
+        await graph.upsert_node(GraphNode(scope, f"iso-{i}", "CONCEPT",
+                                          embedding=_emb(1.0, 0.0)))
+    await graph.upsert_node(GraphNode(scope, "joined", "CONCEPT", embedding=_emb(0.7, 0.3)))
+    await graph.upsert_node(GraphNode(scope, "friend", "CONCEPT", embedding=_emb(0.0, 1.0)))
+    await graph.upsert_edge(GraphEdge(scope, "joined", "friend", "KNOWS"))
+    out = await graph.find_nodes_by_embedding(scope, _emb(1.0, 0.0), limit=2,
+                                              audience=AUDIENCE_STAFF, related_only=True)
+    assert {n.label for n in out} == {"joined", "friend"}
 
 
 async def test_related_only_does_not_cross_scopes(graph):

@@ -1,5 +1,46 @@
 # Changelog
 
+## Unreleased — o vocabulário de status deixa de ser escrito à mão dentro do SQL (2026-08-27)
+
+### Changed
+
+- **`adapters/postgres.py` passa a ler `EDGE_ACCEPTED`/`EDGE_PROPOSED` de `types.py` nos sete
+  sítios em que os escrevia à mão dentro do SQL** — DDL da tabela, DDL da migração aditiva, os
+  três ramos do `upsert_edge`, o filtro do `walk` e o do `neighbors`.
+
+  **O ficheiro já importava as constantes e já as interpolava** — `_EDGE_VISIBLE` faz isso com
+  o vocabulário de audiência, e a linha 1269 fá-lo com o próprio `EDGE_ACCEPTED`, a quarenta
+  linhas de uma que escrevia `'accepted'` à mão. As duas metades do mesmo ficheiro discordavam
+  sobre onde mora o vocabulário; agora não.
+
+  **Porque isto não é cosmética: uma deriva aqui não levanta erro, deixa de casar.**
+  `AND e.status = 'acepted'` é SQL válido que devolve zero linhas — o `walk` não alcança nada e
+  o `neighbors` não revela ninguém, e o grafo parece **vazio** em vez de partido. Pelo outro
+  lado, um DEFAULT fora do vocabulário é mapeado para `proposed` pelo `sanitize_edge_status` na
+  leitura, e toda aresta nova sairia da travessia sem que ninguém lhe tivesse tocado.
+
+  **O SQL renderizado é byte a byte o mesmo** (provado linha a linha contra `origin/main`: nove
+  linhas tocadas, zero acrescentadas ou removidas, cada uma idêntica depois de desfazer a
+  substituição). As duas formas de errar o escape de chaves na DDL são ruidosas — um `{}` por
+  escapar é `SyntaxError` no import, um `{{}}` a mais é jsonb inválido que o Postgres recusa.
+
+### Added
+
+- **`tests/test_edge_status_vocabulary.py`** — nenhum adaptador escreve um valor de status à
+  mão (prosa pode citá-lo, código não), o SQL só interpola constantes do vocabulário, e a
+  **LISTA** fica presa: um quarto status torna o teste vermelho e obriga a rever cada consulta
+  que filtra por status, em vez de derivar em silêncio. Um teste irmão prende o pressuposto do
+  próprio verificador — a divisão no `#` só é segura enquanto nenhum fragmento de SQL contiver
+  um `#`, senão o infractor estaria dentro da metade descartada.
+
+- **Dois testes de integração que a mutação provou em falta**:
+  `test_pg_a_proposal_re_proposed_still_MERGES_what_it_learned` (duas extracções da mesma
+  aresta não revista são pares: a segunda **funde** o que aprendeu, e nada afirmava isso — o
+  portão podia passar a reter em qualquer status guardado com a suíte inteira verde) e
+  `test_pg_an_edge_written_without_a_status_column_is_ACCEPTED` (o DEFAULT da DDL, que as
+  escritas deste pacote nunca exercitam porque `upsert_edge` manda sempre um status, mas que
+  decide o que um backfill do host ou um restauro produzem).
+
 ## Unreleased — a retenção passa a ver os scopes que nenhum tenant possui (2026-08-27)
 
 ### Added

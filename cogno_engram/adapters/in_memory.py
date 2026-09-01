@@ -653,7 +653,8 @@ class InMemoryGraph:
         return nodes[:limit]
 
     async def count_nodes(self, scope: str, *, audience: str,
-                          label: Optional[str] = None) -> int:
+                          label: Optional[str] = None,
+                          node_type: Optional[str] = None) -> int:
         """How many nodes this scope holds, or how many carry ``label`` (case-insensitively).
 
         Dobrado por `folding.fold_label`, como TODA leitura de nó — `find_node` e `walk`
@@ -669,7 +670,11 @@ class InMemoryGraph:
         return sum(1 for (s, lbl), n in self._nodes.items()
                    if s == scope and lbl in visible
                    and (want is None
-                        or fold_label((n.label or "").strip()) == want))
+                        or fold_label((n.label or "").strip()) == want)
+                   # EXACT, like the Postgres twin and like `list_nodes`: node types are a
+                   # closed vocabulary the writer already normalised, and folding here would
+                   # make this count answer about a wider set than the list it accompanies.
+                   and (node_type is None or n.node_type == node_type))
 
     async def graph_stats(self, scope: str, *, audience: str, top: int = 5) -> GraphStats:
         """The dashboard summary in one pass — the twin of the Postgres aggregate.

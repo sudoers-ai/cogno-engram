@@ -1176,6 +1176,69 @@ async def test_pg_count_nodes_SEES_the_homonym_the_double_collapses(graph):
     assert await graph.count_nodes(scope, label="José", audience=AUDIENCE_STAFF) == 2
 
 
+async def test_pg_count_nodes_by_type(graph):
+    """O parâmetro NOVO, contra o armazém real — e não contra o duplo.
+
+    O duplo em memória e o Postgres **discordam** sobre esta função (ver
+    `test_pg_count_nodes_SEES_the_homonym_the_double_collapses`, logo acima): a chave real é
+    `(scope, engram_fold(label), node_type)` e o duplo colapsa homónimos que o armazém guarda.
+    **Testar só o duplo é exactamente a escolha que aquele teste existe para desaconselhar** —
+    e é a lacuna que este ficheiro fecha.
+    """
+    scope = f"t/{uuid4()}"
+    for i in range(3):
+        await graph.upsert_node(GraphNode(scope, f"p{i}", "PERSON"))
+    for i in range(5):
+        await graph.upsert_node(GraphNode(scope, f"c{i}", "CONCEPT"))
+
+    assert await graph.count_nodes(scope, audience=AUDIENCE_STAFF) == 8
+    assert await graph.count_nodes(scope, audience=AUDIENCE_STAFF, node_type="PERSON") == 3
+    assert await graph.count_nodes(scope, audience=AUDIENCE_STAFF, node_type="ANIMAL") == 0
+
+    # label E tipo estreitam JUNTOS — nenhum pode ganhar em silêncio
+    assert await graph.count_nodes(scope, audience=AUDIENCE_STAFF,
+                                   label="p0", node_type="PERSON") == 1
+    assert await graph.count_nodes(scope, audience=AUDIENCE_STAFF,
+                                   label="p0", node_type="CONCEPT") == 0
+
+    # A INVARIANTE: o count e o list respondem sobre o MESMO conjunto.
+    for tp in ("PERSON", "CONCEPT", "ANIMAL", None):
+        listed = await graph.list_nodes(scope, audience=AUDIENCE_STAFF,
+                                        node_type=tp, limit=1000)
+        counted = await graph.count_nodes(scope, audience=AUDIENCE_STAFF, node_type=tp)
+        assert counted == len(listed), f"count e list divergem para {tp!r}"
+
+
+async def test_pg_count_nodes_by_type_is_EXACT_not_folded(graph):
+    """A correspondência do TIPO é exacta, enquanto a do LABEL é dobrada — e a diferença é
+    deliberada. Uma dobra aqui faria o `count` responder sobre um conjunto **mais largo** do
+    que o `list` devolve, que é a única coisa que este parâmetro promete.
+
+    **A linha em caixa diferente é escrita por baixo do construtor de propósito.** A main
+    normaliza `node_type` na fronteira desde hoje, portanto este caso já não é alcançável por
+    `GraphNode(...)` — mas **as linhas gravadas ANTES dessa normalização continuam na base**, e
+    uma migração ou um `INSERT` cru entram pelo mesmo sítio. É por elas que a exactidão importa.
+
+    O duplo em memória não pode provar isto: a chave dele não tem `node_type`.
+    """
+    scope = f"t/{uuid4()}"
+    await graph.upsert_node(GraphNode(scope, "canonical", "PERSON"))
+    antiga = GraphNode(scope, "legada", "PERSON")
+    antiga.node_type = "person"                     # como a linha ficou antes da normalização
+    await graph.upsert_node(antiga)
+
+    # Duas LINHAS (a chave única inclui `node_type`), e a contagem por tipo vê só a exacta.
+    assert await graph.count_nodes(scope, audience=AUDIENCE_STAFF) == 2
+    assert await graph.count_nodes(scope, audience=AUDIENCE_STAFF, node_type="PERSON") == 1
+    assert await graph.count_nodes(scope, audience=AUDIENCE_STAFF, node_type="person") == 1
+
+    # E o `list` concorda com o `count` nas duas caixas — a invariante, no armazém real.
+    for tp in ("PERSON", "person"):
+        listed = await graph.list_nodes(scope, audience=AUDIENCE_STAFF, node_type=tp, limit=100)
+        assert len(listed) == await graph.count_nodes(scope, audience=AUDIENCE_STAFF,
+                                                      node_type=tp), tp
+
+
 async def test_pg_count_nodes_scopes_and_zeroes(graph):
     mine, theirs = f"t/{uuid4()}", f"t/{uuid4()}"
     await graph.upsert_node(GraphNode(theirs, "José", "PERSON"))

@@ -1521,7 +1521,8 @@ class PostgresKnowledgeGraph(_PgBase):
                 for r in rows]
 
     async def count_nodes(self, scope: str, *, audience: str,
-                          label: Optional[str] = None) -> int:
+                          label: Optional[str] = None,
+                          node_type: Optional[str] = None) -> int:
         """How many nodes this scope holds, or how many carry ``label``.
 
         `engram_fold(label)` on both sides, matching `find_node` and the `walk` seed — the unique
@@ -1540,6 +1541,11 @@ class PostgresKnowledgeGraph(_PgBase):
         if label is not None:
             sql += " AND engram_fold(n.label) = engram_fold(%s)"
             params.append(label.strip())
+        if node_type is not None:
+            # EXACTLY the predicate `list_nodes` uses, so "how many" and "which ones" cannot
+            # answer about different sets — the whole point of the parameter.
+            sql += " AND n.node_type = %s"
+            params.append(node_type)
         async with self._conn() as conn:
             cur = await conn.execute(sql, params)
             row = await cur.fetchone()

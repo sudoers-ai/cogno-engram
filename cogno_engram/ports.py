@@ -220,8 +220,14 @@ class KnowledgeGraph(Protocol):
     # right answer only while the tenant stays smaller than the page — and a homonym created
     # past the cut is simply invisible. That is a live defect the host had to work around by
     # refusing to answer whenever the page came back full.
+    #
+    # `node_type` narrows the same way `list_nodes` does, and exists because a caller that
+    # PAGES a filtered list needs the size of the same set it is paging. Counting only the
+    # unfiltered total leaves the filtered view reporting a ceiling — the defect this closes,
+    # in the exact place the type filter is used.
     async def count_nodes(self, scope: str, *, audience: str,
-                          label: Optional[str] = None) -> int: ...
+                          label: Optional[str] = None,
+                          node_type: Optional[str] = None) -> int: ...
     # The whole dashboard summary in ONE aggregated read per shape, because there was no way
     # to ask "how connected is each node" in bulk. The caller (the host's `knowledge_stats`)
     # was rebuilding it a node at a time — `list_nodes` then `get_node_context` per node, and

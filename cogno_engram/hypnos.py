@@ -29,6 +29,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Callable, Optional, Union
 
 from cogno_engram.ports import KnowledgeGraph, MemoryStore
@@ -122,27 +123,33 @@ def micro_consolidate(turn: TurnRecord, prev: Optional[TurnRecord] = None) -> li
             status = turn.goal_status.upper()
             if status == "NEW":
                 mems.append(MemoryRecord(scope, "goal", f"Started goal: {turn.goal}",
-                                         DEFAULT_CONFIDENCE["goal_started"]))
+                                         DEFAULT_CONFIDENCE["goal_started"],
+                                         first_heard_by=turn.voiced_by))
             elif status == "COMPLETED":
                 mems.append(MemoryRecord(scope, "goal", f"Completed goal: {turn.goal}",
-                                         DEFAULT_CONFIDENCE["goal_completed"]))
+                                         DEFAULT_CONFIDENCE["goal_completed"],
+                                         first_heard_by=turn.voiced_by))
             elif status == "ABANDONED":
                 mems.append(MemoryRecord(scope, "goal", f"Abandoned goal: {turn.goal}",
-                                         DEFAULT_CONFIDENCE["goal_abandoned"]))
+                                         DEFAULT_CONFIDENCE["goal_abandoned"],
+                                         first_heard_by=turn.voiced_by))
 
     if turn.sentiment.upper() == "FRUSTRATED" and (prev is None or prev.sentiment.upper() != "FRUSTRATED"):
         mems.append(MemoryRecord(scope, "sentiment", "User became frustrated.",
-                                 DEFAULT_CONFIDENCE["sentiment"]))
+                                 DEFAULT_CONFIDENCE["sentiment"],
+                                 first_heard_by=turn.voiced_by))
 
     if turn.pii_types:
         mems.append(MemoryRecord(scope, "pii", f"User exposed PII: {', '.join(turn.pii_types)}",
-                                 DEFAULT_CONFIDENCE["pii"]))
+                                 DEFAULT_CONFIDENCE["pii"],
+                                 first_heard_by=turn.voiced_by))
 
     prev_domains = set(prev.domains) if prev else set()
     for domain in turn.domains:
         if domain not in prev_domains:
             mems.append(MemoryRecord(scope, "preference", f"Interested in domain: {domain}",
-                                     DEFAULT_CONFIDENCE["preference"]))
+                                     DEFAULT_CONFIDENCE["preference"],
+                                     first_heard_by=turn.voiced_by))
 
     return mems
 
@@ -163,7 +170,23 @@ def _strip_fence(text: str) -> str:
     return text.strip()
 
 
-def _parse_memories(text: str, scope: str, confidence: float) -> list[MemoryRecord]:
+def _sole_voice(turns: "Sequence[TurnRecord]") -> str:
+    """The one persona that spoke across these turns, or ``""`` when that is not a fact.
+
+    The LLM tiers summarise a WHOLE SESSION, so unlike Tier 1 there is no single turn to read
+    the voice from — and a session can change persona partway. Blank is returned whenever the
+    turns disagree (or nobody recorded a voice), because ``first_heard_by`` is a field readers
+    are meant to trust: picking the session's first or last persona would put a guess in it,
+    and a guess is worse here than the honest "unknown" the column defaults to.
+
+    So attribution is COMPLETE for Tier 1 and PARTIAL above it, by construction.
+    """
+    voices = {t.voiced_by for t in turns if t.voiced_by}
+    return voices.pop() if len(voices) == 1 else ""
+
+
+def _parse_memories(text: str, scope: str, confidence: float,
+                    first_heard_by: str = "") -> list[MemoryRecord]:
     """Parse a ``{category: [item, ...]}`` JSON object into MemoryRecords.
 
     Tolerant: malformed JSON yields no memories (consolidation must not crash the
@@ -183,7 +206,8 @@ def _parse_memories(text: str, scope: str, confidence: float) -> list[MemoryReco
             continue
         for item in items:
             if isinstance(item, str) and item.strip():
-                out.append(MemoryRecord(scope, str(category), item.strip(), confidence))
+                out.append(MemoryRecord(scope, str(category), item.strip(), confidence,
+                                        first_heard_by=first_heard_by))
     return out
 
 
@@ -412,7 +436,7 @@ async def periodic_consolidate(
     if not turns:
         return []
     text = await _generate(backend, system, prompt.format(count=len(turns), transcript=_transcript(turns)))
-    mems = _parse_memories(text, scope, confidence)
+    mems = _parse_memories(text, scope, confidence, _sole_voice(turns))
     await _embed_and_save(store, mems, embedder)
     if extract_relations and kg is not None:
         await _extract_relations(kg, backend, scope=kg_scope or scope, session_id=session_id,
@@ -459,7 +483,7 @@ async def consolidate_session(
     if active:
         text = await _generate(backend, system,
                                prompt.format(turn_count=len(active), transcript=_transcript(active)))
-        mems = _parse_memories(text, session.scope, confidence)
+        mems = _parse_memories(text, session.scope, confidence, _sole_voice(active))
         narrative = _parse_narrative(text)
         await _embed_and_save(store, mems, embedder)
 

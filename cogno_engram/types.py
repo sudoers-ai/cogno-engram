@@ -76,6 +76,24 @@ class TurnRecord:
     id_result: Optional["IdResult"] = None
     metrics: list["StageMetrics"] = field(default_factory=list)
 
+    # WHO SPOKE this turn — the host's persona id, opaque here.
+    #
+    # It rides on the turn because that is the only place it exists: the memories this turn
+    # consolidates into are built by `hypnos` FROM this record, so a field on `MemoryRecord`
+    # alone would have nothing to fill it.
+    #
+    # **This is the VOICE, not the worker.** Under delegation a specialist may do the work
+    # while the hub speaks; a memory holds what the CONTACT said, and the contact addressed
+    # the voice they saw. Recording the specialist would make the memory claim the contact
+    # spoke to someone who never appeared to them — which is why this is `voiced_by` and not
+    # `persona`: on a delegated turn the two have different answers.
+    #
+    # The neighbouring question — "which persona PRODUCED this knowledge", the right one for a
+    # memory born of a tool rather than of the contact's mouth — is deliberately NOT answered
+    # here. It is a different field with a different meaning; merging the two would fuse "who
+    # spoke" with "who knew". Blank means unknown (every row written before this existed).
+    voiced_by: str = ""
+
 
 @dataclass
 class TurnTrace:
@@ -102,6 +120,24 @@ class MemoryRecord:
     embedding: Optional[list[float]] = None
     created_at: Optional[datetime] = None
     id: Optional[str] = None
+    # The persona the contact was talking to when this was first learned — carried here from
+    # `TurnRecord.voiced_by` by the consolidation, so a later persona recalling it can say
+    # WHERE it came from instead of speaking as if it had heard it itself.
+    #
+    # **FIRST heard, and never overwritten** — the store's unique key is
+    # `(scope, category, content)`, so a fact the contact mentions to two personas is ONE row
+    # and a single-valued column can only answer one question about it. The two alternatives
+    # were considered and rejected: putting the persona in the unique key fragments the same
+    # memory per persona (isolation by the back door), and a multi-valued column answers
+    # "which personas have heard this", which nobody asked for. Blank means unknown.
+    #
+    # **The NAME carries the "first"** on purpose. A field called `persona` answers, to the next
+    # reader, "the persona of this memory" — and that diverges from "who heard it first" on the
+    # second turn: mention scheduling to the secretary and then to the bookkeeper and this says
+    # `secretary` forever, which is neither "this memory belongs to her" nor "only she knows it".
+    # A field that answers two questions is a defect this codebase has catalogued; the name is
+    # the cheapest defence, because it is what the reader sees before the comment.
+    first_heard_by: str = ""
 
 
 @dataclass

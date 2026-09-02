@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import socket
+import warnings
 from collections.abc import Mapping
 from functools import lru_cache
 from urllib.parse import quote, unquote, urlsplit, urlunsplit
@@ -57,6 +58,10 @@ _LOCAL_HOSTS = frozenset({"", "localhost", "127.0.0.1", "::1", "0.0.0.0"})
 _PROBE_TIMEOUT_S = 0.5
 
 
+class UnreachableTestDatabase(UserWarning):
+    """The DSN is set but nothing answers there — named once, with the password masked."""
+
+
 def _for_test_database(dsn: str) -> str:
     """``dsn`` with its database name REPLACED by this repo's disposable one."""
     return urlunsplit(urlsplit(dsn)._replace(path=f"/{_TEST_DATABASE}"))
@@ -98,6 +103,20 @@ def _server_is_listening(dsn: str) -> bool:
         return False
 
 
+def _without_password(dsn: str) -> str:
+    """``dsn`` with its password replaced by ``***``, so a skip message can name it.
+
+    Splits the netloc on the LAST ``@`` exactly as ``urlsplit`` itself does, so a password
+    that contains one is removed whole rather than half-printed. A DSN carrying no password
+    comes back untouched.
+    """
+    parts = urlsplit(dsn)
+    userinfo, at, hostport = parts.netloc.rpartition("@")
+    if not at or ":" not in userinfo:
+        return dsn
+    return urlunsplit(parts._replace(netloc=f"{userinfo.split(':', 1)[0]}:***@{hostport}"))
+
+
 def resolve_test_dsn(env: Mapping[str, str] | None = None) -> str:
     """The DSN the DSN-using tests run against; ``""`` means skip.
 
@@ -112,11 +131,71 @@ def resolve_test_dsn(env: Mapping[str, str] | None = None) -> str:
     return fallback if _server_is_listening(fallback) else ""
 
 
+# ── a server that is not there is the ENVIRONMENT, not a failing test ────────────────────
+#
+# With no ENGRAM_TEST_DSN the DSN-using modules skip: `resolve_test_dsn` probes the fallback
+# server and returns "" when nothing answers. An EXPLICIT DSN took no such probe, so a
+# variable left over in a shell — from an earlier session, from a container that has since
+# stopped — turned the suite red instead. Measured on 432f867 with a DSN aimed at a dead
+# port: 22 failed + 8 errors, every one of them `psycopg.OperationalError: connection
+# failed`, and identical on `main` and on any branch. On a box running several worktrees at
+# once that red reads as a defect in the code under test, and costs whoever sees it a round
+# of hunting themselves.
+#
+# The distinction is narrow ON PURPOSE, and the TCP probe is what keeps it narrow: it opens
+# a connection and asks nothing, so it can only ever answer "nothing is listening there".
+# A wrong password, an absent database, a missing `vector` extension, a broken query — each
+# of those happens on a socket that CONNECTED, so none of them can reach this branch. They
+# stay red, which is the point: a guard wide enough to swallow them would be worse than the
+# noise it removes.
+#
+# WHAT it does is blank the resolved DSN on the modules that read it, rather than skip their
+# tests wholesale. The two are not the same, and the difference is measurable: marking every
+# item of every module that exposes `DSN` also silenced the five parametrisations of
+# `test_the_net_catches_legacy_shapes_and_NOTHING_else`, which live in
+# `test_postgres_integration.py` but drive a FAKE connection object and pass with no server
+# anywhere. Module-level `DSN` is the right unit for the abort above (over-refusing costs a
+# run; under-refusing costs a database) and the wrong one here, where over-skipping quietly
+# retires passing tests. Each module already knows which of ITS tests need the database —
+# that knowledge is its own `if not DSN` gate — so hand it the same "" it would have got
+# from an unset variable and let it decide. The suite then reports exactly what it reports
+# with no DSN at all, which is what `test_dsn_skip.py` pins in both directions.
+#
+# The decision is taken during COLLECTION, before any fixture runs — the same reason the
+# abort above is: a check that fires once a test is RUNNING has already let pytest reach the
+# fixture whose next statement is `DROP TABLE`. `cogno-host` carried that shape until
+# 2026-08-26.
+def _blank_the_dsn_when_nothing_is_listening(dsn: str, targets: list) -> None:
+    """Hand the DSN-using modules an empty DSN when ``dsn``'s server does not answer."""
+    if _server_is_listening(dsn):
+        return                       # something answers: whatever the tests find is real
+    for module in {i.module for i in targets if getattr(i, "module", None) is not None}:
+        module.DSN = ""
+    warnings.warn(
+        f"nothing is listening at {_without_password(dsn)} (from {_DSN_ENV}), so the tests "
+        f"that need a database are skipping. This is the ENVIRONMENT, not a defect in the "
+        f"code under test: start that server, or unset {_DSN_ENV} and the suite aims at "
+        f"{_TEST_DATABASE!r} on whatever local server the shell already points at.",
+        UnreachableTestDatabase, stacklevel=1,
+    )
+
+
 def pytest_collection_modifyitems(items) -> None:
-    """Abort when a DSN-using test is about to run against a non-test database.
+    """Decide, per DSN-using test, between running it, refusing it, and skipping it.
+
+    Three outcomes, and none of them collapses into another:
+
+    * the database name does not say "test" → ABORT the whole session, loudly and by name;
+    * the name is safe but nothing answers there → SKIP those tests (the environment, not
+      the code — see ``_blank_the_dsn_when_nothing_is_listening``);
+    * the name is safe and the server answers → do nothing, and whatever the tests find is
+      reported as it happens. A failure against a reachable server is a real failure.
 
     Checks the RESOLVED DSN, not the raw variable: the guard has to inspect the same string
-    the fixtures will open, or the two can drift apart and only one of them is checked.
+    the fixtures will open, or the two can drift apart and only one of them is checked. The
+    unreachable case is decided AFTER the name, so a dangerous DSN aimed at a dead server is
+    still refused by name rather than quietly skipped — otherwise the person keeps a live
+    DSN in their shell and only finds out once the server is back up.
 
     Fires on COLLECTION, not on every session: a stale ``ENGRAM_TEST_DSN`` in someone's
     shell must not stop ``pytest tests/test_in_memory_store.py``, which never opens a
@@ -124,10 +203,14 @@ def pytest_collection_modifyitems(items) -> None:
     ones that ``DROP TABLE``.
     """
     dsn = resolve_test_dsn()
-    if not dsn or names_a_test_database(dsn):
-        return
-    if not any(getattr(getattr(i, "module", None), "DSN", None) for i in items):
+    if not dsn:
+        return                       # nobody named a database; the modules' own skips apply
+    targets = [i for i in items if getattr(getattr(i, "module", None), "DSN", None)]
+    if not targets:
         return                                   # nothing collected would touch that database
+    if names_a_test_database(dsn):
+        _blank_the_dsn_when_nothing_is_listening(dsn, targets)
+        return
     database = urlsplit(dsn).path.lstrip("/")
     pytest.exit(
         f"refusing to run: {_DSN_ENV} points at database {database!r}, which is not a "

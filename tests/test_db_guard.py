@@ -13,6 +13,7 @@ writes at all, which is worse than the row loss.
 
 from __future__ import annotations
 
+import ast
 import os
 import re
 import subprocess
@@ -100,15 +101,55 @@ def test_it_refuses_during_COLLECTION_and_not_once_a_test_is_running():
 # The trigger is a collected test whose module exposes a module-level ``DSN``. That makes the
 # guard fail OPEN for a future module that reads ENGRAM_TEST_DSN some other way — it would
 # connect, DROP, and never trip the abort. Assert the convention instead of trusting it.
+#
+# Two kinds of module name the variable, and only one of them can do damage. The guard's own
+# tests name it to hand it to a pytest SUBPROCESS — which this same conftest then guards in
+# full — and never open a connection themselves. What separates them is not which files they
+# are: a module cannot reach a database without importing a driver, so THAT is the test. A
+# filename exemption would have to be renewed by hand every time a guard grows a second test
+# module, and is unconditional for whatever it names; this one lapses the moment such a
+# module starts connecting.
+_DRIVERS = frozenset({"psycopg", "asyncpg"})
+
+
+def _imports_a_database_driver(src: str) -> bool:
+    """Whether the module actually IMPORTS a driver — parsed, not grepped.
+
+    Prose is not an import, and a text scan cannot tell the difference. The first cut of
+    this was ``re.compile(r"\\b(psycopg|asyncpg)\\b")``, which matched the docstring of
+    every module that merely NAMES ``psycopg.OperationalError`` — and matched this file,
+    because the pattern spells the word it looks for. The AST sees only what the module
+    really pulls in, ``pytest.importorskip("psycopg")`` included.
+    """
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, ast.Import):
+            if any(alias.name.split(".")[0] in _DRIVERS for alias in node.names):
+                return True
+        elif isinstance(node, ast.ImportFrom):
+            if (node.module or "").split(".")[0] in _DRIVERS:
+                return True
+        elif isinstance(node, ast.Call) and getattr(node.func, "attr", "") == "importorskip":
+            if any(isinstance(a, ast.Constant) and a.value in _DRIVERS for a in node.args):
+                return True
+    return False
+
+
+def test_naming_a_driver_in_prose_is_not_importing_one():
+    assert _imports_a_database_driver("import psycopg")
+    assert _imports_a_database_driver("from psycopg.rows import dict_row")
+    assert _imports_a_database_driver('psycopg = pytest.importorskip("psycopg")')
+    assert not _imports_a_database_driver('"""psycopg.OperationalError: connection failed."""')
+    assert not _imports_a_database_driver('_D = re.compile(r"\\b(psycopg|asyncpg)\\b")')
+
 
 def test_every_module_reading_the_dsn_exposes_it_as_a_module_attribute():
     offenders, scanned = [], []
     for f in sorted((_ROOT / "tests").glob("test_*.py")):
         src = f.read_text()
-        if f.name == Path(__file__).name:
-            continue
         if "ENGRAM_TEST_DSN" not in src and "resolve_test_dsn" not in src:
             continue
+        if not _imports_a_database_driver(src):
+            continue                    # names the DSN, cannot open it — see above
         scanned.append(f.name)
         if not re.search(r"^DSN\s*=", src, re.M):
             offenders.append(f.name)
@@ -116,6 +157,7 @@ def test_every_module_reading_the_dsn_exposes_it_as_a_module_attribute():
     # variable directly (they call `resolve_test_dsn` now), the match term is the thing
     # that can silently go stale — so assert it still finds them.
     assert len(scanned) >= 5, f"the scan matched only {scanned} — it has stopped seeing the suites"
+    assert "test_postgres_integration.py" in scanned, "the destructive suite fell out of the scan"
     assert not offenders, (
         f"{offenders} read ENGRAM_TEST_DSN but expose no module-level `DSN`, so "
         f"pytest_collection_modifyitems in conftest.py cannot see them and would let a "

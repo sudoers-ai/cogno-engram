@@ -14,7 +14,6 @@ turn, which is why the memory field carries "first" in its name.
 
 from __future__ import annotations
 
-import os
 
 import pytest
 

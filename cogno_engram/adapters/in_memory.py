@@ -278,6 +278,12 @@ class InMemoryStore:
                 if memory.embedding is not None:
                     existing.embedding = memory.embedding
                 existing.confidence = memory.confidence
+                # `first_heard_by` is NOT copied over, mirroring the Postgres `DO UPDATE` list
+                # that omits it: the column answers "who did the contact tell this to FIRST", so
+                # the second persona to mention the same fact must not take the credit. Adding it
+                # here to "match the other fields" would make this double disagree with the real
+                # store, and the tests that pass against it would stop saying anything about
+                # production.
                 return
         if memory.created_at is None:
             memory.created_at = _now()

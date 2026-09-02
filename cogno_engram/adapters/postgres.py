@@ -257,6 +257,7 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
             sentiment    text NOT NULL DEFAULT '',
             domains      text[] NOT NULL DEFAULT '{{}}',
             pii_types    text[] NOT NULL DEFAULT '{{}}',
+            voiced_by    text NOT NULL DEFAULT '',
             created_at   timestamptz NOT NULL DEFAULT now(),
             {pk},
             UNIQUE (scope, session_id, turn_n)
@@ -272,6 +273,7 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
             content        text NOT NULL,
             confidence     real NOT NULL DEFAULT 1.0,
             feedback_score real NOT NULL DEFAULT 0.0,
+            first_heard_by text NOT NULL DEFAULT '',
             embedding      vector({embedding_dim}),
             tsv            tsvector GENERATED ALWAYS AS (to_tsvector('{ts_config}', content)) STORED,
             created_at     timestamptz NOT NULL DEFAULT now(),
@@ -343,21 +345,32 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
     # Existence asked per column with a bare `SELECT 1`, whose ROW is truthy whatever row
     # factory the caller configured — `ensure_schema` runs on a plain connection here and on a
     # `dict_row` one elsewhere, and reading a column by NAME crashed on the tuple shape.
-    for column, ddl in (
-        ("attributes",
+    # The TABLE is part of the tuple because this is now the only place that knows how to add a
+    # column without locking readers, and three tables need it. A second copy of the catalogue
+    # read is a second chance to forget it.
+    for table, column, ddl in (
+        ("knowledge_edges", "attributes",
          "ALTER TABLE knowledge_edges ADD COLUMN IF NOT EXISTS attributes jsonb NOT NULL DEFAULT '{}'"),
-        ("status",
+        ("knowledge_edges", "status",
          f"ALTER TABLE knowledge_edges ADD COLUMN IF NOT EXISTS status text NOT NULL DEFAULT '{EDGE_ACCEPTED}'"),
         # The DEFAULT backfills every existing edge as UNCLASSIFIED, not as `tenant`: staff keeps
         # seeing them and no contact does. An upgrade must not hand a contact rows nobody has
         # classified — `maintenance.classify_edge_audience` is the deliberate act that assigns
         # owners, and until it runs the safe answer is "staff only".
-        ("audience",
+        ("knowledge_edges", "audience",
          "ALTER TABLE knowledge_edges ADD COLUMN IF NOT EXISTS audience text NOT NULL DEFAULT ''"),
+        # Who the contact was talking to. The DEFAULT backfills every existing row as BLANK —
+        # deliberately "unknown", not a guess: rows written before this column existed were
+        # produced by a persona nobody recorded, and inventing one would put a name in a field a
+        # reader is meant to trust.
+        ("turns", "voiced_by",
+         "ALTER TABLE turns ADD COLUMN IF NOT EXISTS voiced_by text NOT NULL DEFAULT ''"),
+        ("memories", "first_heard_by",
+         "ALTER TABLE memories ADD COLUMN IF NOT EXISTS first_heard_by text NOT NULL DEFAULT ''"),
     ):
         cur = await conn.execute(
             "SELECT 1 FROM information_schema.columns "
-            "WHERE table_name = 'knowledge_edges' AND column_name = %s", (column,))
+            "WHERE table_name = %s AND column_name = %s", (table, column))
         if await cur.fetchone() is None:
             await conn.execute(ddl)
 
@@ -755,11 +768,12 @@ class PostgresStore(_PgBase):
             await conn.execute(
                 """INSERT INTO turns
                    (scope, session_id, turn_n, user_input, response, feedback,
-                    goal, goal_status, sentiment, domains, pii_types)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    goal, goal_status, sentiment, domains, pii_types, voiced_by)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                    ON CONFLICT (scope, session_id, turn_n) DO NOTHING""",
                 (turn.scope, turn.session_id, turn.turn_n, user_input, response, turn.feedback,
-                 turn.goal, turn.goal_status, turn.sentiment, turn.domains, turn.pii_types))
+                 turn.goal, turn.goal_status, turn.sentiment, turn.domains, turn.pii_types,
+                 turn.voiced_by))
 
     async def update_turn_response(self, scope: str, session_id: str, turn_n: int,
                                    response: str) -> None:
@@ -773,7 +787,7 @@ class PostgresStore(_PgBase):
 
     async def load_turns(self, session_id: str, *, scope: str = "") -> list[TurnRecord]:
         cols = ("SELECT scope, session_id, turn_n, user_input, response, feedback, goal, "
-                "goal_status, sentiment, domains, pii_types, created_at FROM turns ")
+                "goal_status, sentiment, domains, pii_types, voiced_by, created_at FROM turns ")
         async with self._conn() as conn:
             if scope:
                 cur = await conn.execute(
@@ -833,7 +847,7 @@ class PostgresStore(_PgBase):
         async with self._conn() as conn:
             cur = await conn.execute(
                 "SELECT scope, session_id, turn_n, user_input, response, feedback, goal, "
-                "goal_status, sentiment, domains, pii_types, created_at "
+                "goal_status, sentiment, domains, pii_types, voiced_by, created_at "
                 "FROM turns WHERE scope = %s AND session_id::text != %s "
                 "ORDER BY created_at DESC, id DESC LIMIT %s", (scope, exclude_session, limit))
             rows = await cur.fetchall()
@@ -863,7 +877,7 @@ class PostgresStore(_PgBase):
         async with self._conn() as conn:
             cur = await conn.execute(
                 "SELECT scope, session_id, turn_n, user_input, response, feedback, goal, "
-                "goal_status, sentiment, domains, pii_types, created_at "
+                "goal_status, sentiment, domains, pii_types, voiced_by, created_at "
                 f"FROM turns WHERE {self._SUBTREE} "
                 "ORDER BY created_at DESC, id DESC LIMIT %s OFFSET %s",
                 (scope_prefix, like, limit, offset))
@@ -922,7 +936,7 @@ class PostgresStore(_PgBase):
             user_input=r["user_input"], response=r["response"], feedback=r["feedback"],
             goal=r["goal"], goal_status=r["goal_status"], sentiment=r["sentiment"],
             domains=list(r["domains"] or []), pii_types=list(r["pii_types"] or []),
-            created_at=r["created_at"])
+            voiced_by=r["voiced_by"], created_at=r["created_at"])
 
     # ── memories ─────────────────────────────────────────────────────────
     async def save_memory(self, memory: MemoryRecord) -> None:
@@ -930,13 +944,19 @@ class PostgresStore(_PgBase):
         mid = memory.id or str(uuid4())
         async with self._conn() as conn:
             await conn.execute(
-                """INSERT INTO memories (id, scope, category, content, confidence, embedding)
-                   VALUES (%s, %s, %s, %s, %s, %s::vector)
+                # `first_heard_by` is written on INSERT and DELIBERATELY absent from the
+                # DO UPDATE: the column answers "who did the contact tell this to FIRST", so the
+                # second persona to hear the same fact must not overwrite the first. The
+                # asymmetry IS the design — uniformising this list with the one above would
+                # silently turn the field into "who mentioned it most recently".
+                """INSERT INTO memories
+                       (id, scope, category, content, confidence, embedding, first_heard_by)
+                   VALUES (%s, %s, %s, %s, %s, %s::vector, %s)
                    ON CONFLICT (scope, category, content) DO UPDATE SET
                        confidence = EXCLUDED.confidence,
                        embedding  = COALESCE(EXCLUDED.embedding, memories.embedding)""",
                 (mid, memory.scope, memory.category, memory.content, memory.confidence,
-                 _vec(memory.embedding)))
+                 _vec(memory.embedding), memory.first_heard_by))
 
     async def load_memories(self, scope: str, *, query: Optional[RetrievalQuery] = None,
                             limit: int = 50,
@@ -955,7 +975,7 @@ class PostgresStore(_PgBase):
 
         if q_emb is not None and q_txt is not None:
             sql = (
-                f"SELECT id, scope, category, content, confidence, feedback_score, created_at, "
+                f"SELECT id, scope, category, content, confidence, feedback_score, first_heard_by, created_at, "
                 f"  ({w.vector} * (1.0 - (embedding <=> %s::vector)) "
                 f"   + {w.lexical} * ts_rank_cd(tsv, {tsq}) "
                 f"   + COALESCE(feedback_score, 0) * {w.feedback}) AS score "
@@ -963,17 +983,17 @@ class PostgresStore(_PgBase):
                 f"ORDER BY score DESC LIMIT %s")
             full = [_vec(q_emb), q_txt] + params + [limit]
         elif q_emb is not None:
-            sql = (f"SELECT id, scope, category, content, confidence, feedback_score, created_at "
+            sql = (f"SELECT id, scope, category, content, confidence, feedback_score, first_heard_by, created_at "
                    f"FROM memories {where} AND embedding IS NOT NULL "
                    f"ORDER BY (embedding <=> %s::vector) - COALESCE(feedback_score,0)*0.1 ASC LIMIT %s")
             full = params + [_vec(q_emb), limit]
         elif q_txt is not None:
-            sql = (f"SELECT id, scope, category, content, confidence, feedback_score, created_at "
+            sql = (f"SELECT id, scope, category, content, confidence, feedback_score, first_heard_by, created_at "
                    f"FROM memories {where} AND tsv @@ {tsq} "
                    f"ORDER BY ts_rank_cd(tsv, {tsq}) DESC LIMIT %s")
             full = params + [q_txt, q_txt, limit]
         else:
-            sql = (f"SELECT id, scope, category, content, confidence, feedback_score, created_at "
+            sql = (f"SELECT id, scope, category, content, confidence, feedback_score, first_heard_by, created_at "
                    f"FROM memories {where} ORDER BY created_at DESC LIMIT %s")
             full = params + [limit]
 
@@ -982,12 +1002,13 @@ class PostgresStore(_PgBase):
             rows = await cur.fetchall()
         return [MemoryRecord(scope=r["scope"], category=r["category"], content=r["content"],
                              confidence=r["confidence"], feedback_score=r["feedback_score"],
+                             first_heard_by=r["first_heard_by"],
                              created_at=r["created_at"], id=str(r["id"])) for r in rows]
 
     async def scan_memories(self, scope: str, *, after_id: "Optional[str]" = None,
                             limit: int = 1000) -> list[MemoryRecord]:
         _require_scope(scope)
-        sql = ("SELECT id, scope, category, content, confidence, feedback_score, created_at "
+        sql = ("SELECT id, scope, category, content, confidence, feedback_score, first_heard_by, created_at "
                "FROM memories WHERE scope = %s")
         params: list = [scope]
         if after_id is not None:
@@ -1002,6 +1023,7 @@ class PostgresStore(_PgBase):
             rows = await cur.fetchall()
         return [MemoryRecord(scope=r["scope"], category=r["category"], content=r["content"],
                              confidence=r["confidence"], feedback_score=r["feedback_score"],
+                             first_heard_by=r["first_heard_by"],
                              created_at=r["created_at"], id=str(r["id"])) for r in rows]
 
     async def adjust_feedback_score(self, scope: str, query_text: str, delta: float,

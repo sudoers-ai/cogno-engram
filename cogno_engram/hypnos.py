@@ -180,9 +180,20 @@ def _sole_voice(turns: "Sequence[TurnRecord]") -> str:
     and a guess is worse here than the honest "unknown" the column defaults to.
 
     So attribution is COMPLETE for Tier 1 and PARTIAL above it, by construction.
+
+    **A blank turn counts AGAINST the answer, and that is the case this predicate was originally
+    silent about.** Skipping the blanks would make ``[secretary, ""]`` answer ``secretary`` — a
+    claim about the turn NOBODY RECORDED, which could as easily have been the bookkeeper. That is
+    the same guess this function exists to refuse, arriving through a gap in the definition rather
+    than through a choice: a predicate that answers the pure case and was never asked about the
+    mixed one is not defined, it is UNDEFINED, and the next reader takes the pure answer for the
+    rule.
+
+    Blank is UNKNOWN, never ABSENT. One unrecorded turn is enough to make "this session had one
+    voice" unprovable, so the honest answer is "".
     """
-    voices = {t.voiced_by for t in turns if t.voiced_by}
-    return voices.pop() if len(voices) == 1 else ""
+    voices = {t.voiced_by for t in turns}
+    return next(iter(voices)) if len(voices) == 1 and all(voices) else ""
 
 
 def _parse_memories(text: str, scope: str, confidence: float,

@@ -90,6 +90,28 @@ def test_a_session_that_changed_persona_attributes_the_memory_to_NEITHER():
     assert _sole_voice([_turn(1, voice="")]) == ""
 
 
+def test_ONE_unrecorded_turn_is_enough_to_withhold_the_attribution():
+    """The MIXED case — some turns carry a voice, some do not — and the one the predicate was
+    originally silent about.
+
+    Skipping the blanks would answer `secretary` for a session whose OTHER turn nobody recorded,
+    which could as easily have been the bookkeeper. That is a claim about the unrecorded turn, and
+    it is the same guess the whole field exists to refuse.
+
+    A predicate that answers the pure case and was never asked about the mixed one is not defined,
+    it is UNDEFINED — and the next reader takes the pure answer for the rule. So it is pinned in
+    both directions here.
+    """
+    assert _sole_voice([_turn(1, voice=SECRETARY), _turn(2, voice="")]) == ""
+    assert _sole_voice([_turn(1, voice=""), _turn(2, voice=SECRETARY)]) == "", (
+        "order must not decide it — a set-based answer that depended on position would be a "
+        "second bug wearing the first one's answer")
+    assert _sole_voice([]) == ""
+
+    # ...and the positive control, so this cannot pass by refusing everything.
+    assert _sole_voice([_turn(1, voice=SECRETARY), _turn(2, voice=SECRETARY)]) == SECRETARY
+
+
 def test_the_llm_tier_stamps_the_voice_it_was_given():
     """`_sole_voice` decides; `_parse_memories` must actually carry the decision through."""
     out = _parse_memories('{"preference": ["likes mornings"]}', SCOPE, 0.8, SECRETARY)

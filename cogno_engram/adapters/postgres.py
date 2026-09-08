@@ -32,6 +32,8 @@ from uuid import uuid4
 import psycopg
 from psycopg.rows import dict_row
 
+from cogno_engram import write_loss
+from cogno_engram.trace_policy import TRACE_REVISION_WINDOW_S
 from cogno_engram.folding import FOLD_FUNCTION_SQL, fold_label
 from cogno_engram.types import (
     AUDIENCE_STAFF,
@@ -55,6 +57,13 @@ from cogno_engram.types import (
 )
 
 logger = logging.getLogger("cogno_engram.postgres")
+
+# How many times ``save_turn`` re-reads and retries when it loses the race for a
+# freshly allocated ``turn_n``. Each attempt is one round trip and each loss means a
+# concurrent writer committed, so the budget bounds a real contention burst rather
+# than a spin: under READ COMMITTED the first retry already sees the winner.
+_ALLOC_ATTEMPTS = 5
+
 
 # Default embedding width — nomic-embed-text (the parent's default embedder).
 DEFAULT_EMBEDDING_DIM = 768
@@ -614,14 +623,27 @@ def _label_collision_error(groups: "list[str]", cause: Exception) -> RuntimeErro
 class _PgBase:
     """Shared connection plumbing for the Postgres adapters."""
 
+    #: This store ALLOCATES ``turn_n`` when handed ``ALLOCATE_TURN_N``.
+    #:
+    #: A capability flag, not decoration. A caller cannot detect the ability from
+    #: the signature — the old ``save_turn`` accepted the same argument and simply
+    #: wrote the sentinel into the column — so a host that probed by trying would
+    #: corrupt a row against an older engram. The host pins the two libraries by
+    #: git SHA and they land in separate deploys, so the mixed combination is a
+    #: state the ecosystem WILL be in, not one it might be. Absent → the caller
+    #: keeps numbering turns itself, exactly as before.
+    allocates_turn_n = True
+
     def __init__(self, *, dsn: Optional[str] = None, pool=None,
-                 ts_config: str = DEFAULT_TS_CONFIG, mask_pii: bool = False) -> None:
+                 ts_config: str = DEFAULT_TS_CONFIG, mask_pii: bool = False,
+                 trace_revision_window_s: float = TRACE_REVISION_WINDOW_S) -> None:
         if not dsn and pool is None:
             raise ValueError("provide either dsn= or pool=")
         self._dsn = dsn
         self._pool = pool
         self._ts = _validate_ts_config(ts_config)
         self._mask_pii = mask_pii
+        self._trace_revision_window_s = float(trace_revision_window_s)
 
     @asynccontextmanager
     async def _conn(self) -> AsyncIterator[Any]:
@@ -759,21 +781,92 @@ class PostgresStore(_PgBase):
                        ended_at=row["ended_at"], summary=row["summary"])
 
     # ── turns ────────────────────────────────────────────────────────────
-    async def save_turn(self, turn: TurnRecord) -> None:
+    async def save_turn(self, turn: TurnRecord) -> int:
+        """Persist one turn; return the ``turn_n`` actually written (0 if none was).
+
+        **The coordinate can be ALLOCATED here, and that is the point.** Pass
+        ``turn.turn_n = ALLOCATE_TURN_N`` (any negative) and the number is
+        chosen by this statement, as
+        ``max(turn_n) + 1`` over the rows that already exist for
+        ``(scope, session_id)`` — read and written inside ONE statement, so the
+        read cannot go stale between the two.
+
+        A caller that computes the next number itself and passes it in has a
+        time-of-check/time-of-use hole that no amount of care closes: two workers
+        serving the same session read the same maximum, and the loser's turn is
+        silently discarded by the ``ON CONFLICT``. That is not hypothetical — it
+        is the production incident this method was rewritten for, where a
+        counter kept OUTSIDE this table replayed coordinates that were years of
+        conversation old, and every replayed turn vanished without a trace.
+
+        Allocation is still racy at the statement level, and deliberately so: two
+        concurrent inserts compute the same ``max + 1``, one lands, the other
+        conflicts and returns no row. The loser then **re-reads and retries**
+        (``_ALLOC_ATTEMPTS``), which is what turns the race into two rows instead
+        of one. Under READ COMMITTED the retry sees the winner's committed row,
+        so it converges in one extra pass; the loop exists for the pathological
+        case, not the ordinary one.
+
+        A caller-pinned ``turn_n >= 0`` is honoured verbatim — a backfill, an
+        import or a replay is re-stating history, not appending to it — and a
+        collision there is reported as a loss rather than absorbed.
+
+        Returns 0 when nothing was written. It never raises on a conflict: this
+        runs after the contact already has their reply, and taking the turn down
+        to report a bookkeeping failure trades a lost row for a lost turn.
+        """
         _require_scope(turn.scope)
         user_input, response = turn.user_input, turn.response
         if self._mask_pii and turn.pii_types:
             user_input, response = _mask_pii(user_input), _mask_pii(response)
-        async with self._conn() as conn:
-            await conn.execute(
-                """INSERT INTO turns
-                   (scope, session_id, turn_n, user_input, response, feedback,
-                    goal, goal_status, sentiment, domains, pii_types, voiced_by)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                   ON CONFLICT (scope, session_id, turn_n) DO NOTHING""",
-                (turn.scope, turn.session_id, turn.turn_n, user_input, response, turn.feedback,
-                 turn.goal, turn.goal_status, turn.sentiment, turn.domains, turn.pii_types,
-                 turn.voiced_by))
+        payload = (user_input, response, turn.feedback, turn.goal, turn.goal_status,
+                   turn.sentiment, turn.domains, turn.pii_types, turn.voiced_by)
+
+        if turn.turn_n is not None and turn.turn_n >= 0:
+            async with self._conn() as conn:
+                cur = await conn.execute(
+                    """INSERT INTO turns
+                       (scope, session_id, turn_n, user_input, response, feedback,
+                        goal, goal_status, sentiment, domains, pii_types, voiced_by)
+                       VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                       ON CONFLICT (scope, session_id, turn_n) DO NOTHING
+                       RETURNING turn_n""",
+                    (turn.scope, turn.session_id, turn.turn_n) + payload)
+                row = await cur.fetchone()
+            if row is None:
+                write_loss.record(write_loss.TURN_DISCARDED, scope=turn.scope,
+                                  session=turn.session_id, turn=turn.turn_n,
+                                  reason="coordinate_taken", pinned="true")
+                return 0
+            return int(row["turn_n"])
+
+        # ``max(turn_n) + 1`` computed INSIDE the insert. The aggregate over a
+        # filtered set always yields exactly one row (NULL → 0 for a new session),
+        # so the SELECT feeds the INSERT unconditionally. Types are cast
+        # explicitly: in a SELECT list a bare placeholder has no inferable type,
+        # unlike the VALUES form above.
+        for attempt in range(_ALLOC_ATTEMPTS):
+            async with self._conn() as conn:
+                cur = await conn.execute(
+                    """INSERT INTO turns
+                       (scope, session_id, turn_n, user_input, response, feedback,
+                        goal, goal_status, sentiment, domains, pii_types, voiced_by)
+                       SELECT %s::text, %s::uuid, COALESCE(max(t.turn_n), 0) + 1,
+                              %s::text, %s::text, %s::smallint, %s::text, %s::text,
+                              %s::text, %s::text[], %s::text[], %s::text
+                         FROM turns t
+                        WHERE t.scope = %s::text AND t.session_id = %s::uuid
+                       ON CONFLICT (scope, session_id, turn_n) DO NOTHING
+                       RETURNING turn_n""",
+                    (turn.scope, turn.session_id) + payload
+                    + (turn.scope, turn.session_id))
+                row = await cur.fetchone()
+            if row is not None:
+                turn.turn_n = int(row["turn_n"])
+                return turn.turn_n
+        write_loss.record(write_loss.TURN_ALLOCATION_EXHAUSTED, scope=turn.scope,
+                          session=turn.session_id, attempts=_ALLOC_ATTEMPTS)
+        return 0
 
     async def update_turn_response(self, scope: str, session_id: str, turn_n: int,
                                    response: str) -> None:
@@ -812,20 +905,59 @@ class PostgresStore(_PgBase):
         return int(row["c"])
 
     # ── turn traces (own table) ──────────────────────────────────────────
-    async def save_turn_trace(self, trace: "TurnTrace") -> None:
+    async def save_turn_trace(self, trace: "TurnTrace") -> bool:
+        """Persist one turn trace; return whether it was stored.
+
+        ``created_at`` is honoured when the caller sets it (a backfill, an import,
+        a test seeding history); absent, the column default stamps the row. The
+        in-memory adapter always did this — the Postgres one silently dropped it,
+        which made every imported trace "now" and any time-window read over them a
+        lie.
+
+        **An older trace is never overwritten by a newer one, and ``created_at``
+        never moves.** The upsert used to be an unconditional
+        ``DO UPDATE SET trace = EXCLUDED.trace``, with ``created_at`` left out of
+        the SET — so a trace arriving at an occupied coordinate replaced content
+        that was days old while the row went on advertising the old date. The
+        column did not merely go stale: it actively lied, and every read that
+        trusted it (a time-window audit, an incident reconstruction) inherited the
+        lie. Real ages had to be recovered from ``xmin``.
+
+        The rule is a comparison against ``TRACE_REVISION_WINDOW_S``: a stored
+        trace stays revisable for as long as the turn that produced it could still
+        be writing (a correction loop, a re-voice, a backfill batch re-running its
+        own rows), and is immutable afterwards. A write arriving days later at an
+        occupied coordinate is, by construction, a DIFFERENT turn wearing an old
+        turn's number. Keeping the stored row is the safe direction because it is
+        the one already referenced: a ``turns`` row of the same age sits beside it,
+        and replacing only the trace leaves the pair describing two different
+        conversations — which is precisely the state the incident left behind.
+
+        Refusing beats versioning here for a reason worth stating: a suffixed
+        second version needs a schema migration and changes what
+        ``traces_for_session`` returns — one row per coordinate is a promise every
+        reader in the ecosystem already relies on, and a P0 that is racing a live
+        data loss is the wrong moment to renegotiate it. Nothing is lost that was
+        not already going to be lost, and the refusal is counted.
+        """
         _require_scope(trace.scope)
         async with self._conn() as conn:
-            await conn.execute(
-                # ``created_at`` is honoured when the caller sets it (a backfill, an import,
-                # a test seeding history); absent, the column default stamps the row. The
-                # in-memory adapter always did this — the Postgres one silently dropped it,
-                # which made every imported trace "now" and any time-window read over them a
-                # lie.
+            cur = await conn.execute(
                 "INSERT INTO turn_traces (scope, session_id, turn_n, trace, created_at) "
                 "VALUES (%s, %s, %s, %s::jsonb, COALESCE(%s, now())) "
-                "ON CONFLICT (scope, session_id, turn_n) DO UPDATE SET trace = EXCLUDED.trace",
+                "ON CONFLICT (scope, session_id, turn_n) DO UPDATE SET trace = EXCLUDED.trace "
+                "  WHERE EXCLUDED.created_at <= turn_traces.created_at "
+                "                            + make_interval(secs => %s) "
+                "RETURNING turn_n",
                 (trace.scope, trace.session_id, trace.turn_n, json.dumps(trace.trace),
-                 trace.created_at))
+                 trace.created_at, self._trace_revision_window_s))
+            row = await cur.fetchone()
+        if row is None:
+            write_loss.record(write_loss.TRACE_OVERWRITE_REFUSED, scope=trace.scope,
+                              session=trace.session_id, turn=trace.turn_n,
+                              reason="stored_trace_is_older")
+            return False
+        return True
 
     async def traces_for_session(self, session_id: str, *, scope: str = "") -> list["TurnTrace"]:
         async with self._conn() as conn:

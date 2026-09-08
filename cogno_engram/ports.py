@@ -66,7 +66,14 @@ class MemoryStore(Protocol):
                             limit: int = 100) -> list[Session]: ...
 
     # ── turns ────────────────────────────────────────────────────────────
-    async def save_turn(self, turn: TurnRecord) -> None: ...
+    # Set ``allocates_turn_n = True`` on the class to advertise that ALLOCATE_TURN_N
+    # is understood; a caller must probe that flag rather than the signature, since
+    # an older store accepts the sentinel and writes it into the column.
+    # Returns the ``turn_n`` actually written — 0 when nothing was. Pass
+    # ``turn.turn_n <= 0`` to have the coordinate ALLOCATED by the store
+    # (``max + 1``, race-safe); a caller that computes it itself owns a
+    # time-of-check/time-of-use hole. See PostgresStore.save_turn.
+    async def save_turn(self, turn: TurnRecord) -> int: ...
     async def update_turn_response(self, scope: str, session_id: str, turn_n: int,
                                    response: str) -> None: ...
     # ``scope`` (optional) isolates the read to that scope — see get_session on why id alone is
@@ -82,7 +89,9 @@ class MemoryStore(Protocol):
     # ── turn traces (own table) ──────────────────────────────────────────
     # The per-turn pipeline trace (audit/inspector). Kept OUT of the flat ``turns`` row:
     # variable-shape, debug-oriented, opt-in. UPSERT by (scope, session_id, turn_n).
-    async def save_turn_trace(self, trace: TurnTrace) -> None: ...
+    # Returns whether the trace was stored. A STRICTLY OLDER stored trace is
+    # never replaced, and ``created_at`` never moves.
+    async def save_turn_trace(self, trace: TurnTrace) -> bool: ...
     async def traces_for_session(self, session_id: str, *, scope: str = "") -> list[TurnTrace]: ...
     # Admin / cross-scope reads: all turns at or under a scope SUBTREE (``scope_prefix`` itself or
     # any ``scope_prefix + "/" + …`` descendant), newest-first + a total for pagination. This is

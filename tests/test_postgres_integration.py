@@ -1894,3 +1894,126 @@ async def test_the_total_does_not_count_ANOTHER_contacts_edge(graph):
 
     staff = await graph.graph_stats(scope, audience=AUDIENCE_STAFF, top=10)
     assert staff.total_edges == 2, "o staff vê as duas — senão o teste passaria por não contar nada"
+
+
+# ── the turn coordinate: allocation, the race, and the two losses ─────────────
+#
+# These are the Postgres halves of `test_a_turn_is_never_lost_in_silence.py`. The
+# race twin can only live here: a race needs two real connections contending for a
+# real unique index, and an in-memory list cannot fake the one thing under test.
+
+async def test_two_concurrent_writers_on_one_session_get_two_rows(store):
+    """The twin that proves the fix is not just a nicer way to lose a turn.
+
+    ``max(turn_n) + 1`` read by the application and then INSERTed is
+    time-of-check/time-of-use: two workers serving the same session read the same
+    maximum, and the ``ON CONFLICT DO NOTHING`` eats the loser. The deploy is
+    multi-worker by construction — it is why the ID stage keeps its state in
+    ``ctx.metadata`` rather than in an instance — so this is the ordinary case,
+    not the exotic one.
+
+    Allocating inside the statement and RETRYING on the conflict is what turns the
+    race into two rows. Ten writers, one session, no coordination: ten rows,
+    numbered 1..10, nothing discarded.
+    """
+    import asyncio
+
+    from cogno_engram import write_loss
+    from cogno_engram.types import ALLOCATE_TURN_N
+
+    write_loss.reset()
+    scope = f"t/{uuid4()}"
+    s = await store.create_session(scope)
+    writers = 10
+
+    results = await asyncio.gather(*[
+        store.save_turn(TurnRecord(s.id, scope, ALLOCATE_TURN_N, f"concurrent {i}"))
+        for i in range(writers)])
+
+    assert sorted(results) == list(range(1, writers + 1)), \
+        f"every writer must get its own coordinate, got {sorted(results)}"
+    assert await store.turn_count(s.id) == writers, "no writer may be silently dropped"
+    assert write_loss.counts()[write_loss.TURN_DISCARDED] == 0
+    assert write_loss.counts()[write_loss.TURN_ALLOCATION_EXHAUSTED] == 0
+    stored = sorted(t.turn_n for t in await store.load_turns(s.id, scope=scope))
+    assert stored == list(range(1, writers + 1))
+    write_loss.reset()
+
+
+async def test_the_counter_is_monotonic_across_a_restart_pg(store, pg):
+    """The coordinate comes from the rows, so nothing that forgets can rewind it.
+
+    In production the next ``turn_n`` was kept in a per-contact row OUTSIDE this
+    table; it regressed from 119 into the single digits and every turn after that
+    replayed an occupied coordinate. With the number derived here, "the counter
+    restarted" is not a state the system can be in.
+    """
+    from cogno_engram import write_loss
+    from cogno_engram.types import ALLOCATE_TURN_N
+
+    write_loss.reset()
+    scope = f"t/{uuid4()}"
+    s = await store.create_session(scope)
+    for expected in (1, 2, 3):
+        assert await store.save_turn(
+            TurnRecord(s.id, scope, ALLOCATE_TURN_N, f"turn {expected}")) == expected
+
+    # A brand-new store object: a different worker, a redeploy, a wiped cache.
+    fresh = PostgresStore(dsn=pg, mask_pii=True)
+    assert await fresh.save_turn(TurnRecord(s.id, scope, ALLOCATE_TURN_N, "after")) == 4
+    assert write_loss.counts()[write_loss.TURN_DISCARDED] == 0
+    write_loss.reset()
+
+
+async def test_a_discarded_turn_is_counted_pg(store):
+    """The ``DO NOTHING`` still absorbs — it must, this runs after the reply is
+    delivered — but it now says so."""
+    from cogno_engram import write_loss
+
+    write_loss.reset()
+    scope = f"t/{uuid4()}"
+    s = await store.create_session(scope)
+    assert await store.save_turn(TurnRecord(s.id, scope, 7, "first")) == 7
+    assert await store.save_turn(TurnRecord(s.id, scope, 7, "lands on a taken seat")) == 0
+    assert write_loss.counts()[write_loss.TURN_DISCARDED] == 1
+    assert await store.turn_count(s.id) == 1
+    write_loss.reset()
+
+
+async def test_an_old_trace_is_not_overwritten_and_created_at_does_not_lie(store):
+    """The trace half, on the real table.
+
+    The stored trace claims August; a turn wearing the same number arrives today.
+    Before the guard, the content was replaced and ``created_at`` kept advertising
+    August — the column did not go stale, it lied, and every time-window read over
+    it inherited the lie. Real ages had to be recovered from ``xmin``.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from cogno_engram import write_loss
+    from cogno_engram.types import TurnTrace
+
+    write_loss.reset()
+    scope = f"t/{uuid4()}"
+    s = await store.create_session(scope)
+    august = datetime(2026, 8, 28, 5, 52, tzinfo=timezone.utc)
+    assert await store.save_turn_trace(
+        TurnTrace(s.id, scope, 76, {"who": "august"}, created_at=august)) is True
+
+    assert await store.save_turn_trace(
+        TurnTrace(s.id, scope, 76, {"who": "september"},
+                  created_at=august + timedelta(days=10))) is False
+
+    got = await store.traces_for_session(s.id, scope=scope)
+    assert len(got) == 1
+    assert got[0].trace == {"who": "august"}, "the older trace must survive"
+    assert got[0].created_at == august, "created_at must not lie about the row it labels"
+    assert write_loss.counts()[write_loss.TRACE_OVERWRITE_REFUSED] == 1
+
+    # …while the same turn revising its own trace still lands.
+    assert await store.save_turn_trace(
+        TurnTrace(s.id, scope, 76, {"who": "august, corrected"},
+                  created_at=august + timedelta(seconds=30))) is True
+    got = await store.traces_for_session(s.id, scope=scope)
+    assert got[0].trace == {"who": "august, corrected"} and got[0].created_at == august
+    write_loss.reset()

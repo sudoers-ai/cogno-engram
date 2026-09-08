@@ -51,6 +51,14 @@ class Session:
     summary: str = ""
 
 
+#: Pass as ``TurnRecord.turn_n`` to have the store ALLOCATE the coordinate
+#: (``max(turn_n) + 1`` for the ``(scope, session_id)``, race-safe) instead of
+#: pinning one. Negative on purpose: ``0`` is a real coordinate that callers
+#: across this repo already use, so overloading it would silently re-number
+#: their rows. See ``MemoryStore.save_turn``.
+ALLOCATE_TURN_N = -1
+
+
 @dataclass
 class TurnRecord:
     session_id: str

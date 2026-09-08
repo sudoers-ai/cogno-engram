@@ -1,6 +1,6 @@
 """cogno-engram — persistence substrate for the Cogno cognitive pipeline."""
 
-from cogno_engram import hypnos, maintenance
+from cogno_engram import hypnos, maintenance, write_loss
 from cogno_engram.adapters.in_memory import InMemoryBuffer, InMemoryGraph, InMemoryStore
 from cogno_engram.graph_context import format_graph_context, ingest_entities
 from cogno_engram.reranker import RerankConfig, recency_score, rerank
@@ -42,6 +42,8 @@ from cogno_engram.types import (
 __version__ = "0.1.0"
 
 __all__ = [
+    # write losses this library counts instead of swallowing (see write_loss.py)
+    "write_loss",
     "AUDIENCE_STAFF",
     "AUDIENCE_TENANT",
     "AUDIENCE_UNCLASSIFIED",

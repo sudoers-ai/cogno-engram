@@ -20,6 +20,8 @@ from dataclasses import replace
 
 
 from cogno_engram.folding import fold_label, has_diacritics
+from cogno_engram import write_loss
+from cogno_engram.trace_policy import TRACE_REVISION_WINDOW_S
 from cogno_engram.types import (
     AUDIENCE_STAFF,
     audience_can_read,
@@ -105,7 +107,22 @@ def _lexical(query: str, content: str) -> float:
 class InMemoryStore:
     """Reference ``MemoryStore`` + ``SupportsVectorSearch``."""
 
-    def __init__(self) -> None:
+    #: This store ALLOCATES ``turn_n`` when handed ``ALLOCATE_TURN_N``.
+    #:
+    #: A capability flag, not decoration. A caller cannot detect the ability from
+    #: the signature — the old ``save_turn`` accepted the same argument and simply
+    #: wrote the sentinel into the column — so a host that probed by trying would
+    #: corrupt a row against an older engram. The host pins the two libraries by
+    #: git SHA and they land in separate deploys, so the mixed combination is a
+    #: state the ecosystem WILL be in, not one it might be. Absent → the caller
+    #: keeps numbering turns itself, exactly as before.
+    allocates_turn_n = True
+
+    def __init__(self, *, trace_revision_window_s: float = TRACE_REVISION_WINDOW_S) -> None:
+        # Same knob, same default, same meaning as the Postgres adapter's — the two
+        # are hand-written copies of one rule and a divergence here is invisible
+        # until production.
+        self._trace_revision_window_s = float(trace_revision_window_s)
         self._sessions: dict[str, Session] = {}
         self._turns: list[TurnRecord] = []
         self._traces: list[TurnTrace] = []
@@ -182,17 +199,33 @@ class InMemoryStore:
         return candidates[0] if candidates else None
 
     # ── turns ────────────────────────────────────────────────────────────
-    async def save_turn(self, turn: TurnRecord) -> None:
+    async def save_turn(self, turn: TurnRecord) -> int:
+        """Mirror of ``PostgresStore.save_turn`` — see there for the design.
+
+        ``turn_n = ALLOCATE_TURN_N`` (any negative) allocates ``max + 1`` for the
+        ``(scope, session_id)``; a pinned number — ``0`` included, it is a real
+        coordinate — is honoured, and a collision on it is a counted loss rather
+        than a duplicate row. The two adapters are hand-written copies of one rule,
+        so a divergence here is a bug that only shows up in production.
+        """
         _require_scope(turn.scope)
-        # Match the Postgres adapter's ON CONFLICT (scope, session_id, turn_n) DO NOTHING: a
-        # retried/idempotent re-save of the same turn coordinate is a no-op, not a duplicate row
-        # (the in-memory adapter otherwise diverged, double-counting turns in local/test runs).
-        if any(t.scope == turn.scope and t.session_id == turn.session_id
-               and t.turn_n == turn.turn_n for t in self._turns):
-            return
+        mine = [t for t in self._turns
+                if t.scope == turn.scope and t.session_id == turn.session_id]
+        if turn.turn_n is not None and turn.turn_n >= 0:
+            # Match the Postgres adapter's ON CONFLICT (scope, session_id, turn_n) DO NOTHING:
+            # a re-save of the same turn coordinate is a no-op, not a duplicate row (the
+            # in-memory adapter otherwise diverged, double-counting turns in local/test runs).
+            if any(t.turn_n == turn.turn_n for t in mine):
+                write_loss.record(write_loss.TURN_DISCARDED, scope=turn.scope,
+                                  session=turn.session_id, turn=turn.turn_n,
+                                  reason="coordinate_taken", pinned="true")
+                return 0
+        else:
+            turn.turn_n = max((t.turn_n for t in mine), default=0) + 1
         if turn.created_at is None:
             turn.created_at = _now()
         self._turns.append(turn)
+        return turn.turn_n
 
     async def update_turn_response(self, scope: str, session_id: str, turn_n: int,
                                    response: str) -> None:
@@ -212,15 +245,33 @@ class InMemoryStore:
                    and (not scope or t.scope == scope))
 
     # ── turn traces (own table) ──────────────────────────────────────────
-    async def save_turn_trace(self, trace: TurnTrace) -> None:
+    async def save_turn_trace(self, trace: TurnTrace) -> bool:
+        """Mirror of ``PostgresStore.save_turn_trace`` — a stored trace stops being
+        revisable once it is older than ``TRACE_REVISION_WINDOW_S``, and its
+        ``created_at`` never moves."""
         _require_scope(trace.scope)
         if trace.created_at is None:
             trace.created_at = _now()
         # UPSERT by (scope, session_id, turn_n).
+        prior = [t for t in self._traces
+                 if t.scope == trace.scope and t.session_id == trace.session_id
+                 and t.turn_n == trace.turn_n]
+        window = timedelta(seconds=self._trace_revision_window_s)
+        if prior and prior[0].created_at is not None \
+                and trace.created_at > prior[0].created_at + window:
+            write_loss.record(write_loss.TRACE_OVERWRITE_REFUSED, scope=trace.scope,
+                              session=trace.session_id, turn=trace.turn_n,
+                              reason="stored_trace_is_older")
+            return False
+        if prior:
+            # The stored row keeps its own ``created_at``: an upsert revises CONTENT,
+            # it does not restate when the turn happened.
+            trace.created_at = prior[0].created_at
         self._traces = [t for t in self._traces
                         if not (t.scope == trace.scope and t.session_id == trace.session_id
                                 and t.turn_n == trace.turn_n)]
         self._traces.append(trace)
+        return True
 
     async def traces_for_session(self, session_id: str, *, scope: str = "") -> list[TurnTrace]:
         traces = [t for t in self._traces if t.session_id == session_id

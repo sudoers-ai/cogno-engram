@@ -38,6 +38,11 @@ dev = [
     "pytest-cov>=5.0",
     "ruff>=0.5",
     "mypy>=1.8",
+    # `tests/test_ci_runs_every_test_file.py` parses `.github/workflows/*.yml` with a real
+    # YAML parser rather than a regex. A HARD dependency, never an `importorskip`: a guard
+    # that skips itself when its parser is missing is the same "green means nothing" state
+    # the guard exists to end.
+    "pyyaml>=6.0",
 ]
 # Reference adapters — install only what you wire up.
 postgres = ["psycopg[binary,pool]>=3.1", "pgvector>=0.2"]

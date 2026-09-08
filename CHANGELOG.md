@@ -130,7 +130,7 @@
   reescreveria um valor à SAÍDA da base, que é uma decisão diferente e com perda. Os ajudantes de
   escrita já coagem contra `VALID_NODE_TYPES` — é o trabalho deles.
 
-  **Não resolve os 10 grupos** de `Ernany/CONCEPT` vs `Ernany/PERSON`: isso é desacordo semântico
+  **Não resolve os 10 grupos** de `Anselmo/CONCEPT` vs `Anselmo/PERSON`: isso é desacordo semântico
   sobre o que a coisa É, outro eixo, e continua parqueado.
 
 ## Unreleased

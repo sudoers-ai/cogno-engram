@@ -268,6 +268,11 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
             pii_types    text[] NOT NULL DEFAULT '{{}}',
             voiced_by    text NOT NULL DEFAULT '',
             created_at   timestamptz NOT NULL DEFAULT now(),
+            -- WHEN Tier-3 last consolidated this turn, or NULL for "not yet". The janitor's
+            -- idempotence marker, and it lives HERE — on the row the consolidation READ —
+            -- because the `sessions` row it used to live on is deleted by operations that
+            -- deliberately spare `turns`. See `idle_sessions` for the loop that cost.
+            consolidated_at timestamptz,
             {pk},
             UNIQUE (scope, session_id, turn_n)
         ) {part}
@@ -376,6 +381,15 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
          "ALTER TABLE turns ADD COLUMN IF NOT EXISTS voiced_by text NOT NULL DEFAULT ''"),
         ("memories", "first_heard_by",
          "ALTER TABLE memories ADD COLUMN IF NOT EXISTS first_heard_by text NOT NULL DEFAULT ''"),
+        # NULLABLE, and with NO backfill — the two together are the migration story. Every row
+        # that predates the column reads "not yet consolidated", which is what the janitor's
+        # predicate ALREADY said about it a moment before the upgrade: the marker only ever
+        # SUPPRESSES a pick (`idle_sessions` ANDs it onto the old disjunction), so an unstamped
+        # backlog cannot become a thundering herd of LLM re-reads on deploy. A DEFAULT now()
+        # here would be the opposite mistake — it would silently declare the entire history
+        # consolidated and freeze Tier-3 for every session that had not been.
+        ("turns", "consolidated_at",
+         "ALTER TABLE turns ADD COLUMN IF NOT EXISTS consolidated_at timestamptz"),
     ):
         cur = await conn.execute(
             "SELECT 1 FROM information_schema.columns "
@@ -443,6 +457,11 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
         # simula sem matar o processo.
         "DROP INDEX IF EXISTS idx_turns_scope_time",
         "CREATE INDEX IF NOT EXISTS idx_turns_session ON turns (session_id, turn_n)",
+        # PARTIAL, and it shrinks as history is consolidated: `idle_sessions` scans only
+        # turns nobody has read into long-term memory yet, which on a steady-state box is
+        # the last idle window rather than the whole table.
+        "CREATE INDEX IF NOT EXISTS idx_turns_unconsolidated "
+        "ON turns (session_id, scope) WHERE consolidated_at IS NULL",
         "CREATE INDEX IF NOT EXISTS idx_turn_traces_session ON turn_traces (session_id, turn_n)",
         # `admin_traces` lê uma SUBÁRVORE de escopo ordenada por tempo. O ramo `scope = %s` já
         # era servido pela UNIQUE `(scope, session_id, turn_n)`; o que NÃO tinha índice era o
@@ -703,23 +722,62 @@ class PostgresStore(_PgBase):
                        ended_at=row["ended_at"], summary=row["summary"])
 
     async def close_session(self, session_id: str, *, summary: str = "", scope: str = "") -> None:
-        async with self._conn() as conn:
+        """Close a session AND stamp the turns that close covers.
+
+        **Two markers, written together, because one of them is deletable.** The `sessions`
+        row is the summary's home and it is what `idle_sessions` used to consult alone; the
+        `turns.consolidated_at` stamp is the same fact recorded on rows a scope cleanup keeps.
+        The stamp carries the session's OWN `ended_at`, not a second `now()`, and covers only
+        `created_at <= ended_at` — so while the `sessions` row exists the two markers agree
+        turn for turn (see `idle_sessions`), and when it is gone the stamp still remembers.
+
+        Both statements run in ONE transaction. `_conn()` is autocommit, so without the block
+        a crash between them would leave the pair disagreeing — and BOTH orderings of the
+        disagreement are wrong in a different way, which is why the answer is atomicity rather
+        than a chosen order. Neither written → the next tick re-picks and re-consolidates,
+        which costs tokens and loses nothing; that is the direction this whole marker fails in.
+
+        NO TEST GUARDS THE TRANSACTION, and that is not an oversight — it was measured.
+        Removing `conn.transaction()` leaves the whole suite green, and green with reason: the
+        two statements always both run when the process survives, so what the block buys is
+        only the window between them, which a test cannot open without killing the process
+        mid-statement. Said here for the same reason the index CREATE/DROP order is said above.
+
+        `RETURNING` is what makes the stamp honest about the cross-scope guard below: when a
+        colliding id from another scope makes the conflict update a no-op, no row comes back,
+        and stamping that scope's turns would silence a Tier-3 read nobody performed.
+        """
+        async with self._conn() as conn, conn.transaction():
             if scope:
                 # UPSERT: a host that only save_turn()s has no sessions row to update — insert a
                 # closed one (keyed by the same session id) so the janitor's idle scan skips it.
                 # `sessions` is keyed by id alone, so a colliding id from ANOTHER scope would take
                 # this scope's summary (the cross-scope write the read-side fix was written to
                 # stop). Guard the conflict update with the scope.
-                await conn.execute(
+                cur = await conn.execute(
                     "INSERT INTO sessions (id, scope, ended_at, summary) "
                     "VALUES (%s, %s, now(), %s) "
                     "ON CONFLICT (id) DO UPDATE SET ended_at = now(), summary = EXCLUDED.summary "
-                    "WHERE sessions.scope = EXCLUDED.scope",
+                    "WHERE sessions.scope = EXCLUDED.scope "
+                    "RETURNING scope, ended_at",
                     (session_id, scope, summary))
             else:
-                await conn.execute(
-                    "UPDATE sessions SET ended_at = now(), summary = %s WHERE id = %s",
+                cur = await conn.execute(
+                    "UPDATE sessions SET ended_at = now(), summary = %s WHERE id = %s "
+                    "RETURNING scope, ended_at",
                     (summary, session_id))
+            row = await cur.fetchone()
+            if row is None:
+                return          # nothing was closed → there is nothing to declare consolidated
+            # The scope comes from the row we just wrote, never from the argument: the unscoped
+            # branch has none to offer, and this table's ids are known to collide across scopes
+            # on a live box. An unscoped `WHERE session_id = %s` would stamp a NEIGHBOUR's turns
+            # as consolidated — the same cross-scope write the guard above exists to refuse.
+            await conn.execute(
+                "UPDATE turns SET consolidated_at = %s "
+                "WHERE scope = %s AND session_id = %s "
+                "  AND consolidated_at IS NULL AND created_at <= %s",
+                (row["ended_at"], row["scope"], session_id, row["ended_at"]))
 
     async def idle_sessions(self, *, idle_seconds: int = 1800,
                             limit: int = 100) -> list[Session]:
@@ -740,13 +798,59 @@ class PostgresStore(_PgBase):
         #
         # Re-picking on `max(turn) > ended_at` is self-limiting: consolidation re-closes with a
         # fresh `ended_at`, so a session comes back only once per new burst of turns, not once
-        # per tick.
+        # per tick. That clause is correct and stays; what follows is about the OTHER two.
+        #
+        # ── THE RULE THIS QUERY AND THE HOST'S PURGE CONTRACT COLLIDE OVER ──────────────────
+        #
+        # **`sessions` is bookkeeping, `turns` is the measurement, and a scope cleanup that
+        # deletes the first while sparing the second re-arms this loop for ever.** The two
+        # halves of that sentence are written in two repositories and neither used to know
+        # about the other: here, pickability is derived from `turns`; in `cogno-host`,
+        # `tests/unit/test_identity_purge_contract.py::test_the_purge_never_deletes_the_
+        # measurement` forbids the identity purge from touching `turns`, because turns are what
+        # the promise audit measures. Both rules are right. Nothing said which one governs
+        # `sessions` — and that ABSENCE, not either rule, was the defect.
+        #
+        # Measured 2026-09-09, nobody provoking it: an authorised enumerated cleanup removed 11
+        # scopes' memories, traces and `sessions` rows and deliberately left `turns` standing,
+        # obeying the host rule to the letter. Nine minutes later ONE tick re-consolidated all
+        # 10 surviving scopes — 5,258 tokens, one of them a scope whose identity had been gone
+        # for 90 minutes returning with a byte-identical 407-token spend and writing four fresh
+        # memories. The remediation manufactured what it was remediating, and would have done
+        # so every tick for ever, because the "already handled" mark WAS the row the cleanup
+        # deleted. Replayed read-only over the live box: wipe `sessions`, keep `turns`, and the
+        # pre-2026-09-09 predicate returns 311 pickable sessions on every single tick.
+        #
+        # So the mark moved to where the cleanup cannot reach it: `turns.consolidated_at`,
+        # written by `close_session` on the very rows the consolidation read. What a scope
+        # cleanup may do is now stated in ONE sentence, in both repositories:
+        #
+        #     Delete `sessions` for a scope only together with that scope's `turns`
+        #     (`purge_scope` does exactly that). Sparing `turns` is legitimate — they are the
+        #     measurement — but then the `sessions` rows must be spared too, because on their
+        #     own they are the record of work already done, not content.
+        #
+        # ── why the marker is a CONJUNCT and never a replacement ────────────────────────────
+        #
+        # `AND t.consolidated_at IS NULL` can only ever REMOVE a session from this result, never
+        # add one, and three properties fall out of that asymmetry:
+        #
+        #  * **The legitimate re-pick is untouched.** `close_session` stamps exactly the turns
+        #    with `created_at <= ended_at`, so while the `sessions` row exists the new conjunct
+        #    and the old `t.created_at > s.ended_at` disjunct select the same turns, row for
+        #    row. A genuine new burst is unstamped and re-arms the session as it always did.
+        #  * **The upgrade is inert.** Every pre-existing turn reads NULL, i.e. exactly what the
+        #    old predicate already assumed, so nothing re-consolidates that was not already due.
+        #  * **A lost stamp costs tokens, never memory.** If the write is missing the session is
+        #    picked again and consolidated again; the failure mode is a duplicate LLM read, the
+        #    same direction the host janitor's orphan gate deliberately fails in.
         async with self._conn() as conn:
             cur = await conn.execute(
                 "SELECT t.session_id AS id, t.scope AS scope, "
                 "       min(t.created_at) AS started_at, max(t.created_at) AS last_activity "
                 "FROM turns t LEFT JOIN sessions s ON s.id = t.session_id "
-                "WHERE s.id IS NULL OR s.ended_at IS NULL OR t.created_at > s.ended_at "
+                "WHERE (s.id IS NULL OR s.ended_at IS NULL OR t.created_at > s.ended_at) "
+                "  AND t.consolidated_at IS NULL "
                 "GROUP BY t.session_id, t.scope "
                 "HAVING max(t.created_at) < now() - make_interval(secs => %s) "
                 "ORDER BY max(t.created_at) ASC LIMIT %s",
@@ -1216,10 +1320,26 @@ class PostgresStore(_PgBase):
             return cur.rowcount
 
     async def purge_scope(self, scope: str) -> int:
+        """Erase every row this store holds for a scope. RTBF's engram half.
+
+        **All four tables or none — and `sessions` may never be dropped without `turns`.**
+        This method is already correct and this docstring is the reason it must stay that way:
+        `idle_sessions` derives pickability from `turns` and is suppressed by a mark that
+        `close_session` writes onto those same turns, so a cleanup that removes a scope's
+        `sessions` rows and spares its `turns` leaves the janitor re-consolidating that scope
+        for ever. Measured 2026-09-09 — the full account is in `idle_sessions`, and the same
+        rule is written on the host side in
+        `tests/unit/test_identity_purge_contract.py::test_the_purge_never_deletes_the_measurement`,
+        whose "never delete the measurement" is the rule this one had been silently colliding
+        with. Sparing `turns` is legitimate; sparing `turns` while deleting `sessions` is not.
+        """
         _require_scope(scope)
         total = 0
         async with self._conn() as conn:
             # turn_traces + turns + sessions + memories all carry the scope column; drop them all.
+            # `turns` is deleted alongside `sessions`, and the marker `close_session` stamped on
+            # it goes with the row — a scope's consolidation bookkeeping outliving neither the
+            # scope nor the turns it describes.
             for table in ("turn_traces", "turns", "sessions", "memories"):
                 cur = await conn.execute(
                     f"DELETE FROM {table} WHERE scope = %s", (scope,))

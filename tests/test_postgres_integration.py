@@ -245,6 +245,242 @@ async def test_a_session_that_GREW_after_closing_comes_back_for_consolidation(st
         await conn.close()
 
 
+async def test_pg_a_cleanup_that_deletes_sessions_and_spares_turns_does_not_re_arm_the_janitor(store):
+    """THE defect, against the real query — the in-memory adapter cannot prove this one,
+    because the ``s.id IS NULL`` that fired for ever IS the LEFT JOIN.
+
+    An authorised enumerated cleanup deletes a scope's memories, traces and ``sessions`` rows
+    and deliberately spares its ``turns``, obeying ``cogno-host``'s
+    ``test_the_purge_never_deletes_the_measurement`` to the letter. Measured live 2026-09-09:
+    nine minutes later one janitor tick re-consolidated all 10 surviving scopes (5,258 tokens,
+    one of them a scope whose identity had been gone 90 minutes, writing four fresh memories).
+    Replayed read-only over that box: wipe ``sessions``, keep ``turns``, and the old predicate
+    returned **311** pickable sessions on EVERY tick.
+
+    Mutation: drop ``AND t.consolidated_at IS NULL`` from ``idle_sessions`` and this dies —
+    the ten ticks below hand the session back ten times.
+    """
+    scope = f"purge{uuid4().hex[:8]}/u"
+    sid = str(uuid4())
+    conn = await _connect()
+    try:
+        await store.save_turn(TurnRecord(sid, scope, 0, "oi"))
+        await conn.execute("UPDATE turns SET created_at = now() - interval '3 h' "
+                           "WHERE session_id = %s", (sid,))
+        assert sid in [x.id for x in await store.idle_sessions(idle_seconds=1800)]
+        await store.close_session(sid, summary="consolidado", scope=scope)
+
+        # the cleanup: sessions goes, turns stay (the measurement the host rule protects)
+        await conn.execute("DELETE FROM sessions WHERE id = %s", (sid,))
+        cur = await conn.execute("SELECT count(*) FROM turns WHERE session_id = %s", (sid,))
+        assert (await cur.fetchone())[0] == 1, "premise: the turns were spared"
+
+        for tick in range(10):
+            assert sid not in [x.id for x in await store.idle_sessions(idle_seconds=1800)], (
+                f"tick {tick}: the scope came back after its sessions row was deleted")
+    finally:
+        await conn.close()
+
+
+async def test_pg_close_session_stamps_only_the_turns_that_close_covered(store):
+    """The watermark, in SQL. ``close_session`` stamps ``created_at <= ended_at`` using the
+    ``ended_at`` it just wrote — not a second ``now()`` — so the mark and the old
+    ``t.created_at > s.ended_at`` disjunct select the same turns, row for row, and the new
+    conjunct can be ANDed on without changing one verdict.
+
+    Mutation: drop ``AND created_at <= %s`` from the stamp UPDATE and this dies; replace the
+    bound ``ended_at`` with a fresh ``now()`` and the equivalence stops being exact.
+    """
+    scope = f"mark{uuid4().hex[:8]}/u"
+    sid = str(uuid4())
+    conn = await _connect()
+    try:
+        await store.save_turn(TurnRecord(sid, scope, 0, "coberto"))
+        await store.save_turn(TurnRecord(sid, scope, 1, "datado depois do fecho"))
+        await conn.execute("UPDATE turns SET created_at = now() - interval '2 h' "
+                           "WHERE session_id = %s AND turn_n = 0", (sid,))
+        await conn.execute("UPDATE turns SET created_at = now() + interval '2 h' "
+                           "WHERE session_id = %s AND turn_n = 1", (sid,))
+
+        await store.close_session(sid, summary="um turno", scope=scope)
+
+        cur = await conn.execute(
+            "SELECT turn_n, consolidated_at, (SELECT ended_at FROM sessions WHERE id = %s) "
+            "FROM turns WHERE session_id = %s ORDER BY turn_n", (sid, sid))
+        rows = await cur.fetchall()          # tuple rows: (turn_n, consolidated_at, ended_at)
+        assert rows[0][1] is not None, "the covered turn was not stamped"
+        assert rows[0][1] == rows[0][2], (
+            "the stamp must carry the session's own ended_at, not a second now()")
+        assert rows[1][1] is None, (
+            "a turn dated after the close was declared consolidated by a read that never saw it")
+    finally:
+        await conn.close()
+
+
+async def test_pg_a_close_the_scope_guard_REFUSED_stamps_nothing(store):
+    """``RETURNING`` is why the stamp can be trusted, and only Postgres has this branch.
+
+    ``sessions`` is keyed by id alone and ids DO collide across scopes — one does on the live
+    box today (311 ``(session_id, scope)`` groups over 310 distinct ids). When the conflict
+    guard refuses a close because the row belongs to another scope, no row comes back and
+    nothing may be stamped: marking the asking scope's turns consolidated would end its Tier-3
+    memory over a consolidation that never happened.
+
+    Mutation: bind the ``scope`` argument and ``now()`` into the stamp instead of the values
+    ``RETURNING`` handed back (i.e. drop the ``row is None`` return) and this dies.
+    """
+    mine, neighbour = f"mine{uuid4().hex[:8]}/u", f"other{uuid4().hex[:8]}/u"
+    sid = str(uuid4())
+    conn = await _connect()
+    try:
+        await store.save_turn(TurnRecord(sid, mine, 0, "meu"))
+        await store.save_turn(TurnRecord(sid, neighbour, 0, "alheio"))
+        await store.close_session(sid, summary="mine only", scope=mine)
+
+        cur = await conn.execute(
+            "SELECT scope, consolidated_at FROM turns WHERE session_id = %s", (sid,))
+        marks = {r[0]: r[1] for r in await cur.fetchall()}
+        assert marks[mine] is not None
+        assert marks[neighbour] is None, "the close stamped a colliding scope's turns"
+
+        # …and the refused close writes nothing at all — not the summary, not a mark.
+        await store.close_session(sid, summary="hijack", scope=neighbour)
+        cur = await conn.execute("SELECT summary FROM sessions WHERE id = %s", (sid,))
+        assert (await cur.fetchone())[0] == "mine only"
+        cur = await conn.execute(
+            "SELECT consolidated_at FROM turns WHERE session_id = %s AND scope = %s",
+            (sid, neighbour))
+        assert (await cur.fetchone())[0] is None, (
+            "a close the scope guard refused still declared that scope's turns consolidated")
+    finally:
+        await conn.close()
+
+
+async def test_pg_purge_scope_takes_the_turns_and_therefore_leaves_nothing_to_re_arm(store):
+    """The supported RTBF path, unchanged — and the reason it never had this defect.
+
+    ``delete_identity`` → ``purge_scope`` deletes ``turns`` alongside ``sessions``, so the mark
+    dies as a column of the row it was stamped on and no consolidation bookkeeping outlives the
+    contact it describes. This is the twin that says the fix costs the working path nothing.
+
+    Mutation: remove ``"turns"`` from ``purge_scope``'s table tuple and this dies — the scope
+    becomes permanently re-pickable, which is exactly the incident.
+    """
+    scope = f"rtbf{uuid4().hex[:8]}/u"
+    sid = str(uuid4())
+    conn = await _connect()
+    try:
+        await store.save_turn(TurnRecord(sid, scope, 0, "oi"))
+        await conn.execute("UPDATE turns SET created_at = now() - interval '3 h' "
+                           "WHERE session_id = %s", (sid,))
+        await store.close_session(sid, summary="consolidado", scope=scope)
+
+        removed = await store.purge_scope(scope)
+        assert removed >= 2                                  # the turn and the session
+        for table in ("turns", "sessions"):
+            cur = await conn.execute(
+                f"SELECT count(*) FROM {table} WHERE scope = %s", (scope,))
+            assert (await cur.fetchone())[0] == 0, f"{table} survived purge_scope"
+        for _ in range(3):
+            assert sid not in [x.id for x in await store.idle_sessions(idle_seconds=1800)]
+    finally:
+        await conn.close()
+
+
+async def test_pg_an_unstamped_backlog_is_not_a_thundering_herd(store):
+    """Deploy day, in SQL: the mark is ANDed onto the old disjunction, never substituted for it.
+
+    Every turn written before the column existed reads NULL — "not yet consolidated" — so if
+    the mark had REPLACED the disjunction the entire history would have become pickable on the
+    first tick after the upgrade, one LLM read per session the box had already read. The old
+    clause still does that work; the mark only ever REMOVES a session from the result.
+
+    The fresh-schema fixture cannot produce this shape on its own (every turn it writes is
+    stamped when its session closes), so the pre-migration world is written here by hand: a
+    closed session whose turns carry no mark.
+
+    Mutation: replace the WHERE's disjunction with ``t.consolidated_at IS NULL`` — i.e. make
+    the mark the only test — and this dies.
+    """
+    scope = f"herd{uuid4().hex[:8]}/u"
+    sid = str(uuid4())
+    conn = await _connect()
+    try:
+        await store.save_turn(TurnRecord(sid, scope, 0, "oi"))
+        await store.close_session(sid, summary="consolidado", scope=scope)
+        # …and now un-stamp it: the rows an upgrade inherits, closed but never marked.
+        await conn.execute("UPDATE turns SET created_at = now() - interval '3 h', "
+                           "consolidated_at = NULL WHERE session_id = %s", (sid,))
+        cur = await conn.execute(
+            "SELECT count(*) FROM turns WHERE session_id = %s AND consolidated_at IS NULL",
+            (sid,))
+        assert (await cur.fetchone())[0] == 1, "premise: the backlog carries no mark"
+
+        for tick in range(3):
+            assert sid not in [x.id for x in await store.idle_sessions(idle_seconds=1800)], (
+                f"tick {tick}: an already-closed session with no newer turns was re-picked — "
+                f"the upgrade would re-read the whole history")
+    finally:
+        await conn.close()
+
+
+async def test_pg_a_turn_written_before_the_column_existed_reads_NOT_consolidated(pg):
+    """The migration story, on the shape the adapter's own writes never produce.
+
+    ``consolidated_at`` is NULLABLE with no DEFAULT and no backfill, and both halves matter.
+    Every row that predates the column reads "not yet consolidated" — exactly what the old
+    predicate already assumed about it — so the upgrade re-consolidates nothing that was not
+    already due. A ``DEFAULT now()`` would be the opposite mistake: it would declare the whole
+    history consolidated and freeze Tier-3 for every session that had not been.
+
+    Mutation: give the column a ``DEFAULT now()`` in either the DDL or the ALTER and this dies.
+    """
+    assert pg, "refusing to write into a database without a resolved test DSN"
+    scope = f"premig{uuid4().hex[:8]}/u"
+    sid = str(uuid4())
+    async with await psycopg.AsyncConnection.connect(
+            pg, row_factory=dict_row, autocommit=True) as conn:
+        # every column EXCEPT the marker — the shape a writer that predates it produces
+        await conn.execute(
+            "INSERT INTO turns (scope, session_id, turn_n, user_input) VALUES (%s, %s, 0, 'oi')",
+            (scope, sid))
+        cur = await conn.execute(
+            "SELECT consolidated_at FROM turns WHERE scope = %s", (scope,))
+        assert (await cur.fetchone())["consolidated_at"] is None, (
+            "a pre-migration turn came back already consolidated — the whole backlog would "
+            "have been declared read by a consolidation that never ran")
+
+
+async def test_pg_ensure_schema_adds_the_marker_to_a_table_that_predates_it(pg):
+    """The ALTER leg: ``CREATE TABLE IF NOT EXISTS`` is a NO-OP against a live table, so a
+    deployment that already has ``turns`` gets the new code and none of the column unless the
+    additive migration runs. Drops the column and asks ``ensure_schema`` to put it back.
+
+    Mutation: remove the ``("turns", "consolidated_at", …)`` row from the ALTER table in
+    ``ensure_schema`` and this dies — on a fresh database everything still passes, which is
+    precisely how an upgrade ships inert.
+    """
+    assert pg, "refusing to write into a database without a resolved test DSN"
+    async with await psycopg.AsyncConnection.connect(
+            pg, row_factory=dict_row, autocommit=True) as conn:
+        await conn.execute("DROP INDEX IF EXISTS idx_turns_unconsolidated")
+        await conn.execute("ALTER TABLE turns DROP COLUMN IF EXISTS consolidated_at")
+        cur = await conn.execute(
+            "SELECT 1 AS present FROM information_schema.columns "
+            "WHERE table_name = 'turns' AND column_name = 'consolidated_at'")
+        assert await cur.fetchone() is None, "premise: the column is gone"
+
+        await ensure_schema(conn, embedding_dim=EMB_DIM)
+
+        cur = await conn.execute(
+            "SELECT is_nullable, column_default FROM information_schema.columns "
+            "WHERE table_name = 'turns' AND column_name = 'consolidated_at'")
+        row = await cur.fetchone()
+        assert row is not None, "ensure_schema did not add the marker to an existing table"
+        assert row["is_nullable"] == "YES" and row["column_default"] is None, (
+            "the marker must arrive nullable and unbackfilled — see the test above")
+
+
 async def test_pii_masking_on_write(store):
     scope = f"t/{uuid4()}"
     s = await store.create_session(scope)

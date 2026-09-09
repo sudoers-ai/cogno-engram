@@ -125,6 +125,12 @@ class InMemoryStore:
         self._trace_revision_window_s = float(trace_revision_window_s)
         self._sessions: dict[str, Session] = {}
         self._turns: list[TurnRecord] = []
+        # The Postgres `turns.consolidated_at` column, mirrored. Keyed by the same
+        # triple that table declares UNIQUE, so "the mark rides on the turn" is true
+        # here too: it survives a `sessions` deletion and dies with `purge_scope`.
+        # NOT a field on `TurnRecord` — that dataclass is what the HOST wrote; this is
+        # what the janitor did to it, and a host has no business setting it.
+        self._consolidated: set[tuple[str, str, int]] = set()
         self._traces: list[TurnTrace] = []
         self._memories: list[MemoryRecord] = []
         self._locks: dict[str, asyncio.Lock] = {}
@@ -143,6 +149,12 @@ class InMemoryStore:
         return s
 
     async def close_session(self, session_id: str, *, summary: str = "", scope: str = "") -> None:
+        """Mirror of ``PostgresStore.close_session``: close the row AND stamp the turns.
+
+        The stamp is the marker a `sessions` deletion cannot reach — see that method and
+        ``idle_sessions`` for the loop it closes. Same watermark rule (`created_at <=
+        ended_at`), same refusal to stamp when nothing was actually closed.
+        """
         session = self._sessions.get(session_id)
         if session is not None and scope and session.scope != scope:
             return          # a colliding id owned by ANOTHER scope — never write its summary
@@ -154,6 +166,17 @@ class InMemoryStore:
             # (host-persisted turns) — so the janitor's idle scan won't re-pick it.
             self._sessions[session_id] = Session(
                 id=session_id, scope=scope, started_at=_now(), ended_at=_now(), summary=summary)
+        else:
+            return          # no row and no scope to make one → nothing closed, nothing to stamp
+        closed = self._sessions[session_id]
+        ended = closed.ended_at
+        assert ended is not None                       # just written, both branches above
+        # The scope comes from the row that was closed, never from the argument — the Postgres
+        # adapter reads it back with RETURNING for the same reason: ids collide across scopes.
+        for turn in self._turns:
+            if (turn.session_id == session_id and turn.scope == closed.scope
+                    and turn.created_at is not None and turn.created_at <= ended):
+                self._consolidated.add((turn.scope, turn.session_id, turn.turn_n))
 
     async def idle_sessions(self, *, idle_seconds: int = 1800,
                             limit: int = 100) -> list[Session]:
@@ -161,6 +184,8 @@ class InMemoryStore:
         # last activity per session_id, derived from turns (the host may never create_session)
         last: dict[str, tuple[str, "datetime", "datetime"]] = {}   # sid → (scope, first, last)
         for t in self._turns:
+            if (t.scope, t.session_id, t.turn_n) in self._consolidated:
+                continue        # already read into long-term memory — the mark a purge can't erase
             ts = t.created_at or _now()
             cur = last.get(t.session_id)
             if cur is None:
@@ -176,7 +201,9 @@ class InMemoryStore:
             # Closed is not the same as FINISHED: a host whose session_id is derived from
             # (tenant, channel, sender) reuses one session per contact forever, so turns keep
             # arriving after a close. Skip only when nothing has happened since — see the
-            # Postgres adapter for the measured effect of getting this wrong.
+            # Postgres adapter for the measured effect of getting this wrong. The `sessions`
+            # row is only HALF the answer: it is deletable, and the loop that fact opened is
+            # closed by the `_consolidated` filter above, not by this test.
             if sess is not None and sess.ended_at is not None and lst <= sess.ended_at:
                 continue
             out.append(Session(id=sid, scope=scope, started_at=first))
@@ -427,6 +454,9 @@ class InMemoryStore:
             before = len(coll)
             setattr(self, coll_attr, [r for r in coll if r.scope != scope])
             total += before - len(getattr(self, coll_attr))
+        # The marks go with the turns they were stamped on — in Postgres they are a COLUMN of
+        # the deleted row and cannot do otherwise. Not counted: a mark is not a row.
+        self._consolidated = {k for k in self._consolidated if k[0] != scope}
         return total
 
     # ── concurrency ──────────────────────────────────────────────────────

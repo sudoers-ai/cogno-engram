@@ -60,6 +60,26 @@ build-backend = "setuptools.build_meta"
 [tool.setuptools.packages.find]
 include = ["cogno_engram*"]
 
+[tool.setuptools.package-data]
+# PEP 561. Without this marker INSIDE the built wheel, a type checker that finds this package in
+# site-packages does not read a line of it: a consumer with `ignore_missing_imports = true` — which
+# every repo in this stack sets, to keep third-party noise out of its own errors — sees the whole
+# package silently become `Any`, and every disagreement across the seam stops being an error.
+#
+# Measured on cogno-host 2026-09-18: with the sibling libs installed as wheels (what its CI does),
+# `mypy cogno_host` resolved 13 of the 16 pinned siblings and was blind to exactly the three that
+# ship no marker — `cogno-anima`, `cogno-engram`, `cogno-observability`. A deliberately wrong name
+# (`from cogno_engram import DEFINITELY_NOT_A_REAL_NAME`) came back GREEN for this package: the
+# host was type-checking NOTHING of it. In the observability case that same blindness had been
+# hiding a real contract error on the host's `main` for 17 days, through a green "Type-check
+# (mypy)" step.
+#
+# Declared EXPLICITLY rather than left to `include-package-data`: modern setuptools discovers the
+# file on its own, but a guarantee that rests on a default moves when the default does — and this
+# one is invisible when it breaks, because the repo still LOOKS typed and only the install is not.
+# `tests/test_py_typed_ships.py` holds it against a BUILT WHEEL.
+cogno_engram = ["py.typed"]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]

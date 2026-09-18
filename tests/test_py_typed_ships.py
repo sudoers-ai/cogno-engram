@@ -47,7 +47,13 @@ def _pristine_copy(dest: pathlib.Path) -> pathlib.Path:
 def test_py_typed_is_inside_the_built_wheel(tmp_path):
     src = _pristine_copy(tmp_path / "src")
     out = subprocess.run(
-        [sys.executable, "-m", "pip", "wheel", "--no-deps", "--no-build-isolation",
+        # Build ISOLATION is left ON (pip's default): with `--no-build-isolation` the runner has to
+        # already have the declared backend importable, and a CI virtualenv for 3.12 does not ship
+        # `setuptools` — measured, `BackendUnavailable`, red on 3.12 and green on 3.11 in the same
+        # matrix. An isolated build is also the faithful reproduction of how the wheel is really
+        # made. `--no-cache-dir` stays: pip caches wheels built from a local directory, and with
+        # the cache on, this test passed over a mutation that deleted the marker outright.
+        [sys.executable, "-m", "pip", "wheel", "--no-deps",
          "--no-cache-dir", "-w", str(tmp_path / "wheel"), str(src)],
         capture_output=True, text=True, timeout=600)
     if out.returncode != 0:

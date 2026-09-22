@@ -180,13 +180,14 @@ async def test_the_two_sides_agree_on_whole_LABELS_not_just_characters():
     combinantes — sobrevive a todos eles e parte um nome inteiro (`Łódź`, `São Gonçalo do Amarante`)
     sem tocar em nenhum caractere isolado.
 
-    Os rótulos abaixo são o domínio a sério: nomes pt-BR/es com acento, o nome do próprio dono nas
-    duas grafias em que a base viva o tem, e as formas Unicode compostas E decompostas do mesmo
-    nome — que é o caso que um teste por caractere nunca constrói."""
+    Os rótulos abaixo são o domínio a sério: nomes pt-BR/es com acento, um nome de contacto nas
+    duas grafias em que uma base viva o guarda (o contacto escreve como escreve), e as formas
+    Unicode compostas E decompostas do mesmo nome — que é o caso que um teste por caractere
+    nunca constrói."""
     conn = await _pg()
     labels = [
         "José", "Jose", "JOSÉ", "josé",
-        "Vinicius Vale", "Vinícius Vale",          # o par que existe na base viva
+        "Heitor Lacerda", "heitor lacerda",         # o par que uma base viva guarda
         "Hernani", "Hernaní",
         "São Gonçalo do Amarante", "Sao Goncalo do Amarante",
         "Łódź", "Añez", "Müller", "D'Ávila", "Conceição",
@@ -208,7 +209,7 @@ async def test_the_two_sides_agree_on_whole_LABELS_not_just_characters():
     # e o que o produto PROMETE: as formas do mesmo nome caem todas na mesma chave
     for grupo in (["José", "Jose", "JOSÉ", "josé",
                    unicodedata.normalize("NFD", "José")],
-                  ["Vinicius Vale", "Vinícius Vale"],
+                  ["Heitor Lacerda", "heitor lacerda"],
                   ["São Gonçalo do Amarante", "Sao Goncalo do Amarante"]):
         keys = {fold_label(r) for r in grupo}
         assert len(keys) == 1, f"{grupo} devia ser uma só pessoa/lugar, deu {keys}"

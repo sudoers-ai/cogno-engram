@@ -216,7 +216,7 @@ async def _count_or_repoint(conn, survivor_id: int, loser: int, dry_run: bool) -
 async def _store_alias(conn, survivor_id: int, loser: str) -> None:
     """O rótulo que desaparece fica no sobrevivente, em `attributes.aliases`.
 
-    Perder a grafia é perder informação: `Vinícius Vale` e `Vinicius Vale` são a mesma pessoa, mas
+    Perder a grafia é perder informação: `Heitor Lacerda` e `heitor lacerda` são a mesma pessoa, mas
     saber que ela já se escreveu das duas maneiras é um facto sobre ela — e é o que permite
     desfazer a fusão à mão se alguém decidir que foi errada."""
     await conn.execute(

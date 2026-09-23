@@ -191,7 +191,7 @@ async def test_the_two_sides_agree_on_whole_LABELS_not_just_characters():
         "Hernani", "Hernaní",
         "São Gonçalo do Amarante", "Sao Goncalo do Amarante",
         "Łódź", "Añez", "Müller", "D'Ávila", "Conceição",
-        "André Castro", "Clínica veterinária", "Funcionário",
+        "Adélio Bentes", "Clínica veterinária", "Funcionário",
         unicodedata.normalize("NFC", "José"),      # composta
         unicodedata.normalize("NFD", "José"),      # decomposta — mesmo nome, bytes diferentes
         "  José  ", "JOSÉ MARIA da SILVA",

@@ -99,10 +99,12 @@ REASON_EXTRACTOR_UNAVAILABLE = "extractor_unavailable"   # no extractor for this
 REASON_GATE_REFUSED = "gate_refused"                # the caller's pre-embedding gate said no
 REASON_EMBED_FAILED = "embed_failed"                # the embedder raised or answered the wrong width
 REASON_EXPIRED = "expired"                          # a draft nobody confirmed before `expires_at`
+REASON_DISCARDED = "discarded"                      # a draft its uploader withdrew
+REASON_INTERRUPTED = "interrupted"                  # `processing` outlived the process working it
 REASON_INTERNAL = "internal"                        # anything else — the log has the detail
 VALID_KB_REASONS: frozenset[str] = EXTRACTOR_REASONS | frozenset({
     REASON_UNSUPPORTED_TYPE, REASON_EXTRACTOR_UNAVAILABLE, REASON_GATE_REFUSED,
-    REASON_EMBED_FAILED, REASON_EXPIRED, REASON_INTERNAL,
+    REASON_EMBED_FAILED, REASON_EXPIRED, REASON_DISCARDED, REASON_INTERRUPTED, REASON_INTERNAL,
 })
 
 # ── media types ──────────────────────────────────────────────────────────────────────
@@ -129,8 +131,18 @@ VALID_COMMIT_OUTCOMES: frozenset[str] = frozenset({COMMIT_READY, COMMIT_DELETED,
 TOMBSTONE_DELETED = "deleted"      # one document, removed on request
 TOMBSTONE_PURGED = "purged"        # removed by a subtree purge
 TOMBSTONE_EXPIRED = "expired"      # a draft nobody confirmed: its chunks and original removed
+TOMBSTONE_DISCARDED = "discarded"  # a draft its uploader withdrew — at once, not in 24 h
+TOMBSTONE_INTERRUPTED = "interrupted"   # a `processing` version whose worker is gone
 VALID_TOMBSTONE_KINDS: frozenset[str] = frozenset({TOMBSTONE_DELETED, TOMBSTONE_PURGED,
-                                                   TOMBSTONE_EXPIRED})
+                                                   TOMBSTONE_EXPIRED, TOMBSTONE_DISCARDED,
+                                                   TOMBSTONE_INTERRUPTED})
+
+# ── discarding a draft ───────────────────────────────────────────────────────────────
+DISCARD_OK = "discarded"           # the draft is gone (or already was — a repeat is free)
+DISCARD_NOT_A_DRAFT = "not_a_draft"   # the version exists and is not awaiting confirmation
+DISCARD_MISSING = "missing"        # no such version of a document of this owner
+VALID_DISCARD_OUTCOMES: frozenset[str] = frozenset({DISCARD_OK, DISCARD_NOT_A_DRAFT,
+                                                    DISCARD_MISSING})
 
 # ── claiming a draft for its commit ──────────────────────────────────────────────────
 #: How long an unconfirmed draft lives by default. A mechanism default — a host passes its own.
@@ -281,6 +293,10 @@ class KbVersion:
     #: When the draft stops being confirmable (``prepare``'s clock + ttl); ``None`` for a version
     #: that never waited for confirmation.
     expires_at: Optional[datetime] = None
+    #: When this version last ENTERED ``processing`` — begun by a prepare, or claimed by a
+    #: commit. The one clock a stale ``processing`` is judged by (``interrupt_stale``):
+    #: ``created_at`` cannot tell a draft confirmed a minute ago from one abandoned an hour ago.
+    claimed_at: Optional[datetime] = None
 
 
 @dataclass(frozen=True)

@@ -330,9 +330,11 @@ class DocumentStore(Protocol):
     # to ``processing`` and resumed) instead of numbering a new one. ``None`` when the document
     # does not exist under ``owner_key``. ``original`` is refused past the store's ceiling BEFORE
     # anything is written.
+    # ``now`` stamps ``claimed_at`` (the caller's clock; the store's own when omitted).
     async def begin_version(self, owner_key: str, document_id: str, *, sha256: str,
                             embed_model: str, size_bytes: int,
-                            original: Optional[bytes] = None) -> Optional[KbVersion]: ...
+                            original: Optional[bytes] = None,
+                            now: Optional[datetime] = None) -> Optional[KbVersion]: ...
     # Upserts by ordinal (a retried job does not duplicate). Every chunk MUST carry its
     # embedding (``ValueError`` otherwise): a ready version with an unembedded chunk would break
     # the all-or-none rule of ``search``. ``False`` when the version is no longer
@@ -374,6 +376,21 @@ class DocumentStore(Protocol):
     # (``kind="expired"``) is written. The version row stays, so the uploader sees why. Returns
     # how many expired.
     async def expire_drafts(self, *, now: datetime, limit: int = 100) -> int: ...
+    # WITHDRAW a draft now — what the expiry does at 24 h, on request (privacy: an upload made
+    # by mistake must not keep its original stored for a day). Only a version in
+    # ``awaiting_confirmation``: it becomes ``error``/``discarded``, its draft and original are
+    # removed, a tombstone (``discarded``, with ``actor``) is written. Returns
+    # ``documents.DISCARD_*``: a repeat is ``discarded`` again with no second tombstone; a
+    # version in any other state is ``not_a_draft``; another owner's is ``missing``.
+    async def discard_draft(self, owner_key: str, document_id: str, version: int, *,
+                            actor: str = "") -> str: ...
+    # The sweep that keeps "no version stays ``processing`` beyond its process" true —
+    # cross-owner, on the host's tick. Every ``processing`` version whose ``claimed_at`` (or,
+    # for a row that predates it, ``created_at``) is before ``older_than`` becomes
+    # ``error``/``interrupted``, its partial chunks, draft and original removed, with a
+    # tombstone. A prepare that crashed and a commit that died after its claim (the claim
+    # consumed the draft, so nothing can resume it) both land here. Returns how many.
+    async def interrupt_stale(self, *, older_than: datetime, limit: int = 100) -> int: ...
 
     # ── removal ──────────────────────────────────────────────────────────
     # Out of every search AT ONCE (the same statement removes the rows every read joins on),

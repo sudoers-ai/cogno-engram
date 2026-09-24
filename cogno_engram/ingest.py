@@ -263,10 +263,11 @@ async def prepare(store: Any, owner_key: str, document_id: str, *, data: bytes, 
     try:
         version = await store.begin_version(owner_key, document_id, sha256=sha,
                                             embed_model=embed_model, size_bytes=len(data),
-                                            original=original)
+                                            original=original, now=moment)
     except OriginalTooLarge:
         version = await store.begin_version(owner_key, document_id, sha256=sha,
-                                            embed_model=embed_model, size_bytes=len(data))
+                                            embed_model=embed_model, size_bytes=len(data),
+                                            now=moment)
         oversize = True
     if version is None:
         return IngestOutcome(INGEST_DELETED, document_id)
@@ -393,8 +394,9 @@ async def commit(store: Any, owner_key: str, document_id: str, version: int, *, 
                                     heading_path=chunk.heading_path, page=chunk.page,
                                     embedding=vector))
     except asyncio.CancelledError:
-        raise                                            # the version stays `processing`; a new
-    except Exception:                                    # prepare of the same bytes resumes it
+        raise                                            # stays `processing` until a new prepare
+    except Exception:                                    # of the bytes resumes it, or the
+        # `interrupt_stale` sweep ends it — the claim consumed the draft, so nothing else can
         await store.fail_version(owner_key, document_id, number, reason=REASON_INTERNAL)
         raise
 
@@ -440,6 +442,36 @@ async def ingest(store: Any, owner_key: str, document_id: str, *, data: bytes, e
         return prepared
     return await commit(store, owner_key, document_id, prepared.version, embedder=embedder,
                         embed_model=embed_model, gate=gate, pace=pace)
+
+
+async def discard_draft(store: Any, owner_key: str, document_id: str, version: int, *,
+                        actor: str = "") -> str:
+    """WITHDRAW a draft now — what :func:`expire_drafts` does at 24 h, on the uploader's request
+    (an upload made by mistake must not keep its original stored for a day). The version becomes
+    ``error``/``discarded``, its draft and original are removed, and a ``discarded`` tombstone
+    records ``actor``. Returns ``documents.DISCARD_*``: ``discarded`` (a repeat too),
+    ``not_a_draft`` (any version not awaiting confirmation — a served one included), ``missing``.
+    """
+    require_owner(owner_key)
+    return await store.discard_draft(owner_key, document_id, int(version), actor=actor)
+
+
+#: How long a ``processing`` version may go without progress before :func:`interrupt_stale`
+#: calls it dead. A mechanism default; the host passes its own ``older_than``.
+STALE_PROCESSING = timedelta(minutes=30)
+
+
+async def interrupt_stale(store: Any, *, older_than: Optional[datetime] = None,
+                          limit: int = 100) -> int:
+    """The sweep that keeps "no version stays ``processing`` beyond its process" true — for a
+    host's tick, cross-owner. Every ``processing`` version whose ``claimed_at`` is before
+    ``older_than`` (``utc_now() - STALE_PROCESSING`` when omitted) becomes
+    ``error``/``interrupted``, with a tombstone: a prepare that crashed half-way, and a commit
+    that died after its claim — the claim consumed the draft, so nothing can resume it.
+    ``claimed_at`` and not ``created_at``, because a draft confirmed a minute ago and still
+    embedding may have been CREATED an hour ago."""
+    return await store.interrupt_stale(older_than=older_than or utc_now() - STALE_PROCESSING,
+                                       limit=limit)
 
 
 async def expire_drafts(store: Any, *, now: Optional[datetime] = None, limit: int = 100) -> int:

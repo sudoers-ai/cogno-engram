@@ -403,3 +403,56 @@ async def test_a_commit_refuses_a_version_out_of_awaiting_even_with_a_draft_pres
     store._versions[(doc_id, 1)].state = KB_AWAITING_CONFIRMATION
     ok = await commit(store, o, doc_id, 1, embedder=embedder, embed_model=MODEL_A, now=T0)
     assert ok.status == INGEST_READY and embedder.calls == ok.chunks > 0
+
+
+# ── discarding a draft: now, not in 24 h ────────────────────────────────────────────────
+
+async def test_discarding_a_draft_removes_its_bytes_now_and_leaves_a_tombstone(store):
+    from cogno_engram.ingest import discard_draft
+    o = owner()
+    doc_id = await new_doc(store, o)
+    await prepare(store, o, doc_id, data=MANUAL, embed_model=MODEL_A, now=T0)
+    assert await store.stored_original_bytes(o) == len(MANUAL)            # CONTROL: stored
+    assert await discard_draft(store, o, doc_id, 1, actor="uploader-7") == "discarded"
+    assert await store.stored_original_bytes(o) == 0
+    v = await store.get_version(o, doc_id, 1)
+    assert (v.state, v.reason) == (KB_ERROR, "discarded")
+    assert await store.pending_drafts(o) == []
+    [stone] = await store.tombstones(o)
+    assert (stone.kind, stone.actor, stone.versions) == ("discarded", "uploader-7", (1,))
+    # a repeat is free: the same answer, no second tombstone
+    assert await discard_draft(store, o, doc_id, 1, actor="uploader-7") == "discarded"
+    assert len(await store.tombstones(o)) == 1
+    # and it cannot be committed any more
+    out = await commit(store, o, doc_id, 1, embedder=StubEmbedder(), embed_model=MODEL_A, now=T0)
+    assert out.status == INGEST_NOT_PREPARED
+
+
+async def test_discarding_a_draft_leaves_the_served_version_serving(store):
+    from cogno_engram.ingest import discard_draft
+    o = owner()
+    doc_id = await new_doc(store, o)
+    served = b"# Guia\n\nsabado aberto\n"
+    await ingest(store, o, doc_id, data=served, embedder=StubEmbedder(), embed_model=MODEL_A)
+    await prepare(store, o, doc_id, data=MANUAL, embed_model=MODEL_A, now=T0)
+    assert await store.stored_original_bytes(o) == len(served) + len(MANUAL)
+    assert await discard_draft(store, o, doc_id, 2, actor="uploader-7") == "discarded"
+    assert await store.stored_original_bytes(o) == len(served)            # only the draft's went
+    doc = await store.get_document(o, doc_id)
+    assert doc.active.version == 1 and doc.active.state == KB_READY
+    assert len((await store.search(o, profile="GUEST", text="sabado")).hits) == 1
+
+
+async def test_a_served_version_cannot_be_discarded_nor_another_owners_draft(store):
+    from cogno_engram.ingest import discard_draft
+    o, other = owner(), owner()
+    doc_id = await new_doc(store, o)
+    await ingest(store, o, doc_id, data=b"# Guia\n\nsabado\n", embedder=StubEmbedder(),
+                 embed_model=MODEL_A)
+    assert await discard_draft(store, o, doc_id, 1) == "not_a_draft"
+    assert (await store.get_version(o, doc_id, 1)).state == KB_READY
+    await prepare(store, o, doc_id, data=MANUAL, embed_model=MODEL_A, now=T0)
+    assert await discard_draft(store, other, doc_id, 2) == "missing"
+    assert await discard_draft(store, o, doc_id, 99) == "missing"
+    assert (await store.get_version(o, doc_id, 2)).state == KB_AWAITING_CONFIRMATION
+    assert await store.stored_original_bytes(o) > len(b"# Guia\n\nsabado\n")

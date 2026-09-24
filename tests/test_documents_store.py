@@ -424,9 +424,22 @@ async def test_the_tie_break_decides_the_cut_whatever_the_physical_order(docs):
     """Rows written in the OPPOSITE of the tie order — the larger document id first, each one's
     ordinals backwards — so a store that relied on physical order would cut the wrong rows."""
     o = owner()
-    x = await docs.create_document(o, title="M", profiles=["GUEST"], media_type=MEDIA_MARKDOWN)
-    y = await docs.create_document(o, title="M", profiles=["GUEST"], media_type=MEDIA_MARKDOWN)
-    small, large = sorted([x.id, y.id])
+
+    async def create():
+        return (await docs.create_document(o, title="M", profiles=["GUEST"],
+                                           media_type=MEDIA_MARKDOWN)).id
+
+    # The documents' rows must be WRITTEN larger-id first: the plan walks them in the order they
+    # sit, so with the smaller one first a store that ignored the tie-break would still cut
+    # right — a coin flip on two uuid4s, measured (the first version of this test passed under
+    # the mutation). Keep the last one only if the next is smaller; otherwise drop it and retry.
+    large = await create()
+    while True:
+        small = await create()
+        if small < large:
+            break
+        await docs.delete_document(o, large)
+        large = small
     for doc_id in (large, small):
         v = await docs.begin_version(o, doc_id, sha256="3" * 64, embed_model=MODEL_A, size_bytes=1)
         await docs.add_chunks(o, doc_id, v.version, [

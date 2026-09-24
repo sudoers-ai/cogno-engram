@@ -15,13 +15,17 @@ of the neighbours, each inherited from the consumer that first measured it:
   does not count as our work;
 * the cyclic GC is paused around the timed part — a generation-2 collection walks the WHOLE
   test process's heap, which is not this code's allocation;
-* the reading is the minimum of three after a warm-up.
+* the reading is the minimum of three after a warm-up;
+* no trace function runs while the clock does (:func:`_untraced`) — this repo's CI measures
+  coverage, and a line tracer quadruples the reading.
 """
 
 from __future__ import annotations
 
 import gc
+import sys
 import time
+from contextlib import contextmanager
 
 import pytest
 
@@ -56,6 +60,23 @@ def _pool(target_bytes: int) -> "list[Candidate]":
     return out
 
 
+@contextmanager
+def _untraced():
+    """No trace function while the clock runs — restored after, the same object.
+
+    A coverage run (this repo's CI runs the suite under ``--cov``) installs a tracer that is
+    called on every line: measured on the 3.10 leg, the capped ranking read 86.6 ms under it and
+    ~22 ms without. That is the instrument's cost, not this code's — the same reason the GC is
+    paused. The PAIR is timed under the same condition, so the bound cannot pass by the tracer
+    being off in one half and on in the other."""
+    tracer = sys.gettrace()
+    sys.settrace(None)
+    try:
+        yield
+    finally:
+        sys.settrace(tracer)
+
+
 def _rank_time(pool: "list[Candidate]", runs: int = 3) -> float:
     asked = variants(*_QUESTION)
     rank(pool[:50], asked)                                  # warm-up: regexes, unicodedata
@@ -63,9 +84,10 @@ def _rank_time(pool: "list[Candidate]", runs: int = 3) -> float:
     for _ in range(runs):
         gc.disable()
         try:
-            t0 = time.process_time()
-            rank(pool, asked)
-            best = min(best, time.process_time() - t0)
+            with _untraced():
+                t0 = time.process_time()
+                rank(pool, asked)
+                best = min(best, time.process_time() - t0)
         finally:
             gc.enable()
     return best

@@ -74,14 +74,18 @@
 
 ### Testes
 
-- `tests/test_lexical.py` (24) — os sete primeiros MUDARAM-SE com o motor (termos, relevância nas
+- `tests/test_lexical.py` (25) — os sete primeiros MUDARAM-SE com o motor (termos, relevância nas
   duas línguas, o zero que nunca passa, a variante que só entra se acrescenta palavras, o salto
   só para a frente, o desempate, as stopwords no alfabeto do tokenizador), com os fixtures
   RE-INVENTADOS; os restantes são desta lib (a dobra e o que a separa da de rótulos, o plural e o
   que ele não faz, o piso nesta escala, ids sem conteúdo, dedupe, `baseline_nodes`, `edge_text`,
   memórias sem id ou vazias, erro vs nada, top-k, desempate completo, `render`).
 - `tests/test_lexical_cost.py` (3) — o gémeo de tempo e o seu par, e o tecto que pára a
-  CONSTRUÇÃO e não só o resultado.
+  CONSTRUÇÃO e não só o resultado. O relógio é o CPU do processo, com o GC em pausa e **sem
+  tracer**: esta CI corre a suíte sob `--cov`, e o tracer de linha quadruplicou a leitura (medido
+  na perna 3.10: 86,6 ms sob cobertura, ~22 ms sem ela). É o custo do instrumento, não do código;
+  o par é medido na mesma condição, para que o tecto não possa passar por o tracer estar ligado
+  numa metade e desligado na outra.
 
 ## Unreleased — o vocabulário de status deixa de ser escrito à mão dentro do SQL (2026-08-27)
 

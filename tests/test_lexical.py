@@ -131,6 +131,12 @@ def test_the_floor_is_the_stopword_list_and_nothing_else():
     assert "de" in STOPWORDS and "modelagem" not in STOPWORDS
 
 
+def test_a_question_with_no_content_words_scores_nothing_and_does_not_divide_by_zero():
+    lens = terms("lente progressiva")
+    assert relevance(lens, [terms("de da do")]) == 0.0
+    assert relevance(lens, [frozenset(), terms("lente")]) == 1.0, "the empty variant is skipped"
+
+
 def test_the_prefix_is_applied_after_the_stopword_test():
     assert terms("implante implant", prefix=6) == {"implan"}
     assert terms("implante implant") == {"implante", "implant"}

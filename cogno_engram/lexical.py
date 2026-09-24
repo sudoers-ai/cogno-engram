@@ -169,8 +169,10 @@ TOP_K = 5
 #:
 #: **Why it exists.** A ranking is CPU, and on an event loop CPU cannot be interrupted: a
 #: ``rank`` over ~3 MB of section-sized candidates held the loop ~370–400 ms, during which
-#: nothing else in the process ran. At this many section-sized candidates it stays well under
-#: 50 ms (``tests/test_lexical_cost.py`` times it, with its uncapped pair).
+#: nothing else in the process ran. At this many section-sized candidates it is ~16 times
+#: cheaper (~22 ms against ~350 ms on a quiet 20-thread box, 2026-09-24) — and it is the RATIO
+#: that ``tests/test_lexical_cost.py`` asserts, timed intercalated with the uncapped pool, because
+#: an absolute number of milliseconds is a fact about the machine's load, not about this code.
 #:
 #: **What it does not bound: the SIZE of a candidate.** Cost is linear in the total text scored,
 #: so 2 000 candidates of 1.5 KB each are the same 3 MB again. A caller that builds candidates

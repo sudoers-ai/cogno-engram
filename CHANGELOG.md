@@ -1,5 +1,30 @@
 # Changelog
 
+## Unreleased — o custo do ranking prova-se por RAZÃO intercalada e o tecto por MECANISMO; os «< 50 ms» passam a medição (2026-09-24)
+
+### Changed
+
+- **`tests/test_lexical_cost.py`** deixa de afirmar um tempo absoluto. O gémeo antigo prendia o
+  ranking limitado abaixo de 50 ms, e isso media a MÁQUINA e o INSTRUMENTO, não o código: o
+  `process_time` conta só o CPU do processo, mas um processo que partilha núcleos e caches com
+  vizinhos ocupados gasta mais do seu próprio CPU no mesmo trabalho (no consumidor que trouxe este
+  gémeo, o portão leu 93,6 e 160,9 ms com a caixa a load ~13), e o tracer de cobertura desta CI
+  quadruplicava a leitura. Agora:
+  - **o tecto, sem relógio** — `test_over_3MB_the_builder_stops_at_MAX_CANDIDATES_mechanically`:
+    sobre ~3 MB, o construtor pedido com `limit=MAX_CANDIDATES` devolve exactamente isso, de um
+    conjunto mais de dez vezes maior, e o conjunto limitado ainda responde;
+  - **o que o tecto compra, por razão** —
+    `test_TWIN_the_capped_ranking_is_an_order_of_magnitude_cheaper_timed_intercalated`: limitado e
+    sem limites medidos INTERCALADOS (c, u, c, u, c, u), no mesmo processo e à mesma carga, mínimo
+    de cada lado, `sem limites ≥ 10 × limitado`. O conjunto é ~16 vezes o tecto; a razão fica perto
+    de 16 com a máquina leve e sob carga, porque a carga incha as duas pernas por igual.
+  - Os números ficam no docstring do módulo como MEDIÇÃO (24/09/2026, 20 threads, load ~9: ~22 ms
+    limitado, ~325–350 ms sem limites).
+  O README e o docstring de `MAX_CANDIDATES` dizem o mesmo (só texto).
+  Saem `test_TWIN_3MB_of_sections_capped_at_MAX_CANDIDATES_ranks_under_50ms` e
+  `test_PAIR_the_same_3MB_uncapped_is_far_over_the_bound`; entram os dois acima. Só testes; nenhum
+  código da lib muda.
+
 ## Unreleased — documentos: um quarto port, versionado, pesquisado a pedido (F2.4, 2026-09-24)
 
 ### Added

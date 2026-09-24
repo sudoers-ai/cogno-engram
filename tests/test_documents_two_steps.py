@@ -456,3 +456,66 @@ async def test_a_served_version_cannot_be_discarded_nor_another_owners_draft(sto
     assert await discard_draft(store, o, doc_id, 99) == "missing"
     assert (await store.get_version(o, doc_id, 2)).state == KB_AWAITING_CONFIRMATION
     assert await store.stored_original_bytes(o) > len(b"# Guia\n\nsabado\n")
+
+
+# ── a `processing` version never outlives its process ────────────────────────────────────
+
+async def test_a_stale_processing_version_is_interrupted_with_a_tombstone(store):
+    """Both shapes: a prepare that died half-way (begun, never parked), and a commit that died
+    after its claim (the claim consumed the draft — nothing can resume it)."""
+    from cogno_engram.ingest import interrupt_stale
+    o = owner()
+    crashed_prepare = await new_doc(store, o)
+    await store.begin_version(o, crashed_prepare, sha256="c" * 64, embed_model=MODEL_A,
+                              size_bytes=3, original=b"abc", now=T0)
+    dead_commit = await new_doc(store, o)
+    await prepare(store, o, dead_commit, data=MANUAL, embed_model=MODEL_A, now=T0)
+    status, _ = await store.claim_draft(o, dead_commit, 1, now=T0 + timedelta(minutes=10))
+    assert status == "claimed"                            # …and the worker dies here
+
+    assert await interrupt_stale(store, older_than=T0) == 0                    # CONTROL: fresh
+    assert await interrupt_stale(store, older_than=T0 + timedelta(minutes=40)) == 2
+    for doc_id in (crashed_prepare, dead_commit):
+        v = await store.get_version(o, doc_id, 1)
+        assert (v.state, v.reason) == (KB_ERROR, "interrupted"), doc_id
+    assert {s.kind for s in await store.tombstones(o)} == {"interrupted"}
+    assert len(await store.tombstones(o)) == 2
+    assert await store.stored_original_bytes(o) == 0
+    assert await interrupt_stale(store, older_than=T0 + timedelta(days=9)) == 0  # idempotent
+
+
+async def test_a_draft_claimed_just_now_is_not_interrupted_however_old_it_is(store):
+    """The version was CREATED long before `older_than` (a real clock, years before T0) and
+    prepared at T0, but CLAIMED at T0+2h and still embedding: the sweep at T0+1h must leave it."""
+    from cogno_engram.ingest import interrupt_stale
+    o = owner()
+    doc_id = await new_doc(store, o)
+    await prepare(store, o, doc_id, data=MANUAL, embed_model=MODEL_A, now=T0)
+    await store.claim_draft(o, doc_id, 1, now=T0 + timedelta(hours=2))
+    v = await store.get_version(o, doc_id, 1)
+    assert v.created_at < T0 < T0 + timedelta(hours=1) < v.claimed_at     # the shape, asserted
+    assert await interrupt_stale(store, older_than=T0 + timedelta(hours=1)) == 0
+    assert (await store.get_version(o, doc_id, 1)).state == KB_PROCESSING
+    # CONTROL — once THAT clock is old too, it is caught
+    assert await interrupt_stale(store, older_than=T0 + timedelta(hours=3)) == 1
+
+
+async def test_the_interrupt_sweep_never_touches_a_served_or_awaiting_version(store):
+    from cogno_engram.ingest import interrupt_stale
+    o = owner()
+    served = await new_doc(store, o)
+    await ingest(store, o, served, data=b"# Guia\n\nsabado\n", embedder=StubEmbedder(),
+                 embed_model=MODEL_A)
+    waiting = await new_doc(store, o)
+    await prepare(store, o, waiting, data=MANUAL, embed_model=MODEL_A, now=T0)
+    assert await interrupt_stale(store, older_than=T0 + timedelta(days=3650)) == 0
+    assert (await store.get_version(o, served, 1)).state == KB_READY
+    assert (await store.get_version(o, waiting, 1)).state == KB_AWAITING_CONFIRMATION
+    assert await store.tombstones(o) == []
+
+
+def test_interrupted_and_discarded_are_reasons_not_internal():
+    from cogno_engram.documents import sanitize_reason
+    assert sanitize_reason("interrupted") == "interrupted"
+    assert sanitize_reason("discarded") == "discarded"
+    assert {"interrupted", "discarded"} <= VALID_TOMBSTONE_KINDS

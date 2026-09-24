@@ -7,17 +7,14 @@ The document store only needs a neutral text fold for its in-memory lexical stan
 two unrelated contracts: a change to how LABELS are folded would silently move how documents
 are MATCHED.
 
-Until ``#64`` lands the in-memory stand-in still uses ``fold_label`` (the consultor's sequencing:
-whichever of the two PRs lands second does the swap). The test is therefore ``xfail(strict=True)``:
-the day the swap is made it XPASSES, ``strict`` turns that into a failure, and whoever made the
-swap has to delete the marker — so the rule cannot be forgotten in either direction.
+It was written as ``xfail(strict=True)`` while the stand-in still borrowed ``fold_label``
+(``#64``, which brought ``textfold``, had not landed); ``#64`` landed first, the swap was made in
+this PR, and the marker came off — the test now has to PASS.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-
-import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 MODULES = ("cogno_engram/documents.py", "cogno_engram/ingest.py", "cogno_engram/chunking.py")
@@ -49,6 +46,16 @@ def test_the_scan_sees_what_it_scans():
     assert graph_half.count(NAME) > 0
 
 
-@pytest.mark.xfail(strict=True, reason="até a textfold chegar (#64)")
 def test_no_document_module_folds_with_the_label_rule():
     assert _offenders() == {}
+
+
+def test_the_stand_in_folds_with_the_general_fold():
+    """The positive half: what the stand-in DOES use. `ø` is where the two folds differ
+    (`fold_label` transliterates it to `o`, the general fold leaves it), so it tells them apart."""
+    from cogno_engram.adapters.in_memory import _doc_terms
+    from cogno_engram.folding import fold_label
+    from cogno_engram.textfold import fold
+
+    assert fold("Søren") != fold_label("Søren")                  # CONTROL: the probe discriminates
+    assert _doc_terms("Søren, SÁBADO!") == {fold("Søren"), "sabado"}

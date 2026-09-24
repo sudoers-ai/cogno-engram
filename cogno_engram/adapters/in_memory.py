@@ -19,6 +19,7 @@ from typing import AsyncIterator, Optional
 from uuid import uuid4
 
 
+from cogno_engram import textfold
 from cogno_engram.folding import fold_label, has_diacritics
 from cogno_engram.documents import (
     COMMIT_DELETED,
@@ -921,7 +922,15 @@ def _doc_cosine(a: list[float], b: list[float]) -> float:
 
 
 def _doc_terms(text: str) -> "set[str]":
-    return set(re.findall(r"\w+", fold_label(text or "")))
+    """The words of ``text`` for the in-memory lexical stand-in: the GENERAL fold
+    (:func:`cogno_engram.textfold.fold`, no keyword step), then ``\w+``, and NO stopwords — a
+    neutral stand-in, like Postgres ``simple`` plus accent folding. Not the graph's LABEL fold
+    (``cogno_engram.folding``): that is an IDENTITY rule, and borrowing it would make a change to
+    how labels are folded silently move how documents are matched — this section may not even
+    name it (``tests/test_documents_use_the_general_fold.py``).
+    Not ``lexical.tokens`` either: that one drops stopwords and cuts prefixes, because it is the
+    relevance engine's ruler, and this is the store's candidate test."""
+    return set(re.findall(r"\w+", textfold.fold(text)))
 
 
 def _doc_lexical(query_terms: "set[str]", content: str) -> float:
@@ -943,8 +952,8 @@ def _doc_lexical(query_terms: "set[str]", content: str) -> float:
       OCCURRENCES and weighs their PROXIMITY (a word said three times outranks a word said once;
       two words side by side outrank the same two far apart), while this counts distinct words
       and nothing else. And the Postgres configuration may stem and fold accents (``portuguese``,
-      ``unaccent``), which this does not model beyond its own fold. A test that needs the real
-      lexical VALUE belongs on the Postgres leg."""
+      ``unaccent``), which this does not model beyond its accent fold. A test that needs the
+      real lexical VALUE belongs on the Postgres leg."""
     if not query_terms:
         return 0.0
     return len(query_terms & _doc_terms(content)) / len(query_terms)

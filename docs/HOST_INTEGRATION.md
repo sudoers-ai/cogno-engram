@@ -240,6 +240,39 @@ await store.set_feedback(scope, session_id, turn_n, -1)         # host: emoji �
 # KG edges; store.adjust_feedback_score() boosts/penalises hybrid ranking.
 ```
 
+## Relevance over what you retrieved — `cogno_engram.lexical`
+
+Recall and graph walks fetch by PROXIMITY, so they always return something. When the host has to
+say whether any of it is ABOUT the question — and say *nothing relevant* when none is — it
+composes its own reads with the engine; engram never decides who may read what:
+
+```python
+from cogno_engram import lexical
+
+asked = lexical.variants(canonical_query, contact_text)       # rewrite + the contact's own words
+pool = lexical.graph_candidates(walks, limit=lexical.MAX_CANDIDATES + 1,
+                                baseline_nodes=2)             # host: nodes its OLD path walks
+pool += lexical.memory_candidates(records, limit=lexical.MAX_CANDIDATES + 1 - len(pool))
+pool += my_own_candidates                                     # host: its documents, one per section
+decision, picked = lexical.decide(lexical.rank(pool[:lexical.MAX_CANDIDATES], asked),
+                                  failed=sources_that_raised, floor=my_floor)
+```
+
+The host owns: the reads (each with the reader's audience and scope), the SIZE of what it turns
+into candidates (the count bound cannot see bytes), any wall-clock ceiling (ranking is CPU on the
+host's event loop), and the floor's CALIBRATION — `RELEVANCE_FLOOR` is a default measured by one
+host over its labelled set; a host with its own set pins the constant to what its set picks, so
+an engram bump that moves the optimum is red on the host, at the bump. `tokens`/`STOPWORDS` are
+the ONE tokenizer: hand the same object to every ranking and every floor over it.
+
+## Folding text for a lexicon — `cogno_engram.textfold`
+
+`textfold.fold` is the accent/case fold for every lexicon a host matches against (NFKD → marks →
+`casefold`, the extra steps as keywords). A host that already had one should RE-EXPORT this one
+(`from cogno_engram.textfold import fold`) and pin identity with `is`, rather than keep a copy in
+step. It is not a key fold: node identity is `folding.fold_label`, which must agree with Postgres
+`unaccent` and deliberately differs.
+
 ## Swapping adapters
 
 The ports are infrastructure-agnostic. Dev uses the zero-dependency in-memory

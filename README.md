@@ -104,6 +104,14 @@ rules live in one module, `cogno_engram.documents`:
   swap); the previous version answers until the new one is ready and keeps answering if it
   fails. It returns the embedder's own usage (`embedding_tokens`, `embedding_calls`) and takes
   a `gate` (refuse before embedding: zero calls) and a `pace` (tokens per minute).
+- **Or in two steps, when the cost must be confirmed first.** `prepare()` extracts, chunks and
+  ESTIMATES, and parks the version in `awaiting_confirmation` — no embedder, no gate, nothing
+  spent; a bad file fails HERE. `estimated_tokens` and `expires_at` (prepare's clock + 24 h) are
+  persisted on the version. `commit()` claims the draft atomically (two confirmations embed it
+  once), hands the gate that same estimate, embeds and swaps; a second commit is `unchanged`.
+  `expire_drafts(now=…)` — the sweep a host runs on its tick — turns every unconfirmed draft
+  past its expiry into `error`/`expired`, removes its draft and its stored original, and leaves a
+  tombstone. `ingest()` is `prepare()` + `commit()` back to back.
 - **Delete is immediate and leaves a tombstone.** The originals of every version go with it
   (they live in their own table, which no search joins); a job finishing after the delete
   writes nothing.
@@ -124,9 +132,10 @@ hits = await docs.search("acme/secretary", profile="GUEST", text="saturday hours
                          vector=await embedder.embed("saturday hours"), embed_model=model)
 ```
 
-The Postgres adapter (`PostgresDocumentStore`) adds five tables through `ensure_schema`
-(`kb_documents`, `kb_versions`, `kb_chunks`, `kb_originals`, `kb_tombstones`) — additive, no
-ALTER of anything that existed.
+The Postgres adapter (`PostgresDocumentStore`) adds six tables through `ensure_schema`
+(`kb_documents`, `kb_versions`, `kb_chunks`, `kb_drafts`, `kb_originals`, `kb_tombstones`) —
+additive; the two-step columns on `kb_versions` (`estimated_tokens`, `expires_at`) are added to
+an existing table by the same catalogue-checked `ADD COLUMN` the edge columns use.
 
 **Accents.** `ensure_schema(conn, ts_config="portuguese", unaccent=True)` builds the document
 text search over a derived configuration, `cogno_portuguese_unaccent` (a copy of the base whose

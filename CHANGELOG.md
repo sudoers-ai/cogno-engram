@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased — a ingestão em DOIS passos: preparar (e mostrar o custo) antes de confirmar (F2.4, 2026-09-24)
+
+### Added
+
+- **`cogno_engram.ingest.prepare()`** — extrai, parte em trechos e ESTIMA os tokens sobre os
+  trechos EXACTOS que o commit vai embeber, e estaciona a versão em **`awaiting_confirmation`**
+  com os trechos SEM vector (tabela nova `kb_drafts`). Não recebe embedder nem `gate` (nem os
+  pode receber: o teste lê a assinatura), portanto não gasta nada — um erro do ficheiro sai
+  AQUI, antes de se pedir confirmação. `estimated_tokens` e `expires_at` (o `now` injectado + 24 h,
+  `documents.DRAFT_TTL`) ficam PERSISTIDOS na versão (`KbVersion`), para o GET do host.
+- **`commit()`** — reclama o rascunho atomicamente (`awaiting_confirmation` → `processing`, o
+  rascunho sai), passa ao `gate` a MESMA estimativa, embebe com o `pace`, troca. Devolve o uso
+  como sempre. Resultados novos: `not_prepared`, `expired`; um segundo commit é `unchanged` com
+  zero chamadas; três confirmações em simultâneo embebem o rascunho uma vez.
+- **`expire_drafts(store, now=…) -> int`** — o varrimento do tick: cada rascunho com
+  `expires_at <= now` passa a `error`/`expired`, perde o rascunho e o bytea do original, e deixa
+  lápide `expired`. A versão fica (o dono vê porquê); uma versão servida ao lado continua servida.
+- **Store:** `get_version`, `save_draft`, `claim_draft`, `pending_drafts`, `expire_drafts`;
+  estado `awaiting_confirmation`, motivo `expired`, lápide `expired` nos alfabetos fechados; e
+  nenhum adaptador escreve um estado à mão (teste). `kb_versions` ganha `estimated_tokens` e
+  `expires_at` por `ADD COLUMN` verificado no catálogo, e um índice PARCIAL sobre os rascunhos.
+- **`ingest()`** mantém a assinatura e é `prepare()` + `commit()` seguidos — um teste compara os
+  dois caminhos campo a campo.
+- Mutações: 13 sobre os dois passos; 11 morrem sozinhas. As duas guardas de «commit sem
+  prepare» (o estado na `commit` e o rascunho no `claim`) são REDUNDANTES por desenho — cada uma
+  sozinha basta, medido — e tiradas as DUAS o teste falha pela asserção (`ready` em vez de
+  `not_prepared`).
+
 ## Unreleased — documentos: um quarto port, versionado, pesquisado a pedido (F2.4, 2026-09-24)
 
 ### Added

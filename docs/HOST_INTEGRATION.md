@@ -189,7 +189,7 @@ contacts. The split with the host, piece by piece:
 ```python
 from cogno_engram import documents_probe, embed_model_label
 from cogno_engram.adapters.postgres import PostgresDocumentStore
-from cogno_engram.ingest import TokensPerMinute, ingest
+from cogno_engram.ingest import TokensPerMinute, commit, expire_drafts, ingest, prepare
 
 docs = PostgresDocumentStore(dsn=DSN, ts_config="portuguese", unaccent=True)
 # ...built by ensure_schema(conn, ts_config="portuguese", unaccent=True) — the SAME two values
@@ -205,6 +205,17 @@ out = await ingest(docs, owner, doc.id, data=pdf_bytes, embedder=embedder, embed
                    gate=lambda n: budget.allows(tenant_id, n),   # refuse → zero embed calls
                    pace=TokensPerMinute(20_000))            # yield to live conversations
 ledger.record(tenant_id, stage="kb_ingest", tokens=out.embedding_tokens)  # host's business
+
+# …or in TWO steps, when the uploader must confirm the cost first
+draft = await prepare(docs, owner, doc.id, data=pdf_bytes, embed_model=model,
+                      extractor=pdf_extractor)              # no embedder, no gate: spends nothing
+# draft.status == "awaiting_confirmation"; show draft.estimated_tokens, until draft.expires_at
+done = await commit(docs, owner, doc.id, draft.version, embedder=embedder, embed_model=model,
+                    gate=lambda n: budget.allows(tenant_id, n),   # n == draft.estimated_tokens
+                    pace=TokensPerMinute(20_000))
+ledger.record(tenant_id, stage="kb_ingest", tokens=done.embedding_tokens)
+# on the host's tick: every unconfirmed draft past expires_at → error/expired + tombstone
+await expire_drafts(docs, now=clock())
 
 # a turn (the reader path): profile is REQUIRED, and it is the reader's, not the model's
 res = await docs.search(owner, profile=identity_role, text=original_text,
@@ -229,6 +240,13 @@ res = await docs.search(owner, profile=identity_role, text=original_text,
   additive). A host whose migration delegates to it gets them with no new step; a pin bump
   that includes this change needs that migration run on the live database before the first
   upload, like any schema change.
+- **Two steps.** `prepare` records everything the FILE can get wrong before anything is spent;
+  `commit` is the only step that calls the embedder. `commit` outcomes a host must handle:
+  `ready`, `unchanged` (a repeat — bill nothing: `embedding_tokens` is 0), `not_prepared`,
+  `expired` (past `expires_at` and not yet swept — nothing changed), `error`, `deleted`,
+  `superseded`. The expiry is the ENGRAM's rule: call `expire_drafts(docs, now=clock())` on the
+  tick and read `KbVersion.state`/`reason`; do not re-implement the 24 h in the host.
+  `pending_drafts(owner)` lists what waits for confirmation (no text).
 - **Purge.** A tenant purge calls `purge_owner_subtree(tenant_prefix)`: every document under
   the prefix goes, with the chunks and the stored originals of every version, and one
   tombstone per document (ids, versions, when, who — no title, no text). `prune_tombstones`

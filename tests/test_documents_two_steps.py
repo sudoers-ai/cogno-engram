@@ -348,3 +348,58 @@ def test_the_adapters_never_spell_a_state_by_hand():
         text = (root / name).read_text(encoding="utf-8")
         for state in VALID_KB_STATES:
             assert f"'{state}'" not in text and f'"{state}"' not in text, (name, state)
+
+
+# ── each guard of "no commit without a prepare", proved ALONE ───────────────────────────
+#
+# Two guards stand between a commit and a version nobody prepared, and each has its OWN
+# question: the CLAIM asks "is there a draft?" (and nothing about the version's state), the
+# COMMIT asks "is the version awaiting confirmation?". A guard no test proves alone can be
+# removed without anyone noticing, so each test below builds the one shape where only ITS
+# guard stands in the way.
+
+async def _remove_draft_keep_state(store, doc_id: str, version: int) -> None:
+    """A version still `awaiting_confirmation` whose draft is gone — the shape where only the
+    claim's "is there a draft?" can refuse."""
+    if hasattr(store, "_drafts"):
+        store._drafts.pop((doc_id, version))
+        return
+    import psycopg
+    async with await psycopg.AsyncConnection.connect(DSN, autocommit=True) as conn:
+        await conn.execute("DELETE FROM kb_drafts WHERE document_id = %s AND version = %s",
+                           (doc_id, version))
+
+
+async def test_the_claim_refuses_a_version_whose_draft_is_gone(store):
+    o = owner()
+    doc_id = await new_doc(store, o)
+    await prepare(store, o, doc_id, data=MANUAL, embed_model=MODEL_A, now=T0)
+    await _remove_draft_keep_state(store, doc_id, 1)
+    assert (await store.get_version(o, doc_id, 1)).state == KB_AWAITING_CONFIRMATION
+    assert await store.claim_draft(o, doc_id, 1, now=T0) == ("missing", None)
+    assert (await store.get_version(o, doc_id, 1)).state == KB_AWAITING_CONFIRMATION
+    # CONTROL — with its draft, the same version IS claimed
+    other = await new_doc(store, o)
+    await prepare(store, o, other, data=MANUAL, embed_model=MODEL_A, now=T0)
+    status, draft = await store.claim_draft(o, other, 1, now=T0)
+    assert status == "claimed" and draft is not None and draft.chunk_count > 0
+
+
+async def test_a_commit_refuses_a_version_out_of_awaiting_even_with_a_draft_present():
+    """Built in the double: a draft that is THERE, beside a version that is no longer awaiting
+    — the shape where only the commit's state check can refuse."""
+    from cogno_engram.adapters.in_memory import InMemoryDocumentStore
+    from documents_support import EMB_DIM
+    store = InMemoryDocumentStore(embedding_dim=EMB_DIM)
+    o = owner()
+    doc_id = await new_doc(store, o)
+    await prepare(store, o, doc_id, data=MANUAL, embed_model=MODEL_A, now=T0)
+    store._versions[(doc_id, 1)].state = KB_PROCESSING          # a draft is still stored
+    assert (doc_id, 1) in store._drafts
+    embedder = StubEmbedder()
+    out = await commit(store, o, doc_id, 1, embedder=embedder, embed_model=MODEL_A, now=T0)
+    assert out.status == INGEST_NOT_PREPARED and embedder.calls == 0
+    # CONTROL — back in `awaiting_confirmation`, the same draft IS committed
+    store._versions[(doc_id, 1)].state = KB_AWAITING_CONFIRMATION
+    ok = await commit(store, o, doc_id, 1, embedder=embedder, embed_model=MODEL_A, now=T0)
+    assert ok.status == INGEST_READY and embedder.calls == ok.chunks > 0

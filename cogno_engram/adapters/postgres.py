@@ -2616,13 +2616,15 @@ class PostgresDocumentStore(_PgBase):
                 if await self._lock_document(conn, owner_key, doc) is None:
                     return CLAIM_MISSING, None
                 cur = await conn.execute(
-                    "SELECT v.state, v.embed_model, v.pages, v.estimated_tokens, v.expires_at, "
+                    "SELECT v.embed_model, v.pages, v.estimated_tokens, v.expires_at, "
                     "k.chunks, k.created_at FROM kb_versions v JOIN kb_drafts k "
                     "  ON k.document_id = v.document_id AND k.version = v.version "
                     "WHERE v.document_id = %s AND v.version = %s FOR UPDATE OF v",
                     (doc, int(version)))
                 row = await cur.fetchone()
-                if row is None or row["state"] != KB_AWAITING_CONFIRMATION:
+                # The claim's ONE question is "is there a draft?" (the JOIN); whether the version
+                # is awaiting confirmation is the commit's — each proved by its own test.
+                if row is None:
                     return CLAIM_MISSING, None
                 if row["expires_at"] is not None and row["expires_at"] <= now:
                     return CLAIM_EXPIRED, None

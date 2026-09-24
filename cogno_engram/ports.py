@@ -361,7 +361,8 @@ class DocumentStore(Protocol):
     # TAKE the draft for its commit, atomically: ``(CLAIM_OK, draft)`` flips the version to
     # ``processing`` and removes the draft, so two confirmations cannot both embed it. A draft
     # past ``expires_at`` on the caller's ``now`` is NOT claimed (``CLAIM_EXPIRED``); no draft
-    # at all is ``CLAIM_MISSING``.
+    # at all is ``CLAIM_MISSING``. The claim asks ONLY whether a draft exists — whether the
+    # version is still awaiting confirmation is ``ingest.commit``'s question, asked before.
     async def claim_draft(self, owner_key: str, document_id: str, version: int, *,
                           now: datetime) -> "tuple[str, Optional[KbDraft]]": ...
     # The drafts waiting for this owner's confirmation — for the UI's "confirm ~N tokens".

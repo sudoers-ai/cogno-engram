@@ -1205,11 +1205,13 @@ class InMemoryDocumentStore:
         row = self._owned(owner_key, document_id)
         v = self._versions.get((row.id, int(version))) if row is not None else None
         d = self._drafts.get((v.document_id, v.version)) if v is not None else None
-        if v is None or d is None or v.state != KB_AWAITING_CONFIRMATION:
+        # The claim's ONE question is "is there a draft?"; whether the version is awaiting
+        # confirmation is the commit's (`ingest.commit`), and each is proved by its own test.
+        if v is None or d is None:
             return CLAIM_MISSING, None
         if v.expires_at is not None and v.expires_at <= now:
             return CLAIM_EXPIRED, None
-        del self._drafts[(v.document_id, v.version)]
+        self._drafts.pop((v.document_id, v.version), None)
         v.state = KB_PROCESSING
         return CLAIM_OK, self._draft(v, d, with_chunks=True)
 

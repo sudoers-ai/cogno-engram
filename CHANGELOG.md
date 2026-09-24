@@ -23,10 +23,14 @@
   `expires_at` por `ADD COLUMN` verificado no catálogo, e um índice PARCIAL sobre os rascunhos.
 - **`ingest()`** mantém a assinatura e é `prepare()` + `commit()` seguidos — um teste compara os
   dois caminhos campo a campo.
-- Mutações: 13 sobre os dois passos; 11 morrem sozinhas. As duas guardas de «commit sem
-  prepare» (o estado na `commit` e o rascunho no `claim`) são REDUNDANTES por desenho — cada uma
-  sozinha basta, medido — e tiradas as DUAS o teste falha pela asserção (`ready` em vez de
-  `not_prepared`).
+- **As duas guardas de «commit sem prepare», cada uma com a SUA pergunta e o SEU teste.** O
+  `claim_draft` pergunta só «há rascunho?» (nos dois adaptadores:
+  `test_the_claim_refuses_a_version_whose_draft_is_gone`, versão ainda à espera mas sem
+  rascunho); o `commit` pergunta «a versão está à espera de confirmação?»
+  (`test_a_commit_refuses_a_version_out_of_awaiting_even_with_a_draft_present`, montado no
+  duplo: rascunho presente, versão fora de `awaiting_confirmation`). **Vermelho-antes medido:**
+  o `claim` também verificava o estado, e a mutação da guarda do `commit` SOBREVIVIA ao seu
+  teste; separadas as perguntas, cada mutação morre sozinha pela asserção.
 
 ## Unreleased — documentos: um quarto port, versionado, pesquisado a pedido (F2.4, 2026-09-24)
 

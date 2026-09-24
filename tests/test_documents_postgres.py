@@ -196,3 +196,37 @@ async def test_ensure_schema_twice_keeps_every_document(pg):
         await conn.close()
     assert [h.document_id for h in (await pg.search(o, profile="GUEST", text="sábado")).hits] \
         == [doc_id]
+
+
+# ── the lexical score is ts_rank_cd normalised 32, EXACTLY ──────────────────────────────
+
+_OR_QUERY = "replace(plainto_tsquery('portuguese', %s)::text, ''' & ''', ''' | ''')::tsquery"
+
+
+async def test_the_lexical_score_is_ts_rank_cd_with_normalisation_32(pg):
+    """``rank / (rank + 1)`` computed by Postgres itself for the same text and query — pinned
+    to the VALUE, because a clamp downstream would hide an unnormalised rank as a saturated 1.0
+    and the range test alone could not tell."""
+    o = f"acme{uuid4().hex[:6]}/p"
+    long_text = " ".join(["sábado"] * 400 + ["horário"] * 200)
+    await publish(pg, o, profiles=("GUEST",), chunks=((long_text, vec(1.0)),
+                                                     ("sábado curto", vec(1.0))))
+    conn = await _connect()
+    try:
+        for query in ("sábado", "sábado horário"):
+            res = await pg.search(o, profile="GUEST", text=query, limit=10)
+            assert len(res.hits) == 2
+            for hit in res.hits:
+                cur = await conn.execute(
+                    f"SELECT ts_rank_cd(to_tsvector('portuguese', %s), {_OR_QUERY})",
+                    (hit.content, query))
+                raw = (await cur.fetchone())[0]
+                assert hit.lexical_score == pytest.approx(raw / (raw + 1.0), rel=1e-5)
+                assert 0.0 < hit.lexical_score < 1.0
+        # CONTROL — the raw rank of the long chunk really is above 1, so the normalisation bites.
+        cur = await conn.execute(
+            f"SELECT ts_rank_cd(to_tsvector('portuguese', %s), {_OR_QUERY})",
+            (long_text, "sábado"))
+        assert (await cur.fetchone())[0] > 1.0
+    finally:
+        await conn.close()

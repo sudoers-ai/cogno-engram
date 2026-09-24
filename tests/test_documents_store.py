@@ -420,6 +420,23 @@ async def test_scores_are_raw_no_floor_is_applied(docs):
     assert hit.score == pytest.approx(0.6 * hit.vector_score)
 
 
+async def test_the_tie_break_decides_the_cut_whatever_the_physical_order(docs):
+    """Rows written in the OPPOSITE of the tie order — the larger document id first, each one's
+    ordinals backwards — so a store that relied on physical order would cut the wrong rows."""
+    o = owner()
+    x = await docs.create_document(o, title="M", profiles=["GUEST"], media_type=MEDIA_MARKDOWN)
+    y = await docs.create_document(o, title="M", profiles=["GUEST"], media_type=MEDIA_MARKDOWN)
+    small, large = sorted([x.id, y.id])
+    for doc_id in (large, small):
+        v = await docs.begin_version(o, doc_id, sha256="3" * 64, embed_model=MODEL_A, size_bytes=1)
+        await docs.add_chunks(o, doc_id, v.version, [
+            KbChunk(ordinal=i, content="sábado", embedding=vec(1.0)) for i in (2, 1, 0)])
+        assert await docs.commit_version(o, doc_id, v.version, pages=0) == COMMIT_READY
+    for kwargs in ({"vector": vec(1.0), "embed_model": MODEL_A}, {}):
+        cut = await docs.search(o, profile="GUEST", text="sábado", limit=2, **kwargs)
+        assert [(h.document_id, h.ordinal) for h in cut.hits] == [(small, 0), (small, 1)], kwargs
+
+
 async def test_ties_break_by_document_version_ordinal(docs):
     o = owner()
     same = (("sábado", vec(1.0)), ("sábado", vec(1.0)), ("sábado", vec(1.0)))

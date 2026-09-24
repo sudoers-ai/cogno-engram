@@ -49,6 +49,14 @@
   `test_the_reader_path_never_reads_an_original` corre o caminho do leitor com um papel sem
   `SELECT` na coluna dos bytes, e o controlo (`get_original`) é recusado.
 
+- **`test_the_lexical_order_is_the_same_in_both_adapters`** (integração) — a paridade de ORDEM
+  do léxico entre os dois adaptadores, sob `ts_config='simple'`, num corpus DECLARADO no teste
+  (ASCII, cada palavra da pergunta no máximo uma vez por trecho): a mesma ordem de hits e o 0 no
+  mesmo sítio (trecho sem a palavra → 0 nos dois, e ausente numa busca léxica). **Não é o mesmo
+  número** — o teste afirma que os valores DIFEREM, e o docstring de `in_memory._doc_lexical`
+  diz por extenso onde os dois concordam e onde não. Vermelho produzido nos dois lados:
+  achatar a ordem no in-memory e invertê-la no Postgres fazem-no falhar.
+
 ### Notes
 
 - **Os backups da base de dados guardam um original até à retenção deles** — a purga não os

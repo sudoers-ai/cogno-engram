@@ -25,8 +25,10 @@ def vec(*head: float) -> list[float]:
     return (list(head) + [0.0] * EMB_DIM)[:EMB_DIM]
 
 
-async def fresh_postgres(dsn: str, **kwargs):
-    """A ``PostgresDocumentStore`` over freshly created ``kb_*`` tables, or a SKIP."""
+async def fresh_postgres(dsn: str, *, ts_config: str = "portuguese", **kwargs):
+    """A ``PostgresDocumentStore`` over freshly created ``kb_*`` tables, or a SKIP. The tables and
+    the store are built with the SAME ``ts_config`` — a store querying with one configuration
+    over a ``tsv`` generated with another matches nothing and says nothing."""
     psycopg = pytest.importorskip("psycopg")
     if not dsn:
         pytest.skip("no test Postgres answers — the in-memory leg ran")
@@ -37,9 +39,9 @@ async def fresh_postgres(dsn: str, **kwargs):
         pytest.skip(f"test Postgres unreachable: {type(exc).__name__}")
     for table in KB_TABLES:
         await conn.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
-    await ensure_schema(conn, embedding_dim=EMB_DIM)
+    await ensure_schema(conn, embedding_dim=EMB_DIM, ts_config=ts_config)
     await conn.close()
-    return PostgresDocumentStore(dsn=dsn, embedding_dim=EMB_DIM, **kwargs)
+    return PostgresDocumentStore(dsn=dsn, embedding_dim=EMB_DIM, ts_config=ts_config, **kwargs)
 
 
 def store_factory(kind: str, dsn: str):

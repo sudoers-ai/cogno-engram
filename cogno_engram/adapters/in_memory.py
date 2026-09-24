@@ -925,8 +925,26 @@ def _doc_terms(text: str) -> "set[str]":
 
 
 def _doc_lexical(query_terms: "set[str]", content: str) -> float:
-    """Share of the query's words the chunk carries — the in-memory stand-in for ``ts_rank_cd``.
-    ANY shared word makes a candidate (the Postgres side ORs the query's lexemes too)."""
+    """Share of the query's DISTINCT words the chunk carries — a DECLARED stand-in for the
+    Postgres side's ``ts_rank_cd(tsv, query, 32)``, and NOT the same number.
+
+    What the two agree on, and what they do not, said in full because a double is only useful
+    when its limits are written down:
+
+    * **the same candidates**: ANY shared word makes a chunk a lexical candidate here, and the
+      Postgres side ORs the query's lexemes, so a chunk that carries no query word scores 0 on
+      both sides — and, on a lexical search, is absent from both;
+    * **the same range**: both are in ``[0, 1]``;
+    * **the same ORDER on a corpus where each query word occurs at most once per chunk**, under a
+      configuration that only lowercases (Postgres ``simple``, no stemming, no unaccent):
+      ``tests/test_documents_postgres.py::test_the_lexical_order_is_the_same_in_both_adapters``
+      pins it, and the ``0`` in the same place;
+    * **NOT the same value, and not the same order in general**: ``ts_rank_cd`` counts
+      OCCURRENCES and weighs their PROXIMITY (a word said three times outranks a word said once;
+      two words side by side outrank the same two far apart), while this counts distinct words
+      and nothing else. And the Postgres configuration may stem and fold accents (``portuguese``,
+      ``unaccent``), which this does not model beyond its own fold. A test that needs the real
+      lexical VALUE belongs on the Postgres leg."""
     if not query_terms:
         return 0.0
     return len(query_terms & _doc_terms(content)) / len(query_terms)

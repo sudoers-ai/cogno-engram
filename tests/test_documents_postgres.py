@@ -230,3 +230,54 @@ async def test_the_lexical_score_is_ts_rank_cd_with_normalisation_32(pg):
         assert (await cur.fetchone())[0] > 1.0
     finally:
         await conn.close()
+
+
+# ── the in-memory lexical stand-in: same ORDER, same zeros — never the same number ───────
+
+#: A DECLARED corpus: ASCII words only, each query word at most once per chunk. Under the
+#: `simple` configuration (lowercase only: no stemming, no unaccent) that is where the two
+#: measures agree in ORDER — `ts_rank_cd` counts occurrences and weighs proximity, the in-memory
+#: stand-in counts distinct words (see `in_memory._doc_lexical`). Chunk `n` carries `n` of the
+#: three query words, except the two that carry none.
+_ORDER_QUERY = "alfa beta gama"
+_ORDER_CORPUS = (
+    "delta epsilon zeta",              # 0 of 3
+    "alfa eta teta",                   # 1 of 3
+    "iota beta kapa gama",             # 2 of 3
+    "gama lambda alfa beta",           # 3 of 3
+    "mi ni xi",                        # 0 of 3
+    "beta omicron",                    # 1 of 3
+)
+
+
+async def _order(store, owner, **kwargs) -> "list[tuple[int, bool]]":
+    res = await store.search(owner, profile="GUEST", text=_ORDER_QUERY, limit=20, **kwargs)
+    return [(h.ordinal, h.lexical_score == 0.0) for h in res.hits]
+
+
+async def test_the_lexical_order_is_the_same_in_both_adapters():
+    """Same ORDER of hits and the 0 in the same place, under `simple`, on the declared corpus.
+    NOT the same number: the values are asserted to DIFFER, so this can never be read as a claim
+    that the double reproduces `ts_rank_cd`."""
+    pg = await fresh_postgres(DSN, ts_config="simple")
+    memory = InMemoryDocumentStore(embedding_dim=EMB_DIM)
+    same = vec(1.0)                          # one vector for all: the vector ties, words decide
+    o = f"acme{uuid4().hex[:6]}/p"
+    for store in (memory, pg):
+        await publish(store, o, profiles=("GUEST",), chunks=tuple((t, same) for t in _ORDER_CORPUS))
+
+    lexical = {name: await _order(store, o) for name, store in (("memory", memory), ("pg", pg))}
+    hybrid = {name: await _order(store, o, vector=same, embed_model=MODEL_A)
+              for name, store in (("memory", memory), ("pg", pg))}
+
+    # lexical search: the chunks with a query word, best first; the zeros absent on BOTH sides
+    assert lexical["memory"] == lexical["pg"] == [(3, False), (2, False), (1, False), (5, False)]
+    # hybrid with tied vectors: every chunk, and the two without a query word score 0 on BOTH
+    assert hybrid["memory"] == hybrid["pg"] == [(3, False), (2, False), (1, False), (5, False),
+                                                (0, True), (4, True)]
+    # …and NOT the same number
+    mem_values = [h.lexical_score for h in (await memory.search(
+        o, profile="GUEST", text=_ORDER_QUERY, limit=20)).hits]
+    pg_values = [h.lexical_score for h in (await pg.search(
+        o, profile="GUEST", text=_ORDER_QUERY, limit=20)).hits]
+    assert mem_values != pytest.approx(pg_values)

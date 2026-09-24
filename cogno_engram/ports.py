@@ -332,8 +332,10 @@ class DocumentStore(Protocol):
     async def begin_version(self, owner_key: str, document_id: str, *, sha256: str,
                             embed_model: str, size_bytes: int,
                             original: Optional[bytes] = None) -> Optional[KbVersion]: ...
-    # Upserts by ordinal (a retried job does not duplicate). ``False`` when the version is no
-    # longer ``processing`` under this owner — deleted, superseded, or already finished.
+    # Upserts by ordinal (a retried job does not duplicate). Every chunk MUST carry its
+    # embedding (``ValueError`` otherwise): a ready version with an unembedded chunk would break
+    # the all-or-none rule of ``search``. ``False`` when the version is no longer
+    # ``processing`` under this owner — deleted, superseded, or already finished.
     async def add_chunks(self, owner_key: str, document_id: str, version: int,
                          chunks: Sequence[KbChunk]) -> bool: ...
     # The ATOMIC SWAP: in one transaction the version becomes ``ready`` and served, and every
@@ -364,10 +366,10 @@ class DocumentStore(Protocol):
     # searches them is offered at all, and whose titles describe it.
     async def readable_documents(self, owner_key: str, *, profile: str) -> list[KbDocument]: ...
     # Hybrid search over the SERVED version of every ready document ``profile`` may read.
-    # ``vector`` is compared ONLY with chunks whose recorded model equals ``embed_model``; every
-    # other readable chunk is scored lexically and reported in ``models_unavailable`` with the
-    # ``kb_embed_space_unavailable`` degradation. RAW scores, no floor; ties by
-    # ``(document, version, ordinal)``. Never reads a stored original.
+    # ``vector`` is compared ONLY with chunks whose recorded model equals ``embed_model``, and
+    # only when EVERY readable chunk has that model; otherwise the whole search is lexical,
+    # with ``models_unavailable`` and the ``kb_embed_space_unavailable`` degradation. RAW scores
+    # in [0, 1], no floor; ties by ``(document, version, ordinal)``. Never reads an original.
     async def search(self, owner_key: str, *, profile: str, text: str,
                      vector: Optional[list[float]] = None, embed_model: Optional[str] = None,
                      limit: int = 5,

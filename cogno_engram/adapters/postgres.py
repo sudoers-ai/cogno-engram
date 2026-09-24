@@ -4,8 +4,8 @@ cogno_engram.adapters.postgres — the reference Postgres + pgvector adapter.
 Ported clean-room from the parent's ``memory/postgres_store.py`` +
 ``core/db_knowledge.py``, with the business identity (``tenant_id``/
 ``identity_id``) collapsed into a single opaque ``scope`` column. Implements
-``MemoryStore`` (+ ``SupportsVectorSearch``) and ``KnowledgeGraph`` over one
-Postgres database:
+``MemoryStore`` (+ ``SupportsVectorSearch``), ``KnowledgeGraph`` and ``DocumentStore``
+(``PostgresDocumentStore``, the ``kb_*`` tables) over one Postgres database:
 
   * hybrid memory retrieval — ``0.60·vector + 0.40·BM25 + 0.05·feedback``
     (pgvector ``<=>`` + ``ts_rank_cd`` over a generated ``tsvector``);
@@ -27,12 +27,42 @@ import re
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, AsyncIterator, Optional
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import psycopg
 from psycopg.rows import dict_row
 
 from cogno_engram import write_loss
+from cogno_engram.documents import (
+    COMMIT_DELETED,
+    COMMIT_READY,
+    COMMIT_SUPERSEDED,
+    DEFAULT_MAX_BYTES,
+    KB_EMBED_SPACE_UNAVAILABLE,
+    KB_ERROR,
+    KB_PROCESSING,
+    KB_READY,
+    TOMBSTONE_DELETED,
+    TOMBSTONE_PURGED,
+    VALID_MEDIA_TYPES,
+    DocumentLimitReached,
+    KbDocument,
+    KbHit,
+    KbSearchResult,
+    KbTombstone,
+    KbVersion,
+    OriginalTooLarge,
+    chunk_id,
+    clamp_unit,
+    hit_order_key,
+    hybrid_score,
+    require_model,
+    require_owner,
+    require_profile,
+    require_vector,
+    sanitize_profiles,
+    sanitize_reason,
+)
 from cogno_engram.trace_policy import TRACE_REVISION_WINDOW_S
 from cogno_engram.folding import FOLD_FUNCTION_SQL, fold_label
 from cogno_engram.types import (
@@ -525,6 +555,116 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
             if "uq_nodes_scope_fold_type" not in stmt:
                 raise
             raise _label_collision_error(await _colliding_labels(conn), cause) from cause
+
+    await ensure_documents_schema(conn, embedding_dim=embedding_dim, ts_config=ts_config)
+
+
+# ── documents (see cogno_engram.documents) ────────────────────────────────────────────
+#
+# Five tables, created by `ensure_schema` (so a host whose migration delegates to it — e.g.
+# `python -m cogno_host.migrate` — gets them with no new step) and ADDITIVE: nothing here
+# alters a table that existed before. Why five and not the two a first sketch named:
+#
+#   kb_documents   one row per document: owner, title, who may read, which version is SERVED
+#   kb_versions    one row per indexing ATTEMPT — the swap needs two states at once (the one
+#                  being served and the one being built), so a version cannot be a column
+#   kb_chunks      what a search reads; each row carries the model label it was embedded with
+#   kb_originals   the uploaded bytes, in a table of their OWN so no search can reach them —
+#                  the reader path never joins it, and a `SELECT *` over a version cannot drag
+#                  ten megabytes along
+#   kb_tombstones  what a delete or a purge removed: ids, versions, when, who — no content
+#
+# Every child cascades from its parent, so a delete of a document row removes its versions,
+# chunks and originals in the SAME statement, and a late writer's insert finds no parent.
+#
+# NO vector index on kb_chunks, deliberately: a reader's search is bounded to one owner's
+# served chunks (thousands, not millions) and scans them exactly; an HNSW index with that filter
+# needs iterative scan to be correct and was not asked for by any measurement. Add it when one
+# asks. The lexical half has its GIN index.
+async def ensure_documents_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
+                                  ts_config: str = DEFAULT_TS_CONFIG) -> None:
+    """Create the document tables idempotently (``CREATE ... IF NOT EXISTS``, never an ALTER)."""
+    ts_config = _validate_ts_config(ts_config)
+    dim = int(embedding_dim)
+    await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+    for ddl in (
+        """
+        CREATE TABLE IF NOT EXISTS kb_documents (
+            id             uuid PRIMARY KEY,
+            owner_key      text NOT NULL,
+            title          text NOT NULL,
+            profiles       text[] NOT NULL DEFAULT '{}',
+            media_type     text NOT NULL,
+            active_version integer,
+            created_at     timestamptz NOT NULL DEFAULT now(),
+            updated_at     timestamptz NOT NULL DEFAULT now()
+        )
+        """,
+        f"""
+        CREATE TABLE IF NOT EXISTS kb_versions (
+            document_id  uuid NOT NULL REFERENCES kb_documents(id) ON DELETE CASCADE,
+            version      integer NOT NULL,
+            state        text NOT NULL DEFAULT '{KB_PROCESSING}',
+            reason       text NOT NULL DEFAULT '',
+            sha256       text NOT NULL,
+            embed_model  text NOT NULL,
+            size_bytes   bigint NOT NULL DEFAULT 0,
+            pages        integer NOT NULL DEFAULT 0,
+            chunks       integer NOT NULL DEFAULT 0,
+            created_at   timestamptz NOT NULL DEFAULT now(),
+            finished_at  timestamptz,
+            PRIMARY KEY (document_id, version)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS kb_originals (
+            document_id  uuid NOT NULL,
+            version      integer NOT NULL,
+            data         bytea NOT NULL,
+            PRIMARY KEY (document_id, version),
+            FOREIGN KEY (document_id, version)
+                REFERENCES kb_versions(document_id, version) ON DELETE CASCADE
+        )
+        """,
+        f"""
+        CREATE TABLE IF NOT EXISTS kb_chunks (
+            document_id  uuid NOT NULL,
+            version      integer NOT NULL,
+            ordinal      integer NOT NULL,
+            heading_path text[] NOT NULL DEFAULT '{{}}',
+            page         integer,
+            content      text NOT NULL,
+            embed_model  text NOT NULL,
+            -- NOT NULL: a served version is always fully comparable under its own model (the
+            -- all-or-none rule of `search`). A chunk without a vector cannot be stored.
+            embedding    vector({dim}) NOT NULL,
+            tsv          tsvector GENERATED ALWAYS AS (to_tsvector('{ts_config}', content)) STORED,
+            PRIMARY KEY (document_id, version, ordinal),
+            FOREIGN KEY (document_id, version)
+                REFERENCES kb_versions(document_id, version) ON DELETE CASCADE
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS kb_tombstones (
+            id           bigserial PRIMARY KEY,
+            owner_key    text NOT NULL,
+            document_id  uuid NOT NULL,
+            versions     integer[] NOT NULL DEFAULT '{}',
+            kind         text NOT NULL,
+            actor        text NOT NULL DEFAULT '',
+            removed_at   timestamptz NOT NULL DEFAULT now()
+        )
+        """,
+        # `text_pattern_ops`: the subtree read (`owner_key = %s OR owner_key LIKE 'p/%'`) is
+        # served by it under any collation, and it serves plain equality too — the same
+        # measurement `idx_turns_scope_pattern` records above.
+        "CREATE INDEX IF NOT EXISTS idx_kb_documents_owner "
+        "ON kb_documents (owner_key text_pattern_ops, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_kb_chunks_tsv ON kb_chunks USING gin (tsv)",
+        "CREATE INDEX IF NOT EXISTS idx_kb_tombstones_owner "
+        "ON kb_tombstones (owner_key text_pattern_ops, removed_at DESC)",
+    ):
+        await conn.execute(ddl)
 
 
 async def _installed_fold_definition(conn) -> "str | None":
@@ -1929,3 +2069,490 @@ class PostgresKnowledgeGraph(_PgBase):
                     f"DELETE FROM {table} WHERE scope = %s", (scope,))
                 total += cur.rowcount
         return total
+
+
+# ── the document store ────────────────────────────────────────────────────────────────
+
+def _doc_uuid(document_id: object) -> Optional[str]:
+    """``document_id`` as a canonical uuid string, or ``None`` when it is not one — an id that
+    cannot exist answers "no such document", as it does in memory, instead of a driver error."""
+    try:
+        return str(UUID(str(document_id)))
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+_DOC_COLS = ("d.id, d.owner_key, d.title, d.profiles, d.media_type, d.active_version, "
+             "d.created_at, d.updated_at")
+# The version columns every record is built from. `has_original` is asked of the originals'
+# PRIMARY KEY only — the bytes themselves are read by `get_original` and nowhere else.
+_VERSION_SELECT = (
+    "SELECT v.document_id, v.version, v.state, v.reason, v.sha256, v.embed_model, "
+    "v.size_bytes, v.pages, v.chunks, v.created_at, v.finished_at, "
+    "(o.document_id IS NOT NULL) AS has_original "
+    "FROM kb_versions v LEFT JOIN kb_originals o "
+    "  ON o.document_id = v.document_id AND o.version = v.version ")
+# THE filter of the reader path — one string, so the three reads that serve a reader
+# (`readable_documents`, the search itself, and the models the search reports) cannot drift:
+# this owner, this profile among the published ones, the SERVED version, in state ready.
+_SERVED = (f"JOIN kb_versions v ON v.document_id = d.id AND v.version = d.active_version "
+           f"AND v.state = '{KB_READY}' "
+           "WHERE d.owner_key = %s AND %s = ANY(d.profiles)")
+_OWNER_SUBTREE = "(d.owner_key = %s OR d.owner_key LIKE %s ESCAPE '\\')"
+
+
+def _version_from_row(r: Any) -> KbVersion:
+    return KbVersion(document_id=str(r["document_id"]), version=int(r["version"]),
+                     state=r["state"], sha256=r["sha256"], embed_model=r["embed_model"],
+                     reason=r["reason"] or "", size_bytes=int(r["size_bytes"] or 0),
+                     pages=int(r["pages"] or 0), chunks=int(r["chunks"] or 0),
+                     has_original=bool(r["has_original"]), created_at=r["created_at"],
+                     finished_at=r["finished_at"])
+
+
+class PostgresDocumentStore(_PgBase):
+    """Reference ``DocumentStore`` over the ``kb_*`` tables (``ensure_documents_schema``).
+
+    Every write that must be whole — a version's number, the swap, a delete with its tombstone —
+    runs in ONE transaction that first locks the document row (``FOR UPDATE``), so a concurrent
+    delete either happens before (the write finds nothing and says so) or after (the delete
+    cascades what the write made). No interleaving leaves a chunk without its document.
+    """
+
+    def __init__(self, *, dsn: Optional[str] = None, pool=None,
+                 ts_config: str = DEFAULT_TS_CONFIG,
+                 embedding_dim: int = DEFAULT_EMBEDDING_DIM,
+                 max_original_bytes: int = DEFAULT_MAX_BYTES) -> None:
+        super().__init__(dsn=dsn, pool=pool, ts_config=ts_config)
+        self.embedding_dim = int(embedding_dim)
+        self.max_original_bytes = int(max_original_bytes)
+
+    # ── rows → records ───────────────────────────────────────────────────
+    async def _records(self, conn, rows: "list[Any]") -> "list[KbDocument]":
+        # The version query runs EVEN WITH NO ROWS, on purpose: it is one indexed lookup of an
+        # empty array, and skipping it made every version column invisible to the health probe
+        # (which reads an owner that holds nothing). Measured by
+        # `test_the_probe_passes_on_a_fresh_schema_and_fails_without_any_column`: with the early
+        # return, dropping seven `kb_versions` columns left the probe green.
+        cur = await conn.execute(
+            _VERSION_SELECT + "WHERE v.document_id = ANY(%s::uuid[]) ORDER BY v.version",
+            ([str(r["id"]) for r in rows],))
+        versions: dict[str, list[KbVersion]] = {}
+        for r in await cur.fetchall():
+            versions.setdefault(str(r["document_id"]), []).append(_version_from_row(r))
+        out = []
+        for r in rows:
+            vs = versions.get(str(r["id"]), [])
+            active = next((v for v in vs if v.version == r["active_version"]), None)
+            out.append(KbDocument(owner_key=r["owner_key"], id=str(r["id"]), title=r["title"],
+                                  profiles=tuple(r["profiles"] or ()), media_type=r["media_type"],
+                                  active=active, latest=vs[-1] if vs else None,
+                                  created_at=r["created_at"], updated_at=r["updated_at"]))
+        return out
+
+    @staticmethod
+    def _subtree_like(prefix: str) -> str:
+        esc = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        return esc + "/%"
+
+    # ── management ───────────────────────────────────────────────────────
+    async def create_document(self, owner_key: str, *, title: str, profiles, media_type: str,
+                              max_documents: Optional[int] = None) -> KbDocument:
+        require_owner(owner_key)
+        if media_type not in VALID_MEDIA_TYPES:
+            raise ValueError(f"unsupported media type {media_type!r}")
+        doc_id = str(uuid4())
+        async with self._conn() as conn:
+            async with conn.transaction():
+                if max_documents is not None:
+                    # Serialise creations PER OWNER, then count: a count taken outside the lock
+                    # lets two concurrent uploads both see room for one.
+                    digest = hashlib.sha256(f"kb_documents:{owner_key}".encode()).digest()
+                    await conn.execute("SELECT pg_advisory_xact_lock(%s)",
+                                       (int.from_bytes(digest[:8], "big", signed=True),))
+                    cur = await conn.execute(
+                        "SELECT count(*) AS c FROM kb_documents WHERE owner_key = %s",
+                        (owner_key,))
+                    row = await cur.fetchone()
+                    if int(row["c"]) >= int(max_documents):
+                        raise DocumentLimitReached(
+                            f"owner already holds {max_documents} documents")
+                await conn.execute(
+                    "INSERT INTO kb_documents (id, owner_key, title, profiles, media_type) "
+                    "VALUES (%s, %s, %s, %s, %s)",
+                    (doc_id, owner_key, " ".join(str(title or "").split()),
+                     list(sanitize_profiles(profiles)), media_type))
+                cur = await conn.execute(
+                    f"SELECT {_DOC_COLS} FROM kb_documents d WHERE d.id = %s", (doc_id,))
+                [record] = await self._records(conn, await cur.fetchall())
+        return record
+
+    async def get_document(self, owner_key: str, document_id: str) -> Optional[KbDocument]:
+        require_owner(owner_key)
+        doc = _doc_uuid(document_id)
+        if doc is None:
+            return None
+        async with self._conn() as conn:
+            cur = await conn.execute(
+                f"SELECT {_DOC_COLS} FROM kb_documents d WHERE d.owner_key = %s AND d.id = %s",
+                (owner_key, doc))
+            records = await self._records(conn, await cur.fetchall())
+        return records[0] if records else None
+
+    async def list_documents(self, owner_key: str) -> "list[KbDocument]":
+        require_owner(owner_key)
+        async with self._conn() as conn:
+            cur = await conn.execute(
+                f"SELECT {_DOC_COLS} FROM kb_documents d WHERE d.owner_key = %s "
+                "ORDER BY d.created_at, d.id", (owner_key,))
+            return await self._records(conn, await cur.fetchall())
+
+    async def set_profiles(self, owner_key: str, document_id: str, profiles) -> bool:
+        require_owner(owner_key)
+        doc = _doc_uuid(document_id)
+        if doc is None:
+            return False
+        async with self._conn() as conn:
+            cur = await conn.execute(
+                "UPDATE kb_documents SET profiles = %s, updated_at = now() "
+                "WHERE owner_key = %s AND id = %s",
+                (list(sanitize_profiles(profiles)), owner_key, doc))
+            return cur.rowcount > 0
+
+    async def get_original(self, owner_key: str, document_id: str, *,
+                           version: Optional[int] = None) -> Optional[bytes]:
+        require_owner(owner_key)
+        doc = _doc_uuid(document_id)
+        if doc is None:
+            return None
+        async with self._conn() as conn:
+            cur = await conn.execute(
+                "SELECT o.data FROM kb_originals o JOIN kb_documents d ON d.id = o.document_id "
+                "WHERE d.owner_key = %s AND o.document_id = %s "
+                "  AND o.version = COALESCE(%s::integer, d.active_version)",
+                (owner_key, doc, version))
+            row = await cur.fetchone()
+        return bytes(row["data"]) if row is not None else None
+
+    # ── ingestion ────────────────────────────────────────────────────────
+    async def _lock_document(self, conn, owner_key: str, doc: str) -> Optional[Any]:
+        cur = await conn.execute(
+            "SELECT id, active_version FROM kb_documents WHERE owner_key = %s AND id = %s "
+            "FOR UPDATE", (owner_key, doc))
+        return await cur.fetchone()
+
+    async def _version_record(self, conn, doc: str, version: int) -> Optional[KbVersion]:
+        cur = await conn.execute(_VERSION_SELECT + "WHERE v.document_id = %s AND v.version = %s",
+                                 (doc, version))
+        row = await cur.fetchone()
+        return _version_from_row(row) if row is not None else None
+
+    async def begin_version(self, owner_key: str, document_id: str, *, sha256: str,
+                            embed_model: str, size_bytes: int,
+                            original: Optional[bytes] = None) -> Optional[KbVersion]:
+        require_owner(owner_key)
+        require_model(embed_model, self.embedding_dim)
+        if original is not None and len(original) > self.max_original_bytes:
+            raise OriginalTooLarge(f"original of {len(original)} bytes is over the "
+                                   f"{self.max_original_bytes}-byte ceiling")
+        doc = _doc_uuid(document_id)
+        if doc is None:
+            return None
+        async with self._conn() as conn:
+            async with conn.transaction():
+                if await self._lock_document(conn, owner_key, doc) is None:
+                    return None
+                cur = await conn.execute(
+                    "SELECT version, state FROM kb_versions "
+                    "WHERE document_id = %s AND sha256 = %s AND embed_model = %s",
+                    (doc, sha256, embed_model))
+                same = await cur.fetchone()
+                if same is not None:
+                    number = int(same["version"])
+                    if same["state"] != KB_READY:
+                        await conn.execute(
+                            f"UPDATE kb_versions SET state = '{KB_PROCESSING}', reason = '', "
+                            "finished_at = NULL WHERE document_id = %s AND version = %s",
+                            (doc, number))
+                else:
+                    cur = await conn.execute(
+                        "SELECT COALESCE(max(version), 0) + 1 AS n FROM kb_versions "
+                        "WHERE document_id = %s", (doc,))
+                    number = int((await cur.fetchone())["n"])
+                    await conn.execute(
+                        "INSERT INTO kb_versions (document_id, version, state, sha256, "
+                        "embed_model, size_bytes) VALUES (%s, %s, %s, %s, %s, %s)",
+                        (doc, number, KB_PROCESSING, sha256, embed_model, int(size_bytes)))
+                if original is not None:
+                    await conn.execute(
+                        "INSERT INTO kb_originals (document_id, version, data) VALUES (%s, %s, %s) "
+                        "ON CONFLICT (document_id, version) DO NOTHING",
+                        (doc, number, bytes(original)))
+                return await self._version_record(conn, doc, number)
+
+    async def add_chunks(self, owner_key: str, document_id: str, version: int,
+                         chunks) -> bool:
+        require_owner(owner_key)
+        rows = [(c, require_vector(c.embedding, self.embedding_dim, what="chunk embedding"))
+                for c in chunks]                          # validate ALL before staging any
+        doc = _doc_uuid(document_id)
+        if doc is None:
+            return False
+        async with self._conn() as conn:
+            async with conn.transaction():
+                cur = await conn.execute(
+                    "SELECT v.embed_model FROM kb_versions v "
+                    "JOIN kb_documents d ON d.id = v.document_id "
+                    f"WHERE d.owner_key = %s AND v.document_id = %s AND v.version = %s "
+                    f"  AND v.state = '{KB_PROCESSING}' FOR SHARE OF v",
+                    (owner_key, doc, int(version)))
+                live = await cur.fetchone()
+                if live is None:
+                    return False
+                # The chunk's model label is the VERSION's, copied here — never the caller's —
+                # so a chunk cannot claim a model its version was not built with.
+                async with conn.cursor() as c2:
+                    await c2.executemany(
+                        "INSERT INTO kb_chunks (document_id, version, ordinal, heading_path, "
+                        "page, content, embed_model, embedding) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s::vector) "
+                        "ON CONFLICT (document_id, version, ordinal) DO UPDATE SET "
+                        "heading_path = EXCLUDED.heading_path, page = EXCLUDED.page, "
+                        "content = EXCLUDED.content, embed_model = EXCLUDED.embed_model, "
+                        "embedding = EXCLUDED.embedding",
+                        [(doc, int(version), int(c.ordinal), list(c.heading_path), c.page,
+                          c.content, live["embed_model"], _vec(emb)) for c, emb in rows])
+        return True
+
+    async def commit_version(self, owner_key: str, document_id: str, version: int, *,
+                             pages: int) -> str:
+        require_owner(owner_key)
+        doc = _doc_uuid(document_id)
+        if doc is None:
+            return COMMIT_DELETED
+        number = int(version)
+        async with self._conn() as conn:
+            async with conn.transaction():
+                row = await self._lock_document(conn, owner_key, doc)
+                if row is None:
+                    return COMMIT_DELETED
+                cur = await conn.execute(
+                    "SELECT state, (SELECT max(version) FROM kb_versions WHERE document_id = %s) "
+                    "AS newest FROM kb_versions WHERE document_id = %s AND version = %s",
+                    (doc, doc, number))
+                v = await cur.fetchone()
+                if v is None:
+                    return COMMIT_SUPERSEDED
+                if number != int(v["newest"]):
+                    await conn.execute(
+                        "DELETE FROM kb_versions WHERE document_id = %s AND version = %s",
+                        (doc, number))
+                    return COMMIT_SUPERSEDED
+                if v["state"] == KB_READY and row["active_version"] == number:
+                    return COMMIT_READY
+                if v["state"] != KB_PROCESSING:
+                    return COMMIT_SUPERSEDED
+                await conn.execute(
+                    f"UPDATE kb_versions SET state = '{KB_READY}', reason = '', "
+                    "finished_at = now(), pages = %s, chunks = (SELECT count(*) FROM kb_chunks "
+                    "  WHERE document_id = %s AND version = %s) "
+                    "WHERE document_id = %s AND version = %s",
+                    (int(pages), doc, number, doc, number))
+                await conn.execute(
+                    "UPDATE kb_documents SET active_version = %s, updated_at = now() WHERE id = %s",
+                    (number, doc))
+                # Older versions go with their chunks and originals (cascade) in the SAME
+                # transaction — the swap is whole or it did not happen.
+                await conn.execute(
+                    "DELETE FROM kb_versions WHERE document_id = %s AND version < %s",
+                    (doc, number))
+        return COMMIT_READY
+
+    async def fail_version(self, owner_key: str, document_id: str, version: int, *,
+                           reason: str) -> bool:
+        require_owner(owner_key)
+        doc = _doc_uuid(document_id)
+        if doc is None:
+            return False
+        async with self._conn() as conn:
+            async with conn.transaction():
+                if await self._lock_document(conn, owner_key, doc) is None:
+                    return False
+                cur = await conn.execute(
+                    f"UPDATE kb_versions SET state = '{KB_ERROR}', reason = %s, finished_at = now() "
+                    f"WHERE document_id = %s AND version = %s AND state <> '{KB_READY}'",
+                    (sanitize_reason(reason), doc, int(version)))
+                if cur.rowcount == 0:
+                    return False
+                for table in ("kb_chunks", "kb_originals"):
+                    await conn.execute(
+                        f"DELETE FROM {table} WHERE document_id = %s AND version = %s",
+                        (doc, int(version)))
+        return True
+
+    # ── removal ──────────────────────────────────────────────────────────
+    async def _remove(self, conn, rows: "list[Any]", kind: str, actor: str) -> int:
+        """Delete these (already locked) documents and write one tombstone each — ids and version
+        numbers only, read BEFORE the cascade takes them."""
+        if not rows:
+            return 0
+        ids = [str(r["id"]) for r in rows]
+        cur = await conn.execute(
+            "SELECT document_id, array_agg(version ORDER BY version) AS versions "
+            "FROM kb_versions WHERE document_id = ANY(%s::uuid[]) GROUP BY document_id", (ids,))
+        versions = {str(r["document_id"]): list(r["versions"] or []) for r in await cur.fetchall()}
+        await conn.execute("DELETE FROM kb_documents WHERE id = ANY(%s::uuid[])", (ids,))
+        async with conn.cursor() as c2:
+            await c2.executemany(
+                "INSERT INTO kb_tombstones (owner_key, document_id, versions, kind, actor) "
+                "VALUES (%s, %s, %s::integer[], %s, %s)",
+                [(r["owner_key"], str(r["id"]), versions.get(str(r["id"]), []), kind,
+                  str(actor or "")) for r in rows])
+        return len(rows)
+
+    async def delete_document(self, owner_key: str, document_id: str, *, actor: str = "") -> bool:
+        require_owner(owner_key)
+        doc = _doc_uuid(document_id)
+        if doc is None:
+            return False
+        async with self._conn() as conn:
+            async with conn.transaction():
+                cur = await conn.execute(
+                    "SELECT id, owner_key FROM kb_documents WHERE owner_key = %s AND id = %s "
+                    "FOR UPDATE", (owner_key, doc))
+                return await self._remove(conn, await cur.fetchall(), TOMBSTONE_DELETED,
+                                          actor) > 0
+
+    async def purge_owner_subtree(self, owner_prefix: str, *, actor: str = "") -> int:
+        require_owner(owner_prefix)
+        async with self._conn() as conn:
+            async with conn.transaction():
+                cur = await conn.execute(
+                    f"SELECT d.id, d.owner_key FROM kb_documents d WHERE {_OWNER_SUBTREE} "
+                    "FOR UPDATE", (owner_prefix, self._subtree_like(owner_prefix)))
+                return await self._remove(conn, await cur.fetchall(), TOMBSTONE_PURGED, actor)
+
+    async def tombstones(self, owner_prefix: str, *, limit: int = 100) -> "list[KbTombstone]":
+        require_owner(owner_prefix)
+        async with self._conn() as conn:
+            cur = await conn.execute(
+                "SELECT d.owner_key, d.document_id, d.versions, d.kind, d.actor, d.removed_at "
+                f"FROM kb_tombstones d WHERE {_OWNER_SUBTREE} "
+                "ORDER BY d.removed_at DESC, d.id DESC LIMIT %s",
+                (owner_prefix, self._subtree_like(owner_prefix), int(limit)))
+            rows = await cur.fetchall()
+        return [KbTombstone(owner_key=r["owner_key"], document_id=str(r["document_id"]),
+                            versions=tuple(int(x) for x in (r["versions"] or ())), kind=r["kind"],
+                            actor=r["actor"] or "", removed_at=r["removed_at"]) for r in rows]
+
+    async def prune_tombstones(self, *, before: datetime) -> int:
+        async with self._conn() as conn:
+            cur = await conn.execute("DELETE FROM kb_tombstones WHERE removed_at < %s", (before,))
+            return cur.rowcount
+
+    async def stored_original_bytes(self, owner_prefix: str) -> int:
+        require_owner(owner_prefix)
+        async with self._conn() as conn:
+            # `octet_length` is answered from the value's header, without de-TOASTing the bytes.
+            cur = await conn.execute(
+                "SELECT COALESCE(sum(octet_length(o.data)), 0) AS n FROM kb_originals o "
+                f"JOIN kb_documents d ON d.id = o.document_id WHERE {_OWNER_SUBTREE}",
+                (owner_prefix, self._subtree_like(owner_prefix)))
+            row = await cur.fetchone()
+        return int(row["n"])
+
+    # ── the reader path ──────────────────────────────────────────────────
+    async def readable_documents(self, owner_key: str, *, profile: str) -> "list[KbDocument]":
+        require_owner(owner_key)
+        profile = require_profile(profile)
+        async with self._conn() as conn:
+            cur = await conn.execute(
+                f"SELECT {_DOC_COLS} FROM kb_documents d {_SERVED} ORDER BY d.created_at, d.id",
+                (owner_key, profile))
+            return await self._records(conn, await cur.fetchall())
+
+    async def search(self, owner_key: str, *, profile: str, text: str,
+                     vector: Optional[list[float]] = None, embed_model: Optional[str] = None,
+                     limit: int = 5,
+                     weights: Optional[HybridWeights] = None) -> KbSearchResult:
+        require_owner(owner_key)
+        profile = require_profile(profile)
+        if vector is not None and embed_model is None:
+            raise ValueError("a query vector needs the label of the model that made it")
+        if embed_model is not None:
+            require_model(embed_model, self.embedding_dim)
+        query = require_vector(vector, self.embedding_dim, what="query vector") \
+            if vector is not None else None
+        w = weights or HybridWeights()
+        hybrid_score(0.0, 0.0, vector_weight=w.vector, lexical_weight=w.lexical)   # validates
+        q_txt = text if (text and text.strip()) else None
+        # OR over the query's lexemes: a natural-language question rarely has EVERY word in the
+        # passage that answers it, and `plainto_tsquery` ANDs them.
+        tsq = (f"replace(plainto_tsquery('{self._ts}', %s)::text, ''' & ''', ''' | ''')::tsquery")
+        async with self._conn() as conn:
+            cur = await conn.execute(
+                f"SELECT DISTINCT v.embed_model FROM kb_documents d {_SERVED}",
+                (owner_key, profile))
+            models = {r["embed_model"] for r in await cur.fetchall()}
+            unavailable = sorted(models if query is None else models - {embed_model})
+            use_vector = query is not None and not unavailable        # all or none
+
+            params: list = []
+            if use_vector:
+                vexpr = "GREATEST(0.0, LEAST(1.0, 1.0 - (c.embedding <=> %s::vector)))"
+                params.append(_vec(query))
+            else:
+                vexpr = "NULL::float8"
+            if q_txt is not None:
+                # normalisation 32 = rank / (rank + 1): ts_rank_cd is unbounded, the fusion needs
+                # [0, 1]. A lexical-only candidate must MATCH (`@@`); with a vector, every served
+                # chunk is a candidate and the vector ranks it.
+                lmatch = f"(c.tsv @@ {tsq})"
+                lexpr = f"CASE WHEN c.tsv @@ {tsq} THEN ts_rank_cd(c.tsv, {tsq}, 32) ELSE 0 END"
+                params += [q_txt, q_txt, q_txt]              # lmatch, the CASE test, the rank
+            else:
+                lmatch, lexpr = "false", "0.0"
+            params += [owner_key, profile]
+            keep = "true" if use_vector else "s.lmatch"
+            wv, wl = float(w.vector), float(w.lexical)
+            order = ("(%s * s.vscore + %s * s.lscore) / (%s + %s)" if use_vector else "s.lscore")
+            order_params = [wv, wl, wv, wl] if use_vector else []
+            cur = await conn.execute(
+                "SELECT * FROM ("
+                "  SELECT c.document_id, c.version, c.ordinal, c.heading_path, c.page, c.content, "
+                f"        c.embed_model, d.title, {vexpr} AS vscore, "
+                f"        {lmatch} AS lmatch, {lexpr} AS lscore "
+                "  FROM kb_chunks c "
+                "  JOIN kb_documents d ON d.id = c.document_id AND d.active_version = c.version "
+                f"  {_SERVED}"
+                ") s "
+                f"WHERE {keep} "
+                f"ORDER BY {order} DESC, s.document_id, s.version, s.ordinal LIMIT %s",
+                params + order_params + [max(0, int(limit))])
+            rows = await cur.fetchall()
+        hits = []
+        for r in rows:
+            vs = clamp_unit(float(r["vscore"])) if r["vscore"] is not None else None
+            ls = clamp_unit(float(r["lscore"] or 0.0))
+            doc = str(r["document_id"])
+            hits.append(KbHit(
+                id=chunk_id(doc, int(r["version"]), int(r["ordinal"])), document_id=doc,
+                version=int(r["version"]), ordinal=int(r["ordinal"]), title=r["title"],
+                heading_path=tuple(r["heading_path"] or ()), page=r["page"], content=r["content"],
+                embed_model=r["embed_model"], vector_score=vs, lexical_score=ls,
+                score=hybrid_score(vs, ls, vector_weight=wv, lexical_weight=wl)))
+        hits.sort(key=hit_order_key)
+        return KbSearchResult(hits=tuple(hits),
+                              degradations=(KB_EMBED_SPACE_UNAVAILABLE,) if unavailable else (),
+                              models_unavailable=tuple(unavailable))
+
+    # ── maintenance ──────────────────────────────────────────────────────
+    async def stale_documents(self, *, embed_model: str, limit: int = 100) -> "list[KbDocument]":
+        require_model(embed_model, self.embedding_dim)
+        async with self._conn() as conn:
+            cur = await conn.execute(
+                f"SELECT {_DOC_COLS} FROM kb_documents d JOIN kb_versions v "
+                "  ON v.document_id = d.id AND v.version = d.active_version "
+                "WHERE v.embed_model <> %s ORDER BY d.created_at, d.id LIMIT %s",
+                (embed_model, int(limit)))
+            return await self._records(conn, await cur.fetchall())

@@ -139,7 +139,11 @@ def _pack(paragraphs: Sequence[str], config: ChunkingConfig) -> list[str]:
     """Paragraphs packed into bodies of at most ``target_chars``, each after the first opening
     with the tail of the one before it. A body is never ONLY overlap."""
     overlap = config.overlap_chars
-    piece = max(1, config.target_chars - overlap)
+    # Room for the overlap AND the joiner ("\n\n", two characters) in front of a piece: a
+    # piece sized to `target - overlap` overflowed by the joiner whenever the tail had no
+    # word boundary to shrink at (a long URL) — measured by
+    # `test_a_run_without_whitespace_is_cut_hard`.
+    piece = max(1, config.target_chars - overlap - 2)
     units: list[tuple[str, bool]] = []            # (text, continues the previous unit's paragraph)
     for para in paragraphs:
         parts = _split_long(para, piece) if len(para) > piece else [para]
@@ -159,6 +163,16 @@ def _pack(paragraphs: Sequence[str], config: ChunkingConfig) -> list[str]:
     if has_unit and cur.strip():
         bodies.append(cur)
     return bodies
+
+
+def _path(root: tuple[str, ...], trail: Sequence[str]) -> tuple[str, ...]:
+    """The document title, then the heading trail — without repeating the title when the
+    document's own top heading IS the title (``# Manual`` in a document titled *Manual*), which
+    is the common case and would otherwise spend characters of every chunk saying it twice."""
+    trail = tuple(trail)
+    if root and trail and trail[0].casefold() == root[0].casefold():
+        trail = trail[1:]
+    return root + trail
 
 
 def _content(path: Sequence[str], body: str, config: ChunkingConfig) -> str:
@@ -199,8 +213,7 @@ def chunk_markdown(title: str, text: str, config: ChunkingConfig = DEFAULT_CHUNK
     fence = ""
 
     def flush() -> None:
-        path = root + tuple(t for _, t in stack)
-        out.emit(path, _pack(_paragraphs(section), config), None)
+        out.emit(_path(root, [t for _, t in stack]), _pack(_paragraphs(section), config), None)
 
     for line in _normalise(text or "").split("\n"):
         m_fence = _FENCE.match(line)
@@ -215,7 +228,9 @@ def chunk_markdown(title: str, text: str, config: ChunkingConfig = DEFAULT_CHUNK
             continue
         m = _HEADING.match(line)
         heading = " ".join((m.group(2) or "").split()) if m else ""
-        if m and heading:
+        if m and not heading:
+            continue                                   # a bare `#` marks nothing and says nothing
+        if m:
             flush()
             section = []
             level = len(m.group(1))
@@ -254,5 +269,6 @@ def chunk_pages(title: str, pages: Sequence[ExtractedPage],
     trail = _outline_paths(outline, [p.number for p in pages])
     for page in pages:
         lines = _normalise(page.text or "").split("\n")
-        out.emit(root + trail.get(page.number, ()), _pack(_paragraphs(lines), config), page.number)
+        out.emit(_path(root, trail.get(page.number, ())), _pack(_paragraphs(lines), config),
+                 page.number)
     return out.chunks

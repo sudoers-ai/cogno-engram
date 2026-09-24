@@ -171,6 +171,65 @@ anchoring anything on a node — *"this is the contact's own node"* — needs it
 `lower(label)` and `knowledge_nodes` has no unique constraint on `(scope, label)` alone, so a
 label can name more than one node and the walk will expand from all of them.
 
+## Documents — the host decides who, engram keeps what
+
+`DocumentStore` (`cogno_engram.documents`) is the store for text a tenant publishes to its
+contacts. The split with the host, piece by piece:
+
+| Concern | Owner |
+| --- | --- |
+| Tables, versions + atomic swap, chunking, hybrid search, the model guard, tombstones | **cogno-engram** |
+| `ingest()` — extract → chunk → gate → embed → stage → swap, returning the usage | **cogno-engram** |
+| PDF text extraction (separate process, deadline, no network, text layer only) | **cogno-vox** (`TextExtractor`) |
+| What `owner_key` is (e.g. `f"{tenant}/{persona}"`), which `profiles` exist, a reader's profile | **host** |
+| Upload API/UI, the job runner (one at a time, never on a turn), plan limits | **host** |
+| Writing `IngestOutcome.embedding_tokens` to the tenant's ledger; the budget `gate` | **host** |
+| The tool that searches, its relevance floor, its description | the skill (cortex) |
+
+```python
+from cogno_engram import documents_probe, embed_model_label
+from cogno_engram.adapters.postgres import PostgresDocumentStore
+from cogno_engram.ingest import TokensPerMinute, ingest
+
+docs = PostgresDocumentStore(dsn=DSN)                       # tables come from ensure_schema
+model = embed_model_label(embed_spec(), embed_dimensions()) # the ONE platform embedder
+owner = f"{tenant_id}/{persona_id}"                         # opaque to engram
+
+# upload (API): the row exists at once, state `processing`
+doc = await docs.create_document(owner, title=title, profiles=["GUEST"],
+                                 media_type="application/pdf", max_documents=50)
+# the job (background, never inside a turn)
+out = await ingest(docs, owner, doc.id, data=pdf_bytes, embedder=embedder, embed_model=model,
+                   extractor=pdf_extractor,                  # cogno-vox, extra `pdf`
+                   gate=lambda n: budget.allows(tenant_id, n),   # refuse → zero embed calls
+                   pace=TokensPerMinute(20_000))            # yield to live conversations
+ledger.record(tenant_id, stage="kb_ingest", tokens=out.embedding_tokens)  # host's business
+
+# a turn (the reader path): profile is REQUIRED, and it is the reader's, not the model's
+res = await docs.search(owner, profile=identity_role, text=original_text,
+                        vector=query_vector, embed_model=model)
+# res.degradations == ("kb_embed_space_unavailable",) → the search was lexical only
+```
+
+- **Health.** Call `documents_probe(docs, embed_model=model)` from `/health`: it runs every read
+  the store serves against an owner that holds nothing, and raises what the database raises. A
+  table or column the migration never created fails it — a test drops every column of every
+  `kb_*` table in turn and requires the probe to fail. (The graph probe could not see the
+  engram's `turns` schema once, and the janitor failed silently for days behind a green
+  `/health`; this is the same check for these tables, owned here so it moves with the pin.)
+- **Migration.** `ensure_schema` creates the five `kb_*` tables (`CREATE ... IF NOT EXISTS`,
+  additive). A host whose migration delegates to it gets them with no new step; a pin bump
+  that includes this change needs that migration run on the live database before the first
+  upload, like any schema change.
+- **Purge.** A tenant purge calls `purge_owner_subtree(tenant_prefix)`: every document under
+  the prefix goes, with the chunks and the stored originals of every version, and one
+  tombstone per document (ids, versions, when, who — no title, no text). `prune_tombstones`
+  bounds their retention. **Backups are out of reach:** a database backup keeps an original
+  until the backup's own retention expires — record that in the operator's data policy.
+- **Model swap.** A global embedder change leaves every version on the old label; until it is
+  re-indexed, searches are lexical and marked. `stale_documents(embed_model=new)` lists the work
+  and `reindex()` rebuilds one document from its stored original.
+
 ## Feedback-driven quality
 
 The host captures reactions and writes the signal; engram honours it:

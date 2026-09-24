@@ -14,13 +14,11 @@ All documents are invented; no owner, profile or title names a real tenant or pe
 
 from __future__ import annotations
 
-import hashlib
 from uuid import uuid4
 
 import pytest
 
 from cogno_engram import documents as kb
-from cogno_engram.adapters.in_memory import InMemoryDocumentStore
 from cogno_engram.documents import (
     COMMIT_DELETED,
     COMMIT_READY,
@@ -40,41 +38,17 @@ from cogno_engram.documents import (
 from cogno_engram.ports import DocumentStore
 
 from conftest import resolve_test_dsn  # noqa: E402 — the sibling conftest, on pytest's path
+from documents_support import EMB_DIM, MODEL_A, MODEL_B, publish, store_factory, vec
 
-DSN = resolve_test_dsn()      # ENGRAM_TEST_DSN, else `engram_test` on the local server
-EMB_DIM = 8
-MODEL_A = embed_model_label("stub:alpha", EMB_DIM)
-MODEL_B = embed_model_label("stub:beta", EMB_DIM)
-KB_TABLES = ("kb_chunks", "kb_originals", "kb_versions", "kb_tombstones", "kb_documents")
-
-
-def vec(*head: float) -> list[float]:
-    return (list(head) + [0.0] * EMB_DIM)[:EMB_DIM]
-
-
-async def _postgres_store(**kwargs):
-    psycopg = pytest.importorskip("psycopg")
-    if not DSN:
-        pytest.skip("no test Postgres answers — the in-memory leg ran")
-    from cogno_engram.adapters.postgres import PostgresDocumentStore, ensure_schema
-    try:
-        conn = await psycopg.AsyncConnection.connect(DSN, autocommit=True, connect_timeout=3)
-    except Exception as exc:                            # noqa: BLE001
-        pytest.skip(f"test Postgres unreachable: {type(exc).__name__}")
-    for table in KB_TABLES:
-        await conn.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
-    await ensure_schema(conn, embedding_dim=EMB_DIM)
-    await conn.close()
-    return PostgresDocumentStore(dsn=DSN, embedding_dim=EMB_DIM, **kwargs)
+# ENGRAM_TEST_DSN, else `engram_test` on the local server. Module-level ON PURPOSE: the Postgres
+# leg DROPs the kb_* tables, and `tests/conftest.py` decides by this attribute whether a
+# database may be touched at all (read at fixture time, so a blanked DSN skips the leg).
+DSN = resolve_test_dsn()
 
 
 @pytest.fixture(params=["memory", "postgres"])
 async def make_store(request):
-    async def factory(**kwargs):
-        if request.param == "memory":
-            return InMemoryDocumentStore(embedding_dim=EMB_DIM, **kwargs)
-        return await _postgres_store(**kwargs)
-    return factory
+    return store_factory(request.param, DSN)
 
 
 @pytest.fixture
@@ -84,21 +58,6 @@ async def docs(make_store):
 
 def owner() -> str:
     return f"acme{uuid4().hex[:8]}/persona-a"
-
-
-async def publish(store, owner_key: str, *, title: str = "Manual", profiles=("EMPLOYEE",),
-                  chunks=(("Horários › Sábado\n\nAbrimos das 8h às 12h.", vec(1.0)),),
-                  model: str = MODEL_A, original: bytes = b"# Manual\n") -> str:
-    doc = await store.create_document(owner_key, title=title, profiles=list(profiles),
-                                      media_type=MEDIA_MARKDOWN)
-    v = await store.begin_version(owner_key, doc.id, sha256=hashlib.sha256(original).hexdigest(),
-                                  embed_model=model, size_bytes=len(original), original=original)
-    ok = await store.add_chunks(owner_key, doc.id, v.version, [
-        KbChunk(ordinal=i, content=text, heading_path=(title,), embedding=e)
-        for i, (text, e) in enumerate(chunks)])
-    assert ok
-    assert await store.commit_version(owner_key, doc.id, v.version, pages=0) == COMMIT_READY
-    return doc.id
 
 
 async def ids(store, owner_key, profile, text="horários sábado", **kw):
@@ -508,3 +467,100 @@ async def test_a_document_without_attempts_reads_processing(docs):
     assert doc.title == "Manual de bolso" and doc.profiles == ("GUEST",)
     [listed] = await docs.list_documents(o)
     assert listed.id == doc.id
+
+
+# ── the score (consultor's notes on 3d5780c): renormalised, [0, 1], all or none ──────────
+
+async def test_without_a_vector_the_score_IS_the_lexical_score(docs):
+    """An absent component is renormalised away, never counted as zero: ``0.4·l`` would put
+    every degraded search under any floor calibrated on full scores."""
+    o = owner()
+    await publish(docs, o, profiles=("GUEST",),
+                  chunks=(("abrimos no sábado de manhã", vec(0.5, 1.0)),))
+    lexical = await docs.search(o, profile="GUEST", text="sábado", embed_model=MODEL_A)
+    hybrid = await docs.search(o, profile="GUEST", text="sábado", vector=vec(1.0),
+                               embed_model=MODEL_A)
+    [lx], [hy] = lexical.hits, hybrid.hits
+    assert lx.lexical_score == hy.lexical_score > 0             # the SAME lexical component
+    assert lx.vector_score is None and lx.score == lx.lexical_score
+    # CONTROL: with the vector the fusion is the weighted one, and it is a different number.
+    assert hy.score == pytest.approx(0.6 * hy.vector_score + 0.4 * hy.lexical_score)
+    assert hy.score != lx.score
+
+
+async def test_within_one_result_either_every_hit_has_a_vector_score_or_none_does(docs):
+    o = owner()
+    await publish(docs, o, profiles=("GUEST",), chunks=(("sábado A", vec(1.0)),), model=MODEL_A)
+    await publish(docs, o, profiles=("GUEST",), chunks=(("sábado B", vec(1.0)),), model=MODEL_B)
+    mixed = await docs.search(o, profile="GUEST", text="sábado", vector=vec(1.0),
+                              embed_model=MODEL_B, limit=10)
+    assert len(mixed.hits) == 2
+    assert {h.vector_score for h in mixed.hits} == {None}       # one scale: all lexical
+    assert mixed.models_unavailable == (MODEL_A,)
+    assert mixed.degradations == (KB_EMBED_SPACE_UNAVAILABLE,)
+    # CONTROL — one model only: every hit carries a vector score.
+    solo = owner()
+    await publish(docs, solo, profiles=("GUEST",), chunks=(("sábado", vec(1.0)),) * 2,
+                  model=MODEL_B)
+    full = await docs.search(solo, profile="GUEST", text="sábado", vector=vec(1.0),
+                             embed_model=MODEL_B)
+    assert len(full.hits) == 2 and None not in {h.vector_score for h in full.hits}
+    assert full.degradations == ()
+
+
+async def test_a_chunk_without_its_embedding_can_never_be_stored(docs):
+    """The other side of all-or-none: a ready version with an unembedded chunk would be a
+    served version the vector cannot fully rank. It is refused on the way in, whole batch."""
+    o = owner()
+    doc = await docs.create_document(o, title="M", profiles=["GUEST"], media_type=MEDIA_MARKDOWN)
+    v = await docs.begin_version(o, doc.id, sha256="8" * 64, embed_model=MODEL_A, size_bytes=1)
+    batch = [KbChunk(ordinal=0, content="sábado com vector", embedding=vec(1.0)),
+             KbChunk(ordinal=1, content="sábado sem vector", embedding=None)]
+    with pytest.raises(ValueError):
+        await docs.add_chunks(o, doc.id, v.version, batch)
+    with pytest.raises(ValueError):
+        await docs.add_chunks(o, doc.id, v.version,
+                              [KbChunk(ordinal=0, content="largura errada", embedding=[1.0])])
+    await docs.commit_version(o, doc.id, v.version, pages=0)
+    assert (await docs.get_document(o, doc.id)).active.chunks == 0      # not even the good one
+
+
+LONG = " ".join(["sábado"] * 6000 + ["horário"] * 3000)
+
+
+@pytest.mark.parametrize("text", ["sábado", "sábado sábado sábado sábado", "sábado horário",
+                                  "horário " * 50])
+async def test_no_score_leaves_the_unit_interval(docs, text):
+    o = owner()
+    await publish(docs, o, profiles=("GUEST",), chunks=(
+        (LONG, vec(1.0)), ("sábado", vec(-1.0)), ("sábado curto", vec(0.3, 0.9)),
+        ("nada", vec(0.0, 1.0))))
+    for kwargs in ({}, {"vector": vec(1.0)}, {"vector": vec(-1.0)}):
+        res = await docs.search(o, profile="GUEST", text=text, embed_model=MODEL_A, limit=10,
+                                **kwargs)
+        assert res.hits
+        for h in res.hits:
+            for x in (h.score, h.lexical_score) + ((h.vector_score,) if h.vector_score is not None
+                                                   else ()):
+                assert 0.0 <= x <= 1.0, (kwargs, h.content[:20], x)
+
+
+async def test_an_anti_parallel_vector_is_cut_to_zero_not_negative(docs):
+    o = owner()
+    await publish(docs, o, profiles=("GUEST",), chunks=(("nada", vec(-1.0)),))
+    [hit] = (await docs.search(o, profile="GUEST", text="zzz", vector=vec(1.0),
+                               embed_model=MODEL_A)).hits
+    assert hit.vector_score == 0.0 and hit.score == 0.0
+
+
+async def test_weights_are_renormalised_and_validated(docs):
+    from cogno_engram.types import HybridWeights
+    o = owner()
+    await publish(docs, o, profiles=("GUEST",), chunks=(("sábado", vec(1.0)),))
+    res = await docs.search(o, profile="GUEST", text="sábado", vector=vec(1.0),
+                            embed_model=MODEL_A, weights=HybridWeights(vector=3.0, lexical=1.0))
+    [h] = res.hits
+    assert h.score == pytest.approx((3.0 * h.vector_score + 1.0 * h.lexical_score) / 4.0)
+    with pytest.raises(ValueError):
+        await docs.search(o, profile="GUEST", text="sábado", vector=vec(1.0),
+                          embed_model=MODEL_A, weights=HybridWeights(vector=0.0, lexical=0.0))

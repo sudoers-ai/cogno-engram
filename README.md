@@ -8,13 +8,14 @@
 
 ## Philosophy: ports, not a universal store
 
-A single abstraction over relational + key-value + graph collapses to a lowest-common-denominator that throws away vector search and graph traversal. Instead, `cogno-engram` defines **three capability-scoped ports**, each backed by the storage engine that fits it:
+A single abstraction over relational + key-value + graph collapses to a lowest-common-denominator that throws away vector search and graph traversal. Instead, `cogno-engram` defines **four capability-scoped ports**, each backed by the storage engine that fits it:
 
 | Port | Shape | Reference adapter |
 | --- | --- | --- |
 | `MemoryStore` | sessions / turns / memories + hybrid retrieval + per-turn traces | Postgres + pgvector |
 | `ConversationBuffer` | sliding short-term window (+ TTL) | Redis |
 | `KnowledgeGraph` | typed nodes + directed edges + multi-hop walk | Postgres (recursive CTE) |
+| `DocumentStore` | published documents: versions, chunks, hybrid search | Postgres + pgvector |
 
 Vector search is an **optional capability** (`SupportsVectorSearch`) — a store without it degrades retrieval to lexical/chronological instead of breaking.
 
@@ -76,6 +77,59 @@ equivalent of the parent's LIST(tenant), with zero DDL per new scope):
 ```python
 await ensure_schema(conn, partition_by_scope=True, partitions=8)
 ```
+
+## Documents — published text, versioned, searched on demand
+
+`DocumentStore` keeps text somebody WROTE to be read (a manual, a syllabus, a price list),
+uploaded as Markdown or PDF. It shares no table and no read with memories or the graph. The
+rules live in one module, `cogno_engram.documents`:
+
+- **An opaque owner.** `owner_key` is to documents what `scope` is to the rest — the host
+  composes it, engram never parses it — with the same subtree rule: `purge_owner_subtree("t1")`
+  removes `t1` and every `t1/…`, never `t10`.
+- **Opaque reader labels, no wildcard.** A document is published to `profiles`; every reader
+  call (`search`, `readable_documents`) takes `profile` as a REQUIRED keyword and a blank one
+  is refused. Only the SERVED version in state `ready` is ever read.
+- **One model per version, never mixed.** Every version records the `embed_model` label
+  (`embed_model_label("ollama:nomic-embed-text:latest", 768)`) it was indexed with. A search is
+  handed one vector plus that label; if any readable chunk has another label (a global model
+  swap not yet re-indexed) or there is no vector, the whole search is lexical and says so with
+  `kb_embed_space_unavailable` — never a cosine across models.
+- **Raw scores in [0, 1], no floor.** `vector_score` (`1 − cosine distance`, cut to [0, 1], or
+  `None` when not measured), `lexical_score` (Postgres: `ts_rank_cd` normalisation 32), and
+  `score` = `0.6·v + 0.4·l` renormalised — `score == lexical_score` exactly on a lexical search.
+  Ties break by `(document, version, ordinal)`. Which score is relevant is the caller's floor.
+- **Versions swap atomically.** `ingest()` indexes in the background (extract → chunk by
+  heading, ~2000 **characters**, 15% overlap, heading path on every chunk → embed → stage →
+  swap); the previous version answers until the new one is ready and keeps answering if it
+  fails. It returns the embedder's own usage (`embedding_tokens`, `embedding_calls`) and takes
+  a `gate` (refuse before embedding: zero calls) and a `pace` (tokens per minute).
+- **Delete is immediate and leaves a tombstone.** The originals of every version go with it
+  (they live in their own table, which no search joins); a job finishing after the delete
+  writes nothing.
+- **PDF extraction is not here.** `TextExtractor` is a structural Protocol; the PDF
+  implementation (separate process, deadline, no network, text layer only) is in `cogno-vox`.
+
+```python
+from cogno_engram import InMemoryDocumentStore, embed_model_label
+from cogno_engram.ingest import ingest
+
+model = embed_model_label("ollama:nomic-embed-text:latest", 768)
+docs = InMemoryDocumentStore()
+doc = await docs.create_document("acme/secretary", title="Student guide",
+                                 profiles=["GUEST"], media_type="text/markdown")
+outcome = await ingest(docs, "acme/secretary", doc.id, data=markdown_bytes,
+                       embedder=embedder, embed_model=model)
+hits = await docs.search("acme/secretary", profile="GUEST", text="saturday hours",
+                         vector=await embedder.embed("saturday hours"), embed_model=model)
+```
+
+The Postgres adapter (`PostgresDocumentStore`) adds five tables through `ensure_schema`
+(`kb_documents`, `kb_versions`, `kb_chunks`, `kb_originals`, `kb_tombstones`) — additive, no
+ALTER of anything that existed. `documents_probe(store, embed_model=...)` runs every read against
+an owner that holds nothing, for a host's health check: a missing table or column fails it.
+**A purge cannot reach the database's backups** — they keep an original until their own
+retention expires; that retention is the operator's decision.
 
 ## Edge curation — who asserted it decides whether it is spoken
 
@@ -197,7 +251,7 @@ ENGRAM_TEST_REDIS_URL=redis://localhost:56379/0 \
 
 ## What lives in the host (not here)
 
-Business identity (`tenants`/`identities`), billing/token ledgers, persona/domain schemas, feedback *capture* (emoji → ±1), persona switching, OTP/rate-limiting, and the consolidation **worker loop**. `cogno-engram` only knows `scope`, sessions/turns/memories, the graph, and the buffer.
+Business identity (`tenants`/`identities`), billing/token ledgers, persona/domain schemas, feedback *capture* (emoji → ±1), persona switching, OTP/rate-limiting, and the consolidation **worker loop**. `cogno-engram` only knows `scope`, sessions/turns/memories, the graph, and the buffer — and, for documents, an opaque `owner_key`, opaque reader `profiles`, and the usage an ingestion spent (who pays for it, which profiles exist and which upload limits a plan has are the host's).
 
 ## License
 

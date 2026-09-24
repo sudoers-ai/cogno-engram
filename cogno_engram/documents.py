@@ -30,9 +30,11 @@ The deployment has ONE embedder, but it can be swapped globally, and a swap leav
 chunk in the old model's space until it is re-indexed. So every version records the
 ``embed_model`` it was indexed with, a search is handed ONE query vector plus the label of the
 model that made it, and a chunk is scored against that vector ONLY when its label is the same,
-by equality of the key. A chunk of another model (mid re-index) or any chunk when the caller has
-no vector (the embedder is down) is scored LEXICALLY only, and the result says so with
-:data:`KB_EMBED_SPACE_UNAVAILABLE` — never with a cosine across models.
+by equality of the key. When any readable chunk was indexed by another model (mid re-index), or
+the caller has no vector (the embedder is down), the WHOLE search is scored LEXICALLY — one
+scale per result — and says so with :data:`KB_EMBED_SPACE_UNAVAILABLE`; never with a cosine
+across models. A chunk is never stored without its vector, so a served version is always fully
+comparable under its own model.
 
 **Nothing is served until it is whole.** A document has versions; a version is built in the
 background (``processing``) while the previous one keeps answering, becomes ``ready`` in one
@@ -302,13 +304,19 @@ def chunk_id(document_id: str, version: int, ordinal: int) -> str:
 
 @dataclass(frozen=True)
 class KbHit:
-    """One chunk a search returned, with the three numbers that ranked it — RAW.
+    """One chunk a search returned, with the three numbers that ranked it — RAW, each in [0, 1].
 
-    No floor is applied here: which score is "relevant enough" is calibrated by the caller over
-    the distribution these numbers actually have (a floor measured on another scale is a number
-    about that scale). ``vector_score`` is ``None`` — not 0.0 — when the chunk was scored by
-    words only (other model, or no query vector): "not measured" and "measured, unrelated" are
-    different facts, and a caller that floors on the vector must be able to tell them apart."""
+    * ``vector_score`` — ``1 − cosine distance`` to the query vector, cut to ``[0, 1]``; ``None``
+      — not 0.0 — when the search was LEXICAL (see ``KbSearchResult``): "not measured" and
+      "measured, unrelated" are different facts.
+    * ``lexical_score`` — each adapter's own lexical measure, normalised into ``[0, 1]``: in
+      Postgres ``ts_rank_cd`` with normalisation 32 (``rank / (rank + 1)``), in memory the share
+      of the query's words the chunk carries. The RANGE is the contract; the two adapters'
+      values for the same chunk are NOT equal and are not meant to be.
+    * ``score`` — :func:`hybrid_score` of the two (``= lexical_score`` exactly when lexical).
+
+    No floor is applied: which score is "relevant enough" is calibrated by the caller over the
+    distribution these numbers actually have."""
 
     id: str
     document_id: str
@@ -328,9 +336,13 @@ class KbHit:
 class KbSearchResult:
     """What a search returned and what it could NOT do.
 
-    ``models_unavailable`` names the embedding models readable chunks were indexed with that the
-    query vector did not come from (every one of them when there was no vector); when non-empty,
-    ``degradations`` carries :data:`KB_EMBED_SPACE_UNAVAILABLE`."""
+    **All or none:** within one result either EVERY hit has a ``vector_score`` or NONE does, so
+    the scores of one result are always on one scale. The vector is used only when every
+    readable chunk was indexed by the model that made it; if ANY readable chunk was indexed by
+    another model (a global swap not yet re-indexed), or there is no vector (the embedder is
+    down), the whole search is lexical. ``models_unavailable`` names the models that forced it
+    (every readable model when there was no vector); when non-empty, ``degradations`` carries
+    :data:`KB_EMBED_SPACE_UNAVAILABLE`."""
 
     hits: tuple[KbHit, ...] = ()
     degradations: tuple[str, ...] = ()
@@ -351,12 +363,31 @@ class KbTombstone:
     removed_at: Optional[datetime] = None
 
 
+def clamp_unit(x: float) -> float:
+    """``x`` cut to ``[0, 1]`` — both components of a score live on that scale, or the linear
+    fusion below would be mixing units."""
+    return 0.0 if x != x else max(0.0, min(1.0, float(x)))
+
+
 def hybrid_score(vector_score: Optional[float], lexical_score: float, *,
                  vector_weight: float, lexical_weight: float) -> float:
-    """The one fusion both adapters rank by: ``w_v·vector + w_l·lexical``, a missing vector
-    contributing nothing (the same linear fusion ``load_memories`` uses, without feedback)."""
-    return (vector_weight * vector_score if vector_score is not None else 0.0) \
-        + lexical_weight * lexical_score
+    """The one fusion both adapters rank by, RENORMALISED over the components present.
+
+    With a vector: ``(w_v·v + w_l·l) / (w_v + w_l)`` — ``0.6·v + 0.4·l`` at the defaults, the
+    linear fusion ``load_memories`` uses (without its feedback term). **Without one:
+    ``score = l`` exactly**, not ``w_l·l``: an absent component is renormalised away, never
+    counted as zero (the convention of the anima's ``compute_cumulative``). Counting it as zero
+    would put every degraded search under any floor a caller calibrated on full scores, and
+    the degradation would read as "nothing relevant" — a silent false negative.
+
+    Both components are in ``[0, 1]`` (the adapters normalise them), so the score is too."""
+    lexical = clamp_unit(lexical_score)
+    if vector_score is None:
+        return lexical
+    wv, wl = float(vector_weight), float(lexical_weight)
+    if wv < 0 or wl < 0 or wv + wl <= 0:
+        raise ValueError("hybrid weights must be non-negative with a positive sum")
+    return clamp_unit((wv * clamp_unit(vector_score) + wl * lexical) / (wv + wl))
 
 
 def hit_order_key(hit: KbHit) -> tuple:

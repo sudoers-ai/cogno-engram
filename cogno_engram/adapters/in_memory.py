@@ -1,7 +1,7 @@
 """
 cogno_engram.adapters.in_memory — zero-dependency reference adapters.
 
-Pure-Python implementations of all three ports, for tests, local dev, and as the
+Pure-Python implementations of all four ports, for tests, local dev, and as the
 executable proof that the Protocols are honest. They implement the same hybrid
 retrieval fusion and multi-hop graph walk as the Postgres adapter, just over
 in-process structures (no persistence, single-process).
@@ -41,6 +41,7 @@ from cogno_engram.documents import (
     KbVersion,
     OriginalTooLarge,
     chunk_id,
+    clamp_unit,
     hit_order_key,
     hybrid_score,
     owner_in_subtree,
@@ -1072,10 +1073,10 @@ class InMemoryDocumentStore:
         v = self._versions.get((row.id, int(version))) if row is not None else None
         if v is None or v.state != KB_PROCESSING:
             return False
+        rows = [(c, require_vector(c.embedding, self.embedding_dim, what="chunk embedding"))
+                for c in chunks]                          # validate ALL before staging any
         staged = self._chunks.setdefault((v.document_id, v.version), {})
-        for c in chunks:
-            emb = require_vector(c.embedding, self.embedding_dim, what="chunk embedding") \
-                if c.embedding is not None else None
+        for c, emb in rows:
             staged[int(c.ordinal)] = KbChunk(ordinal=int(c.ordinal), content=c.content,
                                               heading_path=tuple(c.heading_path), page=c.page,
                                               embedding=emb)
@@ -1147,9 +1148,11 @@ class InMemoryDocumentStore:
 
     async def tombstones(self, owner_prefix: str, *, limit: int = 100) -> "list[KbTombstone]":
         require_owner(owner_prefix)
-        rows = [t for t in self._tombstones if owner_in_subtree(t.owner_key, owner_prefix)]
-        rows.sort(key=lambda t: (t.removed_at or _now(), t.document_id), reverse=True)
-        return rows[:limit]
+        rows = [(i, t) for i, t in enumerate(self._tombstones)
+                if owner_in_subtree(t.owner_key, owner_prefix)]
+        # newest first, then most recently written — the Postgres `removed_at DESC, id DESC`
+        rows.sort(key=lambda it: (it[1].removed_at or _now(), it[0]), reverse=True)
+        return [t for _, t in rows[:limit]]
 
     async def prune_tombstones(self, *, before: datetime) -> int:
         keep = [t for t in self._tombstones if (t.removed_at or _now()) >= before]
@@ -1200,15 +1203,15 @@ class InMemoryDocumentStore:
         w = weights or HybridWeights()
         terms = _doc_terms(text)
         served = self._served(owner_key, profile)
-        unavailable = sorted({v.embed_model for _, v in served
-                              if query is None or v.embed_model != embed_model})
+        models = {v.embed_model for _, v in served}
+        unavailable = sorted(models if query is None else models - {embed_model})
+        use_vector = query is not None and not unavailable        # all or none
         hits = []
         for row, v in served:
-            comparable = query is not None and v.embed_model == embed_model
             for chunk in self._chunks.get((row.id, v.version), {}).values():
-                vs = _doc_cosine(query, chunk.embedding) \
-                    if comparable and query is not None and chunk.embedding is not None else None
-                ls = _doc_lexical(terms, chunk.content)
+                vs = clamp_unit(_doc_cosine(query, chunk.embedding)) \
+                    if use_vector and query is not None and chunk.embedding is not None else None
+                ls = clamp_unit(_doc_lexical(terms, chunk.content))
                 if vs is None and ls <= 0:
                     continue
                 hits.append(KbHit(

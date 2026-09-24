@@ -1,5 +1,62 @@
 # Changelog
 
+## Unreleased — documentos: um quarto port, versionado, pesquisado a pedido (F2.4, 2026-09-24)
+
+### Added
+
+- **`DocumentStore`** (`cogno_engram.ports`) com as regras num módulo só
+  (`cogno_engram.documents`), o duplo `InMemoryDocumentStore` e o adaptador
+  `PostgresDocumentStore`. Texto que alguém ESCREVEU para ser lido — Markdown ou PDF —, sem
+  tabela nem leitura em comum com as memórias ou o grafo.
+  - **Dono opaco** (`owner_key`), com a regra de subárvore da casa: `purge_owner_subtree("t1")`
+    apaga `t1` e `t1/…`, nunca `t10`. A engram não sabe o que é tenant nem persona.
+  - **Leitores opacos** (`profiles`) e `profile` OBRIGATÓRIO em toda leitura do caminho do
+    leitor (`search`, `readable_documents`), sem wildcard; branco → `ValueError`. Só a versão
+    SERVIDA em estado `ready` é lida.
+  - **Um modelo por versão** (`embed_model`, rótulo `<spec>@<largura>` com a largura verificada
+    contra a coluna). A busca recebe UM vector e o rótulo; se algum trecho legível for de outro
+    modelo, ou não houver vector, a busca INTEIRA é léxica e marcada
+    `kb_embed_space_unavailable` — nunca um cosseno entre modelos.
+  - **Pontuações cruas em [0, 1], sem piso**: `vector_score` = 1 − distância cosseno cortada a
+    [0, 1] (ou `None` quando não medido), `lexical_score` (Postgres: `ts_rank_cd` com
+    normalização 32), `score` renormalizado — igual ao `lexical_score` numa busca léxica.
+    Dentro de um resultado, ou todos os hits têm `vector_score` ou nenhum. Empates por
+    (documento, versão, ordem).
+  - **Troca de versão atómica** e idempotente por (documento, sha256, modelo); uma falha deixa a
+    versão servida a responder; um trecho nunca se grava sem o seu vector.
+  - **Apagar tira da busca na hora**, leva os originais de TODAS as versões e deixa uma LÁPIDE
+    (ids, versões, quando, quem — sem título nem texto). Um job que acaba depois não escreve nada.
+- **`cogno_engram.chunking`** — em CARACTERES (~2000, 15% de sobreposição), por cabeçalho
+  (Markdown, blocos de código respeitados) ou por página (PDF, com o trilho dos marcadores), cada
+  trecho com o caminho de títulos à cabeça.
+- **`cogno_engram.ingest.ingest()`** — tecto de bytes ANTES do extractor → tentativa registada →
+  extrair → partir → `gate` (antes de embeber: recusa = zero chamadas) → embeber (`pace`, com
+  `TokensPerMinute` pronto) → trechos → troca. DEVOLVE o uso que o embedder reportou
+  (`embedding_tokens`, `embedding_calls`, `usage_reported`); quem cobra é o host. `reindex()` a
+  partir do original guardado; `stale_documents()` lista o trabalho de uma troca global de modelo.
+- **`TextExtractor`** — Protocol ESTRUTURAL (a engram não importa a vox, nem a vox a engram):
+  bytes + tectos por keyword, páginas de texto de volta, ou uma excepção com `reason` de
+  `no_text`/`over_limit`/`encrypted`/`invalid`/`timeout`. O de PDF vive na `cogno-vox`.
+- **`documents_probe()`** — todas as leituras contra um dono vazio, para o `/health` do host.
+  `test_the_probe_passes_on_a_fresh_schema_and_fails_without_any_column` deita abaixo cada
+  coluna de cada tabela `kb_*` (lista lida do catálogo) e exige que a sonda falhe. **Vermelho
+  medido antes do conserto:** com o `_records` a saltar a consulta das versões quando não havia
+  linhas, sete colunas de `kb_versions` caíam sem a sonda dar por isso.
+- **`ensure_schema`** cria `kb_documents`, `kb_versions`, `kb_chunks`, `kb_originals` e
+  `kb_tombstones` (aditivo, `IF NOT EXISTS`; nenhum `ALTER` ao que já existia). Sem índice
+  vectorial em `kb_chunks` de propósito — a busca é limitada aos trechos servidos de um dono;
+  GIN no `tsv`. O original fica numa tabela PRÓPRIA que nenhuma leitura do caminho do leitor lê:
+  `test_the_reader_path_never_reads_an_original` corre o caminho do leitor com um papel sem
+  `SELECT` na coluna dos bytes, e o controlo (`get_original`) é recusado.
+
+### Notes
+
+- **Os backups da base de dados guardam um original até à retenção deles** — a purga não os
+  alcança. A retenção é uma decisão pendente do dono; fica só registada.
+- Os valores léxicos dos dois adaptadores para o mesmo trecho NÃO são iguais (o in-memory mede a
+  fracção de palavras); o contrato é o INTERVALO. O `vector_score` é o mesmo número nos dois
+  (teste de paridade).
+
 ## Unreleased — o vocabulário de status deixa de ser escrito à mão dentro do SQL (2026-08-27)
 
 ### Changed

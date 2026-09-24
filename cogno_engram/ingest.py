@@ -85,6 +85,11 @@ CHARS_PER_TOKEN = 4
 #: Chunks staged per ``add_chunks`` call, so one statement never carries a whole book.
 STAGE_BATCH = 200
 
+#: How long past its own ``timeout_s`` an extractor is waited for before this side gives up.
+#: The extractor owns the real deadline (it kills its own process); this is the belt for an
+#: implementation that never returns.
+EXTRACT_GRACE_S = 5.0
+
 
 @dataclass(frozen=True)
 class IngestOutcome:
@@ -170,12 +175,10 @@ async def _extract(data: bytes, media_type: str, extractor: Any,
     if extractor is None or media_type not in (getattr(extractor, "media_types", None) or ()):
         raise ExtractionError(REASON_EXTRACTOR_UNAVAILABLE, media_type)
     try:
-        # The extractor owns the real deadline (it kills its own process). This one is the
-        # belt: a broken implementation that never returns must not hold the job for ever.
         raw = await asyncio.wait_for(
             extractor.extract(data, media_type=media_type, max_bytes=limits.max_bytes,
                               max_pages=limits.max_pages, timeout_s=limits.timeout_s),
-            timeout=limits.timeout_s + 5.0)
+            timeout=limits.timeout_s + EXTRACT_GRACE_S)
     except asyncio.TimeoutError as exc:
         raise ExtractionError(REASON_TIMEOUT, "extractor did not return") from exc
     except ExtractionError:

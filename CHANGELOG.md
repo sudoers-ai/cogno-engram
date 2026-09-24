@@ -1,8 +1,27 @@
 # Changelog
 
-## Unreleased — a RELEVÂNCIA léxica passa a viver aqui: um tokenizador, um score, um piso (2026-09-24)
+## Unreleased — a DOBRA de texto e a RELEVÂNCIA léxica passam a viver aqui: uma dobra, um tokenizador, um score, um piso (2026-09-24)
 
 ### Added
+
+- **`cogno_engram.textfold`** — `fold(text, *, punctuation=False, apostrophes=False,
+  collapse_whitespace=False, strip=False)`: a ÚNICA dobra de acento e caixa para todo léxico que
+  um consumidor compara, com as diferenças entre consumidores como argumentos que o chamador tem
+  de DIZER. Base: NFKD → marcas combinantes fora → `casefold`, por esta ordem.
+
+  **Veio do host de referência, sem mudar um byte de código** (comparado por AST, docstrings e
+  comentários à parte: as quatro instruções de topo do módulo são idênticas às do host). O host
+  passa a RE-EXPORTÁ-LA (`from cogno_engram.textfold import fold`) e apaga o algoritmo: uma
+  definição, dois repositórios, e o teste de identidade (`is`) do lado do host. Os porquês vão
+  na FORMA: NFKD e não NFD (compatibilidade: ligaduras, numerais romanos, algarismos em círculo,
+  os alfabetos matemáticos em que se escrevem nomes de exibição); a dobra de caixa POR ÚLTIMO
+  (com ela primeiro, os caracteres cuja decomposição de compatibilidade é maiúscula saem
+  maiúsculos e uma segunda dobra muda-os outra vez — com ela por último a dobra é idempotente em
+  todo o Unicode); `casefold` e não `lower` («Straße» é «Strasse»; o sigma final em contexto).
+
+  **`folding.fold_label` fica DISTINTA, e declarada** — é a dobra de CHAVE dos nós, tem de
+  concordar com o `unaccent` do Postgres (translitera, NFD) e não segue esta. Nenhuma linha dela
+  mudou neste PR. As duas diferem em 3 757 code points, e um teste diz isso nos dois sentidos.
 
 - **`cogno_engram.lexical`** — o motor que diz se um candidato é SOBRE a pergunta, e que, quando
   nada é, responde *nothing relevant* em vez de entregar o vizinho mais próximo. Uma recuperação
@@ -10,20 +29,19 @@
   transforma num «não há nada» honesto é um PISO, e um piso precisa de um score que signifique o
   mesmo onde quer que seja tirado.
 
-  **Veio de um host, e veio INTEIRO — não é um motor novo.** Vivia no host de referência
-  (a pesquisa híbrida do `knowledge_search`, em sombra, e o tokenizador do material que o
-  `consult_material` lê). A regra do ecossistema é que o host fica com o negócio e a engenharia
-  sai para as libs: o que aqui chega é o algoritmo; quem pode ler o quê, o tecto de TEMPO do
-  turno, o corte do material e a calibração ficam no host. Os corpos das funções são os mesmos
-  (`graph_candidates` ganhou um parâmetro, abaixo), e **a equivalência foi MEDIDA contra as
-  funções que substitui, não afirmada**: 0 de 1 112 064 code points divergem na dobra, 0 de
-  100 000 cadeias no tokenizador e nos `terms` (prefixos 0/5/6/7), 0 de 400 mundos aleatórios em
-  candidatos, ranking, decisão, `render` e `variants`. O comparador foi provado a ver: contra a
-  dobra de RÓTULOS desta lib (`folding.fold_label`) dá 3 757 code points divergentes.
+  **Veio do host de referência, e veio INTEIRO — não é um motor novo.** Vivia lá (a pesquisa
+  híbrida do `knowledge_search`, em sombra, e o tokenizador do material que o `consult_material`
+  lê). A regra do ecossistema é que o host fica com o negócio e a engenharia sai para as libs: o
+  que aqui chega é o algoritmo; quem pode ler o quê, o tecto de TEMPO do turno, o corte do
+  material e a calibração ficam no host. **A equivalência foi MEDIDA contra as funções que
+  substitui, não afirmada**: 0 de 1 112 064 code points divergem na dobra, 0 de 100 000 cadeias no
+  tokenizador e nos `terms` (prefixos 0/5/6/7), 0 de 400 mundos aleatórios em candidatos,
+  ranking, decisão, `render` e `variants`. O comparador foi provado a ver: contra `fold_label` dá
+  3 757 code points divergentes.
 
-  - **um tokenizador** — `tokens` + `STOPWORDS` (dobra de acento e caixa, plural português,
-    palavras funcionais fora), a ÚNICA definição de palavra que um ranking e todo piso sobre ele
-    partilham (é um objecto: um teste pode afirmar identidade em vez de concordância);
+  - **um tokenizador** — `tokens` + `STOPWORDS` (a `textfold.fold`, o plural português, palavras
+    funcionais fora), a ÚNICA definição de palavra que um ranking e todo piso sobre ele partilham
+    (é um objecto: um teste pode afirmar identidade em vez de concordância);
   - **um score** — `terms`, `relevance` (a fracção das palavras da PERGUNTA que o candidato
     carrega, a melhor das variantes — a reescrita canónica e as palavras do próprio contacto),
     `rank` com herança de UM salto ao longo de um walk do grafo (`HOP_DECAY`) e desempate
@@ -37,13 +55,6 @@
   - **as constantes** — `RELEVANCE_FLOOR` (0,3), `STEM_PREFIX` (0), `HOP_DECAY` (0,5), `TOP_K` (5)
     e **`MAX_CANDIDATES`** (2 000), o tecto de TRABALHO por contagem.
 
-  **`fold` NÃO é `folding.fold_label`, e a diferença é deliberada** (fica escrita nos dois
-  sentidos, com teste): a de rótulos deriva uma CHAVE e tem de concordar com o `unaccent` do
-  Postgres, por isso translitera (`ø`→`o`) e usa NFD; esta decide o que é uma PALAVRA e tem de
-  concordar com os léxicos do consumidor, por isso é NFKD → marcas fora → `casefold`. Reutilizar a
-  de rótulos teria mudado 3 757 code points ao consumidor. A concordância com o consumidor é
-  vigiada do lado que vê os dois (o host), por um pin de comportamento — nunca por esta frase.
-
   **O piso é um ponto desta escala, e a curva que o escolheu é do CONSUMIDOR.** Não há aqui teste
   de calibração, e isso é de propósito: o 0,3 foi escolhido sobre o conjunto rotulado de quem o
   consome (~40 perguntas inventadas, três fontes, quatro leitores), e é esse teste que fixa esta
@@ -53,14 +64,12 @@
 
   **O tecto é por CONTAGEM, e o tamanho de cada candidato é do chamador.** Um ranking é CPU e,
   num event loop, CPU não se interrompe: ~3 MB de candidatos do tamanho de uma secção prenderam o
-  loop ~325–400 ms no `rank` (medido aqui e, antes, no host). Com `MAX_CANDIDATES` ficam em ~22 ms nesta máquina
-  (`tests/test_lexical_cost.py`: o gémeo abaixo de 50 ms e o PAR — o mesmo conjunto sem tecto —
-  acima de 150 ms, para que o gémeo meça o tecto e não uma máquina rápida). 2 000 candidatos de
-  1,5 KB são os mesmos 3 MB outra vez: quem constrói candidatos a partir de um documento grande
-  corta-o antes; os construtores param EM `limit` (pede-se um a mais e sabe-se que o tecto bateu
-  sem construir a cauda).
+  loop ~325–400 ms no `rank` (medido aqui e, antes, no host). Com `MAX_CANDIDATES` ficam em
+  ~22 ms nesta máquina. 2 000 candidatos de 1,5 KB são os mesmos 3 MB outra vez: quem constrói
+  candidatos a partir de um documento grande corta-o antes; os construtores param EM `limit`
+  (pede-se um a mais e sabe-se que o tecto bateu sem construir a cauda).
 
-### Changed (em relação à cópia que substitui)
+### Changed (em relação às cópias que substituem)
 
 - **`graph_candidates(..., baseline_nodes=0)`** — a marca `old` («esta aresta também é do caminho
   ANTIGO») dependia de uma constante do host (quantos nós o caminho antigo anda). É um facto sobre
@@ -71,15 +80,24 @@
   qualificação: é a mesma FORMA, não os mesmos bytes — o detalhe aqui corta a 160 sem reticências,
   lá a 120 com `…`. Mantido como estava porque este é o texto que é PONTUADO, e um corte que mude
   move scores.
+- **Os docstrings de `textfold` perdem os nomes dos módulos do host** que cada passo servia e o
+  caso que ilustrava a ordem; ficam as razões.
 
 ### Testes
 
-- `tests/test_lexical.py` (25) — os sete primeiros MUDARAM-SE com o motor (termos, relevância nas
+- `tests/test_textfold.py` (11) — os sete primeiros MUDARAM-SE com a função (os três passos
+  explícitos, o que a base deixa em paz, a idempotência em todo o Unicode e em 100 000 cadeias, os
+  nomes em letras matemáticas — gerados, não colados —, o conjunto onde a ORDEM mudou e o conjunto
+  onde o `casefold` mudou, sempre como CONJUNTOS e nunca como contagem: a contagem é da base
+  Unicode do Python, e cresce entre 3.10 e 3.12); os restantes são a paridade da FUNÇÃO nesses dois
+  conjuntos (responde à base nova, e as bases antigas divergem lá — o controlo), o `None`, e a
+  `fold_label` declarada distinta.
+- `tests/test_lexical.py` (23) — os sete primeiros MUDARAM-SE com o motor (termos, relevância nas
   duas línguas, o zero que nunca passa, a variante que só entra se acrescenta palavras, o salto
   só para a frente, o desempate, as stopwords no alfabeto do tokenizador), com os fixtures
-  RE-INVENTADOS; os restantes são desta lib (a dobra e o que a separa da de rótulos, o plural e o
-  que ele não faz, o piso nesta escala, ids sem conteúdo, dedupe, `baseline_nodes`, `edge_text`,
-  memórias sem id ou vazias, erro vs nada, top-k, desempate completo, `render`).
+  RE-INVENTADOS; os restantes são desta lib (o plural e o que ele não faz, o piso nesta escala,
+  ids sem conteúdo, dedupe, `baseline_nodes`, `edge_text`, memórias sem id ou vazias, erro vs
+  nada, top-k, desempate completo, `render`).
 - `tests/test_lexical_cost.py` (3) — o gémeo de tempo e o seu par, e o tecto que pára a
   CONSTRUÇÃO e não só o resultado. O relógio é o CPU do processo, com o GC em pausa e **sem
   tracer**: esta CI corre a suíte sob `--cov`, e o tracer de linha quadruplicou a leitura (medido

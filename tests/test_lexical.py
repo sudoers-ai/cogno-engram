@@ -10,11 +10,10 @@ from __future__ import annotations
 import pytest
 
 from cogno_engram import GraphEdge
-from cogno_engram.folding import fold_label
 from cogno_engram.lexical import (DECISION_ERROR, DECISION_NOTHING, DECISION_RELEVANT,
                                   RELEVANCE_FLOOR, SOURCE_GRAPH, SOURCE_MATERIAL,
                                   SOURCE_MEMORY, SOURCES, STOPWORDS, TOP_K, Candidate, chosen,
-                                  decide, edge_end, edge_text, fold, graph_candidates,
+                                  decide, edge_end, edge_text, graph_candidates,
                                   memory_candidates, rank, relevance, render, terms, tokens,
                                   variants)
 
@@ -93,25 +92,7 @@ def test_the_stopword_list_is_stored_in_the_tokenizers_own_alphabet():
     assert not [w for w in STOPWORDS if tokens(w) != [w]]
 
 
-# ── the fold and the tokenizer ───────────────────────────────────────────────────────
-
-
-def test_the_fold_is_nfkd_then_marks_then_casefold():
-    assert fold("Não, está ÓTIMO") == "nao, esta otimo"
-    assert fold("Straße") == "strasse", "casefold, not lower"
-    assert fold("𝐉𝐨𝐚𝐨") == "joao", "NFKD first: compatibility capitals come out lower-case"
-    assert fold(None) == ""
-    for s in ("ᴬ", "ϒ", "℃", "ẞ", "ΟΔΟΣ", "İstanbul", "ﬁnal"):
-        assert fold(fold(s)) == fold(s), s
-
-
-def test_the_word_fold_is_NOT_the_label_fold_and_says_so():
-    """The two folds answer different questions, and the difference is observable: the label
-    fold transliterates (it must agree with Postgres ``unaccent``), the word fold does not. If
-    this ever went green on equality, one of the two docstrings would be lying."""
-    assert fold_label("Øverby") == "overby"
-    assert fold("Øverby") == "øverby"
-    assert tokens("Øverby") == ["verby"], "the ø is not a word character to this tokenizer"
+# ── the tokenizer (its fold is ``textfold.fold``, pinned in ``test_textfold.py``) ──────
 
 
 def test_tokens_fold_the_portuguese_plural_and_nothing_more():
@@ -121,6 +102,7 @@ def test_tokens_fold_the_portuguese_plural_and_nothing_more():
     assert tokens("reposições materiais") == ["reposicoe", "materiai"], "not a stemmer"
     assert tokens("a é x 1") == [], "single characters are never tokens"
     assert tokens("R$ 180,00 às 14h") == ["180", "00", "as", "14h"]
+    assert tokens("Øverby") == ["verby"], "no transliteration: ø is not a word character here"
 
 
 def test_the_floor_is_the_stopword_list_and_nothing_else():

@@ -152,8 +152,9 @@ decision, picked = lexical.decide(lexical.rank(pool, asked), failed=sources_that
 payload = lexical.render(canonical_query, picked)            # each result under a citable id
 ```
 
-* **One tokenizer** (`tokens` + `STOPWORDS`): accent/case fold, Portuguese plural fold, function
-  words dropped. Hand the SAME callable to a ranking and to every floor over it.
+* **One tokenizer** (`tokens` + `STOPWORDS`): the accent/case fold (`textfold.fold`, below),
+  Portuguese plural fold, function words dropped. Hand the SAME callable to a ranking and to
+  every floor over it.
 * **One score** (`relevance`): the share of the question's meaning-carrying words a candidate
   carries, the better of the query variants; a one-hop inheritance along a graph walk
   (`HOP_DECAY`); a deterministic tie-break.
@@ -171,6 +172,15 @@ fetched with your audience and your scopes. Why lexical and not a vector distanc
 a cosine is a number about the embedder, while the share of folded words is the same number in a
 unit test and in production. The price is stated in the module: a paraphrase that shares no word
 with the question scores zero.
+
+### One fold — `cogno_engram.textfold`
+
+`fold(text, *, punctuation=False, apostrophes=False, collapse_whitespace=False, strip=False)` is
+the accent and case fold for every lexicon you compare against: NFKD → combining marks dropped →
+`casefold`, in that order, idempotent over all of Unicode, with each consumer's extra step as a
+keyword it has to SAY. Use it rather than a private copy — a copy that drifts moves a match with
+no red anywhere. It is NOT a key fold: the graph's node identity is `folding.fold_label`, which
+must agree with Postgres `unaccent` and deliberately differs.
 
 ## EngramBench
 

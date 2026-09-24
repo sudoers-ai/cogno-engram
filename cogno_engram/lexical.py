@@ -45,30 +45,18 @@ must stay Portuguese to work: it is what the tokenizer is FOR.
 from __future__ import annotations
 
 import re
-import unicodedata
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional, Sequence
 
+from cogno_engram.textfold import fold
+
 # ── words ────────────────────────────────────────────────────────────────────────────
-
-
-def fold(text: Optional[str]) -> str:
-    """Case- and accent-fold ``text`` for WORD matching: NFKD, combining marks dropped, then
-    ``casefold()`` — in that order, so the fold is idempotent over every code point (with the
-    case fold FIRST, characters whose compatibility decomposition is upper-case, such as the
-    mathematical alphabets people type display names in, come out upper-case and a second fold
-    changes them again). ``None`` folds to ``""``.
-
-    **Not** :func:`cogno_engram.folding.fold_label`, and the difference is deliberate. That one
-    derives a KEY a node is stored under and must agree with Postgres ``unaccent`` — so it
-    transliterates (``ø``→``o``, ``æ``→``ae``, ``ł``→``l``) and uses NFD. This one decides what a
-    WORD is for a ranking, and a consumer's own lexicons (the host's) must fold every letter
-    exactly as this does, or a word one side finds the other cannot: the two agree with each
-    other by a behaviour pin kept on the side that can see both, never by this sentence.
-    """
-    folded = unicodedata.normalize("NFKD", text or "")
-    return "".join(ch for ch in folded if not unicodedata.combining(ch)).casefold()
-
+#
+# The fold is :func:`cogno_engram.textfold.fold` — the ONE accent/case fold, the same object a
+# consumer's own lexicons use, never a second spelling of it. Not
+# :func:`cogno_engram.folding.fold_label`: that one derives a KEY and must agree with Postgres
+# ``unaccent`` (it transliterates), and measured against this fold it differs on 3,757 code
+# points — a word it found this tokenizer would not, and the other way round.
 
 _WORD = re.compile(r"[a-z0-9]{2,}")
 
@@ -97,7 +85,8 @@ def _singular(token: str) -> str:
 def tokens(text: str) -> "list[str]":
     """What a word is — the ONE definition a ranking and every floor over it share.
 
-    :func:`fold`, then every run of two or more ``[a-z0-9]``, each through :func:`_singular`.
+    :func:`~cogno_engram.textfold.fold` (no keyword step), then every run of two or more
+    ``[a-z0-9]``, each through :func:`_singular`.
     A consumer that ranks with one tokenizer and filters with another has two chances to
     disagree about the same sentence; pass THIS callable to both (it is one object, so a test
     can assert identity rather than agreement).

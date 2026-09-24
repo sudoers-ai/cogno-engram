@@ -923,7 +923,7 @@ def _doc_cosine(a: list[float], b: list[float]) -> float:
 
 def _doc_terms(text: str) -> "set[str]":
     """The words of ``text`` for the in-memory lexical stand-in: the GENERAL fold
-    (:func:`cogno_engram.textfold.fold`, no keyword step), then ``\w+``, and NO stopwords — a
+    (:func:`cogno_engram.textfold.fold`, no keyword step), then ``\\w+``, and NO stopwords — a
     neutral stand-in, like Postgres ``simple`` plus accent folding. Not the graph's LABEL fold
     (``cogno_engram.folding``): that is an IDENTITY rule, and borrowing it would make a change to
     how labels are folded silently move how documents are matched — this section may not even

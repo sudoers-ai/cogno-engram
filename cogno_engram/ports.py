@@ -1,12 +1,14 @@
 """
 cogno_engram.ports — the capability-scoped Protocols (hexagonal ports).
 
-Three independent ports, each matching the data model that fits it:
+Four independent ports, each matching the data model that fits it:
 
   * ``MemoryStore``       — sessions / turns / memories + hybrid retrieval
                             (relational/document with optional vector search)
   * ``ConversationBuffer``— the sliding short-term window (KV-shaped)
   * ``KnowledgeGraph``    — nodes / edges / multi-hop walk (graph-shaped)
+  * ``DocumentStore``     — published documents: versions, chunks, hybrid search
+                            (see ``cogno_engram.documents``)
 
 There is deliberately NO universal "any DB" store — forcing one interface over
 relational + KV + graph collapses to a lowest-common-denominator that throws
@@ -22,7 +24,15 @@ from __future__ import annotations
 
 from contextlib import AbstractAsyncContextManager
 from datetime import datetime
-from typing import Optional, Protocol, runtime_checkable
+from typing import Optional, Protocol, Sequence, runtime_checkable
+
+from cogno_engram.documents import (
+    KbChunk,
+    KbDocument,
+    KbSearchResult,
+    KbTombstone,
+    KbVersion,
+)
 
 from cogno_engram.types import (
     GraphEdge,
@@ -268,3 +278,103 @@ class KnowledgeGraph(Protocol):
     # Right-to-be-forgotten: hard-delete EVERY node + edge for a scope (the graph half of the
     # host's scope offboarding; pair with ``MemoryStore.purge_scope``). Returns rows removed.
     async def purge_scope(self, scope: str) -> int: ...
+
+
+@runtime_checkable
+class DocumentStore(Protocol):
+    """Published documents — owned by an OPAQUE ``owner_key``, read by OPAQUE ``profile`` labels,
+    versioned, chunked and searched. The rules are written once, in ``cogno_engram.documents``;
+    this port is their surface.
+
+    **Two kinds of read, and the difference is who is reading.**
+
+    * The READER path — :meth:`search` and :meth:`readable_documents` — is what a contact's turn
+      calls. ``profile`` is a REQUIRED keyword with no default and no wildcard: forgetting it is
+      a ``TypeError`` at the call, a blank one a ``ValueError``. Only the SERVED version of a
+      document in state ``ready`` is ever read, and only when ``profile`` is one it is
+      published to.
+    * The MANAGEMENT path — :meth:`get_document`, :meth:`list_documents`, :meth:`get_original`,
+      :meth:`tombstones` — is what the owner's administrator calls to see and fix what they
+      uploaded. It takes no profile because the administrator sees everything they own; a host
+      must never call it on a contact's turn.
+
+    **The write path is the ingestion's** (``cogno_engram.ingest.ingest`` composes it):
+    ``begin_version`` → ``add_chunks`` → ``commit_version`` (atomic swap) or ``fail_version``.
+    Every write is CONDITIONAL on the document still existing under ``owner_key``: a job that
+    finishes after a delete or a purge writes nothing and is told so (``commit_version`` returns
+    ``deleted``), so no late writer can put a removed document back into a search.
+    """
+
+    #: The vector width of this store's column. Every model label and vector is checked against it.
+    embedding_dim: int
+
+    # ── management ───────────────────────────────────────────────────────
+    # ``max_documents`` is enforced in the same statement that inserts, so two concurrent
+    # uploads cannot both pass a count taken before either wrote. Raises
+    # ``documents.DocumentLimitReached`` past it.
+    async def create_document(self, owner_key: str, *, title: str, profiles: Sequence[str],
+                              media_type: str,
+                              max_documents: Optional[int] = None) -> KbDocument: ...
+    async def get_document(self, owner_key: str, document_id: str) -> Optional[KbDocument]: ...
+    async def list_documents(self, owner_key: str) -> list[KbDocument]: ...
+    # Who may read it — takes effect on the next search, no re-indexing.
+    async def set_profiles(self, owner_key: str, document_id: str,
+                           profiles: Sequence[str]) -> bool: ...
+    async def get_original(self, owner_key: str, document_id: str, *,
+                           version: Optional[int] = None) -> Optional[bytes]: ...
+
+    # ── ingestion (see cogno_engram.ingest) ──────────────────────────────
+    # Idempotent by ``(document, sha256, embed_model)``: an attempt at content+model already
+    # recorded returns THAT version (``ready`` → nothing to do; ``processing``/``error`` → reset
+    # to ``processing`` and resumed) instead of numbering a new one. ``None`` when the document
+    # does not exist under ``owner_key``. ``original`` is refused past the store's ceiling BEFORE
+    # anything is written.
+    async def begin_version(self, owner_key: str, document_id: str, *, sha256: str,
+                            embed_model: str, size_bytes: int,
+                            original: Optional[bytes] = None) -> Optional[KbVersion]: ...
+    # Upserts by ordinal (a retried job does not duplicate). ``False`` when the version is no
+    # longer ``processing`` under this owner — deleted, superseded, or already finished.
+    async def add_chunks(self, owner_key: str, document_id: str, version: int,
+                         chunks: Sequence[KbChunk]) -> bool: ...
+    # The ATOMIC SWAP: in one transaction the version becomes ``ready`` and served, and every
+    # OLDER version (its chunks and its original) is removed. Returns ``documents.COMMIT_*``.
+    async def commit_version(self, owner_key: str, document_id: str, version: int, *,
+                             pages: int) -> str: ...
+    # The served version, if any, keeps answering. ``False`` when there was nothing to mark.
+    async def fail_version(self, owner_key: str, document_id: str, version: int, *,
+                           reason: str) -> bool: ...
+
+    # ── removal ──────────────────────────────────────────────────────────
+    # Out of every search AT ONCE (the same statement removes the rows every read joins on),
+    # with the originals of EVERY version, leaving one tombstone. ``actor`` is the caller's
+    # opaque label for who asked.
+    async def delete_document(self, owner_key: str, document_id: str, *,
+                              actor: str = "") -> bool: ...
+    # Every document whose owner IS ``owner_prefix`` or lies under ``owner_prefix/…`` — the
+    # store-wide subtree rule, so ``"t1"`` never reaches ``"t10"``. One tombstone per document.
+    # Returns the number of documents removed.
+    async def purge_owner_subtree(self, owner_prefix: str, *, actor: str = "") -> int: ...
+    async def tombstones(self, owner_prefix: str, *, limit: int = 100) -> list[KbTombstone]: ...
+    async def prune_tombstones(self, *, before: datetime) -> int: ...
+    # Bytes of originals still stored under a subtree — what a purge must bring to zero.
+    async def stored_original_bytes(self, owner_prefix: str) -> int: ...
+
+    # ── the reader path ──────────────────────────────────────────────────
+    # The served, ready documents ``profile`` may read — what decides whether a tool that
+    # searches them is offered at all, and whose titles describe it.
+    async def readable_documents(self, owner_key: str, *, profile: str) -> list[KbDocument]: ...
+    # Hybrid search over the SERVED version of every ready document ``profile`` may read.
+    # ``vector`` is compared ONLY with chunks whose recorded model equals ``embed_model``; every
+    # other readable chunk is scored lexically and reported in ``models_unavailable`` with the
+    # ``kb_embed_space_unavailable`` degradation. RAW scores, no floor; ties by
+    # ``(document, version, ordinal)``. Never reads a stored original.
+    async def search(self, owner_key: str, *, profile: str, text: str,
+                     vector: Optional[list[float]] = None, embed_model: Optional[str] = None,
+                     limit: int = 5,
+                     weights: Optional[HybridWeights] = None) -> KbSearchResult: ...
+
+    # ── maintenance ──────────────────────────────────────────────────────
+    # Documents whose SERVED version was indexed by a model other than ``embed_model`` — the
+    # work list of a re-index after a global model swap. Cross-owner on purpose (like
+    # ``MemoryStore.memory_scopes``): the swap is global, and so is the list.
+    async def stale_documents(self, *, embed_model: str, limit: int = 100) -> list[KbDocument]: ...

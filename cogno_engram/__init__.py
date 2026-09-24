@@ -1,15 +1,34 @@
 """cogno-engram — persistence substrate for the Cogno cognitive pipeline."""
 
-from cogno_engram import hypnos, maintenance, write_loss
-from cogno_engram.adapters.in_memory import InMemoryBuffer, InMemoryGraph, InMemoryStore
+from cogno_engram import chunking, documents, hypnos, ingest, maintenance, write_loss
+from cogno_engram.adapters.in_memory import (
+    InMemoryBuffer,
+    InMemoryDocumentStore,
+    InMemoryGraph,
+    InMemoryStore,
+)
 from cogno_engram.graph_context import format_graph_context, ingest_entities
 from cogno_engram.reranker import RerankConfig, recency_score, rerank
 from cogno_engram.ports import (
     ConversationBuffer,
+    DocumentStore,
     KnowledgeGraph,
     MemoryStore,
     SupportsVectorSearch,
 )
+from cogno_engram.documents import (
+    KB_EMBED_SPACE_UNAVAILABLE,
+    KbChunk,
+    KbDocument,
+    KbHit,
+    KbSearchResult,
+    KbTombstone,
+    KbVersion,
+    TextExtractor,
+    embed_model_label,
+)
+from cogno_engram.ingest import IngestOutcome, documents_probe
+from cogno_engram.ingest import ingest as ingest_document
 from cogno_engram.types import (
     DEFAULT_CONFIDENCE,
     AUDIENCE_STAFF,
@@ -56,12 +75,17 @@ __all__ = [
     "__version__",
     # ports
     "MemoryStore", "SupportsVectorSearch", "ConversationBuffer", "KnowledgeGraph",
+    "DocumentStore",
+    # documents (see cogno_engram.documents / .chunking / .ingest)
+    "documents", "chunking", "ingest", "ingest_document", "documents_probe", "IngestOutcome",
+    "KbDocument", "KbVersion", "KbChunk", "KbHit", "KbSearchResult", "KbTombstone",
+    "TextExtractor", "embed_model_label", "KB_EMBED_SPACE_UNAVAILABLE",
     # types
     "Session", "TurnRecord", "TurnTrace", "MemoryRecord", "GraphNode", "GraphEdge", "NodeContext", "GraphStats",
     "RetrievalQuery", "HybridWeights", "SessionSummary",
     "DEFAULT_CONFIDENCE", "VALID_NODE_TYPES",
     # reference adapters
-    "InMemoryStore", "InMemoryBuffer", "InMemoryGraph",
+    "InMemoryStore", "InMemoryBuffer", "InMemoryGraph", "InMemoryDocumentStore",
     # consolidation + maintenance + reranking + graph helpers
     "hypnos", "maintenance", "rerank", "RerankConfig", "recency_score",
     "ingest_entities", "format_graph_context",

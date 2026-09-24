@@ -42,6 +42,12 @@ atomic swap, or ends in ``error`` with a reason from a closed alphabet — and t
 still answers. Deleting a document takes it out of every search at once, removes its stored
 originals of EVERY version, and leaves a TOMBSTONE (what was removed, when, by whom — no content).
 
+**Two steps when the cost must be confirmed first.** An upload can stop half-way on purpose: it
+is extracted and chunked, its embedding cost is ESTIMATED from the chunks, and the version waits
+in ``awaiting_confirmation`` — nothing embedded, nothing spent — until the uploader confirms it
+(``cogno_engram.ingest.prepare`` then ``commit``). A draft nobody confirms EXPIRES (24 h by
+default, on the caller's clock) and leaves a tombstone like any other removal.
+
 **The original file is stored in the database, in its own table** (``kb_originals`` in
 Postgres), so it lives outside any repository and inside every purge by construction — the row
 that holds it cascades from the document. It is never read by a search: the search reads chunks
@@ -55,14 +61,17 @@ from __future__ import annotations
 import math
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Iterable, Optional, Protocol, Sequence, runtime_checkable
 
 # ── states ───────────────────────────────────────────────────────────────────────────
 KB_PROCESSING = "processing"
+#: Extracted, chunked and costed, NOT embedded — waiting for the uploader to confirm the cost.
+KB_AWAITING_CONFIRMATION = "awaiting_confirmation"
 KB_READY = "ready"
 KB_ERROR = "error"
-VALID_KB_STATES: frozenset[str] = frozenset({KB_PROCESSING, KB_READY, KB_ERROR})
+VALID_KB_STATES: frozenset[str] = frozenset({KB_PROCESSING, KB_AWAITING_CONFIRMATION, KB_READY,
+                                             KB_ERROR})
 
 # ── why an extraction failed — the EXTRACTOR's closed alphabet ───────────────────────
 #
@@ -89,10 +98,11 @@ REASON_UNSUPPORTED_TYPE = "unsupported_type"        # not Markdown, not PDF
 REASON_EXTRACTOR_UNAVAILABLE = "extractor_unavailable"   # no extractor for this type is wired
 REASON_GATE_REFUSED = "gate_refused"                # the caller's pre-embedding gate said no
 REASON_EMBED_FAILED = "embed_failed"                # the embedder raised or answered the wrong width
+REASON_EXPIRED = "expired"                          # a draft nobody confirmed before `expires_at`
 REASON_INTERNAL = "internal"                        # anything else — the log has the detail
 VALID_KB_REASONS: frozenset[str] = EXTRACTOR_REASONS | frozenset({
     REASON_UNSUPPORTED_TYPE, REASON_EXTRACTOR_UNAVAILABLE, REASON_GATE_REFUSED,
-    REASON_EMBED_FAILED, REASON_INTERNAL,
+    REASON_EMBED_FAILED, REASON_EXPIRED, REASON_INTERNAL,
 })
 
 # ── media types ──────────────────────────────────────────────────────────────────────
@@ -118,7 +128,17 @@ VALID_COMMIT_OUTCOMES: frozenset[str] = frozenset({COMMIT_READY, COMMIT_DELETED,
 # ── tombstones ───────────────────────────────────────────────────────────────────────
 TOMBSTONE_DELETED = "deleted"      # one document, removed on request
 TOMBSTONE_PURGED = "purged"        # removed by a subtree purge
-VALID_TOMBSTONE_KINDS: frozenset[str] = frozenset({TOMBSTONE_DELETED, TOMBSTONE_PURGED})
+TOMBSTONE_EXPIRED = "expired"      # a draft nobody confirmed: its chunks and original removed
+VALID_TOMBSTONE_KINDS: frozenset[str] = frozenset({TOMBSTONE_DELETED, TOMBSTONE_PURGED,
+                                                   TOMBSTONE_EXPIRED})
+
+# ── claiming a draft for its commit ──────────────────────────────────────────────────
+#: How long an unconfirmed draft lives by default. A mechanism default — a host passes its own.
+DRAFT_TTL = timedelta(hours=24)
+CLAIM_OK = "claimed"               # the draft is this caller's; the version is `processing` now
+CLAIM_EXPIRED = "expired"          # past its `expires_at` on the caller's clock — not claimed
+CLAIM_MISSING = "missing"          # no draft for that version (never prepared, or claimed already)
+VALID_CLAIM_OUTCOMES: frozenset[str] = frozenset({CLAIM_OK, CLAIM_EXPIRED, CLAIM_MISSING})
 
 
 def sanitize_reason(raw: object) -> str:
@@ -254,6 +274,13 @@ class KbVersion:
     has_original: bool = False
     created_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
+    #: The embedding cost estimated at PREPARE, over the exact chunks the commit will embed —
+    #: 0 for a version that never waited for confirmation. Kept after the draft is gone, so
+    #: "what was the uploader shown" stays answerable.
+    estimated_tokens: int = 0
+    #: When the draft stops being confirmable (``prepare``'s clock + ttl); ``None`` for a version
+    #: that never waited for confirmation.
+    expires_at: Optional[datetime] = None
 
 
 @dataclass(frozen=True)
@@ -367,6 +394,28 @@ def clamp_unit(x: float) -> float:
     """``x`` cut to ``[0, 1]`` — both components of a score live on that scale, or the linear
     fusion below would be mixing units."""
     return 0.0 if x != x else max(0.0, min(1.0, float(x)))
+
+
+@dataclass(frozen=True)
+class KbDraft:
+    """A prepared version waiting for confirmation: its chunks WITHOUT vectors, the pages it was
+    read from, the embedding cost ESTIMATED over those exact chunks, and when it expires.
+
+    ``estimated_tokens`` and ``expires_at`` are the VERSION's (persisted there, so they outlive
+    the draft); ``estimated_tokens`` is computed ONCE, at prepare, over the chunks stored here —
+    the number shown to the uploader, the number the commit's gate is handed, and the chunks the
+    commit embeds are therefore the same set by construction. ``chunks`` is empty in a listing
+    (``DocumentStore.pending_drafts``), which carries ``chunk_count`` instead."""
+
+    document_id: str
+    version: int
+    embed_model: str
+    chunk_count: int
+    pages: int
+    estimated_tokens: int
+    expires_at: datetime
+    chunks: tuple[KbChunk, ...] = ()
+    created_at: Optional[datetime] = None
 
 
 def hybrid_score(vector_score: Optional[float], lexical_score: float, *,

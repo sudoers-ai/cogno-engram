@@ -29,6 +29,7 @@ from typing import Optional, Protocol, Sequence, runtime_checkable
 from cogno_engram.documents import (
     KbChunk,
     KbDocument,
+    KbDraft,
     KbSearchResult,
     KbTombstone,
     KbVersion,
@@ -343,8 +344,35 @@ class DocumentStore(Protocol):
     async def commit_version(self, owner_key: str, document_id: str, version: int, *,
                              pages: int) -> str: ...
     # The served version, if any, keeps answering. ``False`` when there was nothing to mark.
+    # Failing a DRAFT (``awaiting_confirmation``) drops the draft with it.
     async def fail_version(self, owner_key: str, document_id: str, version: int, *,
                            reason: str) -> bool: ...
+    # One version of one document of this owner, any state — ``None`` when there is none.
+    async def get_version(self, owner_key: str, document_id: str,
+                          version: int) -> Optional[KbVersion]: ...
+
+    # ── the two-step ingestion (prepare → confirm → commit) ─────────────
+    # Park a ``processing`` version as a DRAFT: its chunks WITHOUT vectors, the estimate made
+    # over those chunks, and when it expires; the version becomes ``awaiting_confirmation``.
+    # ``False`` when the version is no longer ``processing`` under this owner.
+    async def save_draft(self, owner_key: str, document_id: str, version: int, *,
+                         chunks: Sequence[KbChunk], pages: int, estimated_tokens: int,
+                         expires_at: datetime) -> bool: ...
+    # TAKE the draft for its commit, atomically: ``(CLAIM_OK, draft)`` flips the version to
+    # ``processing`` and removes the draft, so two confirmations cannot both embed it. A draft
+    # past ``expires_at`` on the caller's ``now`` is NOT claimed (``CLAIM_EXPIRED``); no draft
+    # at all is ``CLAIM_MISSING``.
+    async def claim_draft(self, owner_key: str, document_id: str, version: int, *,
+                          now: datetime) -> "tuple[str, Optional[KbDraft]]": ...
+    # The drafts waiting for this owner's confirmation — for the UI's "confirm ~N tokens".
+    # Summaries (``chunks`` empty, ``chunk_count`` set); never another owner's.
+    async def pending_drafts(self, owner_key: str) -> list[KbDraft]: ...
+    # The expiry sweep a host runs on its tick — cross-owner, like ``stale_documents``. Every
+    # ``awaiting_confirmation`` version whose ``expires_at <= now`` becomes ``error`` with reason
+    # ``expired``; its draft chunks and its stored original are removed, and a tombstone
+    # (``kind="expired"``) is written. The version row stays, so the uploader sees why. Returns
+    # how many expired.
+    async def expire_drafts(self, *, now: datetime, limit: int = 100) -> int: ...
 
     # ── removal ──────────────────────────────────────────────────────────
     # Out of every search AT ONCE (the same statement removes the rows every read joins on),

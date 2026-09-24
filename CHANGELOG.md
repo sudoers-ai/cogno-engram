@@ -1,5 +1,88 @@
 # Changelog
 
+## Unreleased — a RELEVÂNCIA léxica passa a viver aqui: um tokenizador, um score, um piso (2026-09-24)
+
+### Added
+
+- **`cogno_engram.lexical`** — o motor que diz se um candidato é SOBRE a pergunta, e que, quando
+  nada é, responde *nothing relevant* em vez de entregar o vizinho mais próximo. Uma recuperação
+  por PROXIMIDADE tem sempre um mais próximo, portanto devolve sempre alguma coisa; o que a
+  transforma num «não há nada» honesto é um PISO, e um piso precisa de um score que signifique o
+  mesmo onde quer que seja tirado.
+
+  **Veio de um host, e veio INTEIRO — não é um motor novo.** Vivia no host de referência
+  (a pesquisa híbrida do `knowledge_search`, em sombra, e o tokenizador do material que o
+  `consult_material` lê). A regra do ecossistema é que o host fica com o negócio e a engenharia
+  sai para as libs: o que aqui chega é o algoritmo; quem pode ler o quê, o tecto de TEMPO do
+  turno, o corte do material e a calibração ficam no host. Os corpos das funções são os mesmos
+  (`graph_candidates` ganhou um parâmetro, abaixo), e **a equivalência foi MEDIDA contra as
+  funções que substitui, não afirmada**: 0 de 1 112 064 code points divergem na dobra, 0 de
+  100 000 cadeias no tokenizador e nos `terms` (prefixos 0/5/6/7), 0 de 400 mundos aleatórios em
+  candidatos, ranking, decisão, `render` e `variants`. O comparador foi provado a ver: contra a
+  dobra de RÓTULOS desta lib (`folding.fold_label`) dá 3 757 code points divergentes.
+
+  - **um tokenizador** — `tokens` + `STOPWORDS` (dobra de acento e caixa, plural português,
+    palavras funcionais fora), a ÚNICA definição de palavra que um ranking e todo piso sobre ele
+    partilham (é um objecto: um teste pode afirmar identidade em vez de concordância);
+  - **um score** — `terms`, `relevance` (a fracção das palavras da PERGUNTA que o candidato
+    carrega, a melhor das variantes — a reescrita canónica e as palavras do próprio contacto),
+    `rank` com herança de UM salto ao longo de um walk do grafo (`HOP_DECAY`) e desempate
+    determinístico, `chosen`, `variants`;
+  - **uma decisão** — `decide` sobre um alfabeto fechado (`DECISION_RELEVANT`/`_NOTHING`/`_ERROR`):
+    uma fonte que PARTIU nunca se lê como uma fonte que não tem nada;
+  - **candidatos a partir dos tipos DESTA lib** — `graph_candidates` (os `(variant, rank, node_id,
+    edges)` de um walk), `memory_candidates` (registos de memória), `edge_text`, `edge_end`, cada
+    um com um id SEM CONTEÚDO (`edge:<nó>.<n>`, `mem:<id>`) que uma resposta cita e um traço pode
+    guardar; `render` é o payload com esses ids;
+  - **as constantes** — `RELEVANCE_FLOOR` (0,3), `STEM_PREFIX` (0), `HOP_DECAY` (0,5), `TOP_K` (5)
+    e **`MAX_CANDIDATES`** (2 000), o tecto de TRABALHO por contagem.
+
+  **`fold` NÃO é `folding.fold_label`, e a diferença é deliberada** (fica escrita nos dois
+  sentidos, com teste): a de rótulos deriva uma CHAVE e tem de concordar com o `unaccent` do
+  Postgres, por isso translitera (`ø`→`o`) e usa NFD; esta decide o que é uma PALAVRA e tem de
+  concordar com os léxicos do consumidor, por isso é NFKD → marcas fora → `casefold`. Reutilizar a
+  de rótulos teria mudado 3 757 code points ao consumidor. A concordância com o consumidor é
+  vigiada do lado que vê os dois (o host), por um pin de comportamento — nunca por esta frase.
+
+  **O piso é um ponto desta escala, e a curva que o escolheu é do CONSUMIDOR.** Não há aqui teste
+  de calibração, e isso é de propósito: o 0,3 foi escolhido sobre o conjunto rotulado de quem o
+  consome (~40 perguntas inventadas, três fontes, quatro leitores), e é esse teste que fixa esta
+  constante — uma mudança aqui que mova o óptimo fica vermelha lá, no bump do pino.
+  `test_the_default_floor_keeps_a_third_and_drops_a_quarter` diz o que 0,3 FAZ nesta escala, não
+  porque é 0,3.
+
+  **O tecto é por CONTAGEM, e o tamanho de cada candidato é do chamador.** Um ranking é CPU e,
+  num event loop, CPU não se interrompe: ~3 MB de candidatos do tamanho de uma secção prenderam o
+  loop ~325–400 ms no `rank` (medido aqui e, antes, no host). Com `MAX_CANDIDATES` ficam em ~22 ms nesta máquina
+  (`tests/test_lexical_cost.py`: o gémeo abaixo de 50 ms e o PAR — o mesmo conjunto sem tecto —
+  acima de 150 ms, para que o gémeo meça o tecto e não uma máquina rápida). 2 000 candidatos de
+  1,5 KB são os mesmos 3 MB outra vez: quem constrói candidatos a partir de um documento grande
+  corta-o antes; os construtores param EM `limit` (pede-se um a mais e sabe-se que o tecto bateu
+  sem construir a cauda).
+
+### Changed (em relação à cópia que substitui)
+
+- **`graph_candidates(..., baseline_nodes=0)`** — a marca `old` («esta aresta também é do caminho
+  ANTIGO») dependia de uma constante do host (quantos nós o caminho antigo anda). É um facto sobre
+  o OUTRO caminho, portanto passa a ser um argumento; `0` não marca nenhuma. O host passa o seu.
+- **`edge_end`** — era `_end`, privada, e o bench do host importava-a; um nome privado importado de
+  fora de uma lib é uma API que ninguém declarou.
+- **O docstring de `edge_text` deixa de dizer «a MESMA forma que o `format_graph_context`»** sem
+  qualificação: é a mesma FORMA, não os mesmos bytes — o detalhe aqui corta a 160 sem reticências,
+  lá a 120 com `…`. Mantido como estava porque este é o texto que é PONTUADO, e um corte que mude
+  move scores.
+
+### Testes
+
+- `tests/test_lexical.py` (24) — os sete primeiros MUDARAM-SE com o motor (termos, relevância nas
+  duas línguas, o zero que nunca passa, a variante que só entra se acrescenta palavras, o salto
+  só para a frente, o desempate, as stopwords no alfabeto do tokenizador), com os fixtures
+  RE-INVENTADOS; os restantes são desta lib (a dobra e o que a separa da de rótulos, o plural e o
+  que ele não faz, o piso nesta escala, ids sem conteúdo, dedupe, `baseline_nodes`, `edge_text`,
+  memórias sem id ou vazias, erro vs nada, top-k, desempate completo, `render`).
+- `tests/test_lexical_cost.py` (3) — o gémeo de tempo e o seu par, e o tecto que pára a
+  CONSTRUÇÃO e não só o resultado.
+
 ## Unreleased — o vocabulário de status deixa de ser escrito à mão dentro do SQL (2026-08-27)
 
 ### Changed

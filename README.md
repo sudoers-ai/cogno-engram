@@ -111,7 +111,12 @@ rules live in one module, `cogno_engram.documents`:
   once), hands the gate that same estimate, embeds and swaps; a second commit is `unchanged`.
   `expire_drafts(now=…)` — the sweep a host runs on its tick — turns every unconfirmed draft
   past its expiry into `error`/`expired`, removes its draft and its stored original, and leaves a
-  tombstone. `ingest()` is `prepare()` + `commit()` back to back.
+  tombstone. `discard_draft(...)` does the same NOW, on the uploader's request (an upload made
+  by mistake must not keep its original for a day), and only to a draft. `interrupt_stale(
+  older_than=…)` — the other tick sweep — ends every `processing` version whose `claimed_at` is
+  older (a crashed prepare, a commit that died after claiming its draft) as
+  `error`/`interrupted`, so no version stays `processing` beyond its process. `ingest()` is
+  `prepare()` + `commit()` back to back.
 - **Delete is immediate and leaves a tombstone.** The originals of every version go with it
   (they live in their own table, which no search joins); a job finishing after the delete
   writes nothing.

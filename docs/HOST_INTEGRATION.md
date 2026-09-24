@@ -189,7 +189,8 @@ contacts. The split with the host, piece by piece:
 ```python
 from cogno_engram import documents_probe, embed_model_label
 from cogno_engram.adapters.postgres import PostgresDocumentStore
-from cogno_engram.ingest import TokensPerMinute, commit, expire_drafts, ingest, prepare
+from cogno_engram.ingest import (TokensPerMinute, commit, discard_draft, expire_drafts, ingest,
+                                 interrupt_stale, prepare)
 
 docs = PostgresDocumentStore(dsn=DSN, ts_config="portuguese", unaccent=True)
 # ...built by ensure_schema(conn, ts_config="portuguese", unaccent=True) — the SAME two values
@@ -216,6 +217,10 @@ done = await commit(docs, owner, doc.id, draft.version, embedder=embedder, embed
 ledger.record(tenant_id, stage="kb_ingest", tokens=done.embedding_tokens)
 # on the host's tick: every unconfirmed draft past expires_at → error/expired + tombstone
 await expire_drafts(docs, now=clock())
+# …and every `processing` version whose worker is gone (claimed_at older than 30 min)
+await interrupt_stale(docs, older_than=clock() - timedelta(minutes=30))
+# the uploader withdraws a draft: its original goes NOW, not in 24 h
+await discard_draft(docs, owner, doc.id, draft.version, actor=admin_id)  # "discarded"|"not_a_draft"|"missing"
 
 # a turn (the reader path): profile is REQUIRED, and it is the reader's, not the model's
 res = await docs.search(owner, profile=identity_role, text=original_text,
@@ -246,7 +251,13 @@ res = await docs.search(owner, profile=identity_role, text=original_text,
   `expired` (past `expires_at` and not yet swept — nothing changed), `error`, `deleted`,
   `superseded`. The expiry is the ENGRAM's rule: call `expire_drafts(docs, now=clock())` on the
   tick and read `KbVersion.state`/`reason`; do not re-implement the 24 h in the host.
-  `pending_drafts(owner)` lists what waits for confirmation (no text).
+  `pending_drafts(owner)` lists what waits for confirmation (no text). `discard_draft` is the
+  privacy half of the same rule (condition (e): a delete takes effect at once): it applies to a
+  draft only and answers `not_a_draft` for anything else — a served version is removed with
+  `delete_document`, never by discarding. `interrupt_stale` is the second tick sweep: a
+  `processing` version is judged by `claimed_at` (when it last entered `processing` — begun, or
+  claimed by a commit), never by `created_at`, so a draft confirmed a minute ago is not ended
+  for having been uploaded an hour ago.
 - **Purge.** A tenant purge calls `purge_owner_subtree(tenant_prefix)`: every document under
   the prefix goes, with the chunks and the stored originals of every version, and one
   tombstone per document (ids, versions, when, who — no title, no text). `prune_tombstones`

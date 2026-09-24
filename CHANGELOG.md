@@ -23,6 +23,22 @@
   `expires_at` por `ADD COLUMN` verificado no catálogo, e um índice PARCIAL sobre os rascunhos.
 - **`ingest()`** mantém a assinatura e é `prepare()` + `commit()` seguidos — um teste compara os
   dois caminhos campo a campo.
+- **`discard_draft(owner_key, document_id, version, *, actor)`** — faz AGORA o que a expiração faz
+  às 24 h, a pedido de quem subiu o ficheiro: a versão passa a `error`/`discarded`, o rascunho e o
+  original saem, lápide `discarded` com o `actor`. Só a um rascunho: noutro estado responde
+  `not_a_draft` (uma versão servida sai por `delete_document`), de outro dono `missing`; um 2.º
+  descarte responde `discarded` sem segunda lápide. **Porquê (privacidade):** um upload errado ao
+  lado de uma versão servida guardava o original 24 h sem o cliente o poder tirar — a condição (e)
+  do Director diz «apagar tira na hora».
+- **`interrupt_stale(*, older_than, limit)`** — o segundo varrimento do tick, cross-owner: toda a
+  versão em `processing` cujo `claimed_at` é anterior a `older_than` passa a
+  `error`/`interrupted`, com lápide (um `prepare` a meio de um crash; um `commit` que morreu depois
+  de reclamar — o claim já consumiu o rascunho, não há retoma). **`claimed_at`** é novo em
+  `kb_versions` (aditivo): o momento em que a versão ENTROU em `processing` pela última vez (o
+  `begin_version`, com o relógio do `prepare`, e o `claim_draft`); o `created_at` não distingue um
+  rascunho confirmado há um minuto de um abandonado há uma hora. Motivos `discarded`/`interrupted`
+  e as lápides correspondentes nos alfabetos fechados — antes, `fail_version(reason="interrupted")`
+  saía `internal`.
 - **As duas guardas de «commit sem prepare», cada uma com a SUA pergunta e o SEU teste.** O
   `claim_draft` pergunta só «há rascunho?» (nos dois adaptadores:
   `test_the_claim_refuses_a_version_whose_draft_is_gone`, versão ainda à espera mas sem
@@ -31,6 +47,9 @@
   duplo: rascunho presente, versão fora de `awaiting_confirmation`). **Vermelho-antes medido:**
   o `claim` também verificava o estado, e a mutação da guarda do `commit` SOBREVIVIA ao seu
   teste; separadas as perguntas, cada mutação morre sozinha pela asserção.
+- Mutações do descarte e do varrimento de interrompidos (9, cada uma sozinha, âncora contada):
+  todas morrem pela asserção — incluindo a que deixa o original no descarte (`97 == 0`) e a que
+  julga pelo `created_at` em vez do `claimed_at` (`1 == 0`).
 
 ## Unreleased — documentos: um quarto port, versionado, pesquisado a pedido (F2.4, 2026-09-24)
 

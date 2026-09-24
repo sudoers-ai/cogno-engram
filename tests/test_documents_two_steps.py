@@ -43,7 +43,7 @@ from cogno_engram.ingest import (
 )
 
 from conftest import resolve_test_dsn  # noqa: E402 — the sibling conftest, on pytest's path
-from documents_support import EMB_DIM, MODEL_A, MODEL_B, FakePdfExtractor, StubEmbedder, store_factory
+from documents_support import MODEL_A, MODEL_B, FakePdfExtractor, StubEmbedder, store_factory
 
 DSN = resolve_test_dsn()      # module-level: the Postgres leg DROPs the kb_* tables
 

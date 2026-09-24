@@ -19,13 +19,15 @@ EMB_DIM = 8
 MODEL_A = embed_model_label("stub:alpha", EMB_DIM)
 MODEL_B = embed_model_label("stub:beta", EMB_DIM)
 KB_TABLES = ("kb_chunks", "kb_originals", "kb_versions", "kb_tombstones", "kb_documents")
+DERIVED_TS_CONFIGS = ("cogno_portuguese_unaccent", "cogno_simple_unaccent")
 
 
 def vec(*head: float) -> list[float]:
     return (list(head) + [0.0] * EMB_DIM)[:EMB_DIM]
 
 
-async def fresh_postgres(dsn: str, *, ts_config: str = "portuguese", **kwargs):
+async def fresh_postgres(dsn: str, *, ts_config: str = "portuguese", unaccent: bool = False,
+                         **kwargs):
     """A ``PostgresDocumentStore`` over freshly created ``kb_*`` tables, or a SKIP. The tables and
     the store are built with the SAME ``ts_config`` — a store querying with one configuration
     over a ``tsv`` generated with another matches nothing and says nothing."""
@@ -39,9 +41,14 @@ async def fresh_postgres(dsn: str, *, ts_config: str = "portuguese", **kwargs):
         pytest.skip(f"test Postgres unreachable: {type(exc).__name__}")
     for table in KB_TABLES:
         await conn.execute(f"DROP TABLE IF EXISTS {table} CASCADE")
-    await ensure_schema(conn, embedding_dim=EMB_DIM, ts_config=ts_config)
+    # The derived unaccent configurations too: they are created ONCE and then left alone by
+    # design, so a stale one from an earlier run would be measured instead of the code.
+    for derived in DERIVED_TS_CONFIGS:
+        await conn.execute(f"DROP TEXT SEARCH CONFIGURATION IF EXISTS {derived}")
+    await ensure_schema(conn, embedding_dim=EMB_DIM, ts_config=ts_config, unaccent=unaccent)
     await conn.close()
-    return PostgresDocumentStore(dsn=dsn, embedding_dim=EMB_DIM, ts_config=ts_config, **kwargs)
+    return PostgresDocumentStore(dsn=dsn, embedding_dim=EMB_DIM, ts_config=ts_config,
+                                 unaccent=unaccent, **kwargs)
 
 
 def store_factory(kind: str, dsn: str):

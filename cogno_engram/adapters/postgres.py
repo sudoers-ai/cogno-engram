@@ -246,8 +246,14 @@ async def _partition_existing_table(conn, tbl: str, partitions: int) -> None:
 
 async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
                         ts_config: str = DEFAULT_TS_CONFIG,
-                        partition_by_scope: bool = False, partitions: int = 8) -> None:
+                        partition_by_scope: bool = False, partitions: int = 8,
+                        unaccent: bool = False) -> None:
     """Create the engram schema idempotently (extension + tables + indexes).
+
+    ``unaccent`` applies to the DOCUMENT tables only (``kb_chunks``, see
+    :func:`ensure_documents_schema`): their text search folds accents on both sides of the match.
+    The ``memories`` table keeps ``ts_config`` as it is — changing the configuration of a
+    generated column on a live table is a migration of its own, not a flag.
 
     No alembic required — this is the zero-friction path. Migrations can be
     layered on top by a host that wants versioned schema.
@@ -556,7 +562,8 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
                 raise
             raise _label_collision_error(await _colliding_labels(conn), cause) from cause
 
-    await ensure_documents_schema(conn, embedding_dim=embedding_dim, ts_config=ts_config)
+    await ensure_documents_schema(conn, embedding_dim=embedding_dim, ts_config=ts_config,
+                                  unaccent=unaccent)
 
 
 # ── documents (see cogno_engram.documents) ────────────────────────────────────────────
@@ -581,10 +588,115 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
 # served chunks (thousands, not millions) and scans them exactly; an HNSW index with that filter
 # needs iterative scan to be correct and was not asked for by any measurement. Add it when one
 # asks. The lexical half has its GIN index.
+_UNACCENT_TOKENS = ("word", "hword", "hword_part")
+_DICT_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def documents_ts_config(ts_config: str = DEFAULT_TS_CONFIG, *, unaccent: bool = False) -> str:
+    """The text-search configuration the document tables are built with AND queried with — one
+    name, derived from the same two arguments on both sides, so the ``tsvector`` a chunk was
+    indexed with and the ``tsquery`` a question is parsed with fold the same way.
+
+    Without ``unaccent`` it is ``ts_config`` itself; with it, the derived
+    ``cogno_<base>_unaccent`` that :func:`ensure_documents_schema` creates."""
+    base = _validate_ts_config(ts_config)
+    if not unaccent:
+        return base
+    return f"cogno_{base.replace('.', '_')}_unaccent"
+
+
+async def _ensure_unaccent_config(conn, base: str) -> str:
+    """Create ``cogno_<base>_unaccent`` IF IT DOES NOT EXIST: a COPY of ``base`` whose non-ASCII
+    word tokens (``word``/``hword``/``hword_part``) pass through ``unaccent`` before the base's
+    OWN dictionaries — so ``Sábado`` and ``sabado`` reach the stemmer as the same word, and a
+    ``portuguese`` base still stems (``sábados`` → ``sab``). ASCII tokens carry no accent and keep
+    the base mapping untouched.
+
+    An existing configuration of that name is LEFT AS IT IS — the mapping is written once, in the
+    statement that creates it, so a second migration cannot rewrite what the first indexed with.
+    Two migrations racing to create it: the loser's ``DuplicateObject`` is the winner's success."""
+    derived = documents_ts_config(base, unaccent=True)
+    await conn.execute("CREATE EXTENSION IF NOT EXISTS unaccent")
+    exists = await (await conn.execute(
+        "SELECT 1 FROM pg_ts_config c JOIN pg_namespace n ON n.oid = c.cfgnamespace "
+        "WHERE c.cfgname = %s AND n.nspname = current_schema()", (derived,))).fetchone()
+    if exists is not None:
+        return derived
+    rows = await (await conn.execute(
+        "SELECT t.alias, array_agg(d.dictname::text ORDER BY m.mapseqno) "
+        "FROM pg_ts_config_map m "
+        "JOIN pg_ts_config c ON c.oid = m.mapcfg "
+        "JOIN pg_ts_dict d ON d.oid = m.mapdict "
+        "JOIN LATERAL ts_token_type(c.cfgparser) t ON t.tokid = m.maptokentype "
+        "WHERE c.oid = %s::regconfig AND t.alias = ANY(%s) GROUP BY t.alias",
+        (base, list(_UNACCENT_TOKENS)))).fetchall()
+    mapping: dict[str, list[str]] = {}
+    for row in rows:
+        alias, dicts = (row["alias"], row["array_agg"]) if isinstance(row, dict) else (row[0], row[1])
+        mapping[alias] = list(dicts or [])
+    names = [d for ds in mapping.values() for d in ds]
+    if not all(_DICT_NAME_RE.match(d) for d in names):
+        raise ValueError(f"unexpected dictionary name in {base!r}: {names!r}")
+    try:
+        async with conn.transaction():
+            await conn.execute(f"CREATE TEXT SEARCH CONFIGURATION {derived} (COPY = {base})")
+            for alias in _UNACCENT_TOKENS:
+                if mapping.get(alias):          # a token type the base ignores stays ignored
+                    await conn.execute(
+                        f"ALTER TEXT SEARCH CONFIGURATION {derived} ALTER MAPPING FOR {alias} "
+                        f"WITH unaccent, {', '.join(mapping[alias])}")
+    except psycopg.errors.DuplicateObject:
+        pass
+    return derived
+
+
+async def _documents_tsv_config(conn) -> "str | None":
+    """The configuration ``kb_chunks.tsv`` was GENERATED with, read from the catalogue — ``None``
+    when there is no such column."""
+    row = await (await conn.execute(
+        "SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d "
+        "JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum "
+        "WHERE d.adrelid = to_regclass('kb_chunks') AND a.attname = 'tsv'")).fetchone()
+    if row is None:
+        return None
+    expr = list(row.values())[0] if isinstance(row, dict) else row[0]
+    match = re.search(r"to_tsvector\('([^']+)'::regconfig", expr or "")
+    return match.group(1) if match else None
+
+
+async def rebuild_documents_tsv(conn, *, ts_config: str = DEFAULT_TS_CONFIG,
+                                unaccent: bool = False) -> None:
+    """Regenerate ``kb_chunks.tsv`` (and its index) with the configuration these arguments name —
+    the one migration a CHANGE of ``ts_config``/``unaccent`` on an existing database needs.
+
+    ``CREATE TABLE IF NOT EXISTS`` never touches a table that exists, so a store switched to
+    another configuration would parse questions one way over chunks indexed another — nothing
+    errors, words just stop matching. This drops the generated column and adds it back, which
+    REWRITES the table under an ``ACCESS EXCLUSIVE`` lock: an operator's step, run when the flag
+    changes, never on a boot."""
+    config = (await _ensure_unaccent_config(conn, ts_config)) if unaccent \
+        else documents_ts_config(ts_config)
+    async with conn.transaction():
+        await conn.execute("ALTER TABLE kb_chunks DROP COLUMN IF EXISTS tsv")
+        await conn.execute(
+            f"ALTER TABLE kb_chunks ADD COLUMN tsv tsvector "
+            f"GENERATED ALWAYS AS (to_tsvector('{config}', content)) STORED")
+        await conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_kb_chunks_tsv ON kb_chunks USING gin (tsv)")
+
+
 async def ensure_documents_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
-                                  ts_config: str = DEFAULT_TS_CONFIG) -> None:
-    """Create the document tables idempotently (``CREATE ... IF NOT EXISTS``, never an ALTER)."""
+                                  ts_config: str = DEFAULT_TS_CONFIG,
+                                  unaccent: bool = False) -> None:
+    """Create the document tables idempotently (``CREATE ... IF NOT EXISTS``, never an ALTER).
+
+    ``kb_chunks.tsv`` is generated with :func:`documents_ts_config` of the same two arguments the
+    store is built with. ``unaccent=True`` first creates the derived configuration (see
+    :func:`_ensure_unaccent_config`). An EXISTING ``kb_chunks`` built with another configuration
+    is not altered: it is logged as an ERROR naming :func:`rebuild_documents_tsv`, because a
+    mismatch does not fail — it silently stops words from matching."""
     ts_config = _validate_ts_config(ts_config)
+    config = (await _ensure_unaccent_config(conn, ts_config)) if unaccent else ts_config
     dim = int(embedding_dim)
     await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
     for ddl in (
@@ -642,7 +754,7 @@ async def ensure_documents_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDIN
             -- NOT NULL: a served version is always fully comparable under its own model (the
             -- all-or-none rule of `search`). A chunk without a vector cannot be stored.
             embedding    vector({dim}) NOT NULL,
-            tsv          tsvector GENERATED ALWAYS AS (to_tsvector('{ts_config}', content)) STORED,
+            tsv          tsvector GENERATED ALWAYS AS (to_tsvector('{config}', content)) STORED,
             PRIMARY KEY (document_id, version, ordinal),
             FOREIGN KEY (document_id, version)
                 REFERENCES kb_versions(document_id, version) ON DELETE CASCADE
@@ -669,6 +781,13 @@ async def ensure_documents_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDIN
         "ON kb_tombstones (owner_key text_pattern_ops, removed_at DESC)",
     ):
         await conn.execute(ddl)
+    built_with = await _documents_tsv_config(conn)
+    if built_with is not None and built_with != config:
+        logger.error("stage=schema event=kb_ts_config_mismatch table=kb_chunks built_with=%s "
+                     "requested=%s remedy=rebuild_documents_tsv(conn, ts_config=%r, unaccent=%r) "
+                     "— until then questions are parsed with one configuration over chunks "
+                     "indexed with another, and words silently stop matching",
+                     built_with, config, ts_config, unaccent)
 
 
 async def _installed_fold_definition(conn) -> "str | None":
@@ -2124,10 +2243,13 @@ class PostgresDocumentStore(_PgBase):
     """
 
     def __init__(self, *, dsn: Optional[str] = None, pool=None,
-                 ts_config: str = DEFAULT_TS_CONFIG,
+                 ts_config: str = DEFAULT_TS_CONFIG, unaccent: bool = False,
                  embedding_dim: int = DEFAULT_EMBEDDING_DIM,
                  max_original_bytes: int = DEFAULT_MAX_BYTES) -> None:
         super().__init__(dsn=dsn, pool=pool, ts_config=ts_config)
+        # The SAME (ts_config, unaccent) the schema was built with: the name is derived by the
+        # one function both sides call, so the question and the chunks fold alike.
+        self._ts = documents_ts_config(ts_config, unaccent=unaccent)
         self.embedding_dim = int(embedding_dim)
         self.max_original_bytes = int(max_original_bytes)
 

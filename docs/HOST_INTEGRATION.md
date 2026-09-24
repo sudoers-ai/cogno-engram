@@ -191,7 +191,8 @@ from cogno_engram import documents_probe, embed_model_label
 from cogno_engram.adapters.postgres import PostgresDocumentStore
 from cogno_engram.ingest import TokensPerMinute, ingest
 
-docs = PostgresDocumentStore(dsn=DSN)                       # tables come from ensure_schema
+docs = PostgresDocumentStore(dsn=DSN, ts_config="portuguese", unaccent=True)
+# ...built by ensure_schema(conn, ts_config="portuguese", unaccent=True) — the SAME two values
 model = embed_model_label(embed_spec(), embed_dimensions()) # the ONE platform embedder
 owner = f"{tenant_id}/{persona_id}"                         # opaque to engram
 
@@ -217,6 +218,13 @@ res = await docs.search(owner, profile=identity_role, text=original_text,
   `kb_*` table in turn and requires the probe to fail. (The graph probe could not see the
   engram's `turns` schema once, and the janitor failed silently for days behind a green
   `/health`; this is the same check for these tables, owned here so it moves with the pin.)
+- **Accents.** Pass `unaccent=True` (and the same `ts_config`) to BOTH `ensure_schema` and
+  `PostgresDocumentStore` — the tables and the questions must fold alike, and the derived
+  configuration name comes from the one function both call (`documents_ts_config`). Changing
+  either on an EXISTING database needs `rebuild_documents_tsv(conn, ts_config=…, unaccent=…)`:
+  the generated `tsv` is not recomputed by a migration re-run, and `ensure_schema` logs
+  `event=kb_ts_config_mismatch` until it is. With no documents yet the rebuild is instant; do it
+  in the same deploy that first sets the flag.
 - **Migration.** `ensure_schema` creates the five `kb_*` tables (`CREATE ... IF NOT EXISTS`,
   additive). A host whose migration delegates to it gets them with no new step; a pin bump
   that includes this change needs that migration run on the live database before the first

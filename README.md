@@ -126,7 +126,18 @@ hits = await docs.search("acme/secretary", profile="GUEST", text="saturday hours
 
 The Postgres adapter (`PostgresDocumentStore`) adds five tables through `ensure_schema`
 (`kb_documents`, `kb_versions`, `kb_chunks`, `kb_originals`, `kb_tombstones`) — additive, no
-ALTER of anything that existed. `documents_probe(store, embed_model=...)` runs every read against
+ALTER of anything that existed.
+
+**Accents.** `ensure_schema(conn, ts_config="portuguese", unaccent=True)` builds the document
+text search over a derived configuration, `cogno_portuguese_unaccent` (a copy of the base whose
+non-ASCII word tokens pass through `unaccent` before the base's own stemmer), and
+`PostgresDocumentStore(ts_config="portuguese", unaccent=True)` parses questions with the SAME
+one — so «sabado» finds «Sábado», «Sábado» finds «sabado», and «Sábados» still stems to it. It
+applies to `kb_chunks` only; `memories` keeps its configuration. **Changing `ts_config` or
+`unaccent` on an EXISTING database does not re-index anything by itself**: `CREATE TABLE IF NOT
+EXISTS` leaves the generated `tsv` as it was, words silently stop matching, and `ensure_schema`
+logs `event=kb_ts_config_mismatch`. The migration is `rebuild_documents_tsv(conn, ts_config=…,
+unaccent=…)`, which rewrites `kb_chunks` under an exclusive lock — an operator's step, not a boot's. `documents_probe(store, embed_model=...)` runs every read against
 an owner that holds nothing, for a host's health check: a missing table or column fails it.
 **A purge cannot reach the database's backups** — they keep an original until their own
 retention expires; that retention is the operator's decision.

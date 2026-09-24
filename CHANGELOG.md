@@ -66,6 +66,19 @@
   metade positiva (`ø` separa as duas dobras). Nasceu `xfail(strict=True)` enquanto a #64 não
   tinha aterrado; aterrou primeiro, a troca fez-se aqui e a marca saiu.
 
+- **Acentos na busca de documentos: `ensure_schema(..., ts_config, unaccent=True)`** cria, SE
+  NÃO EXISTIR, a configuração derivada `cogno_<base>_unaccent` — `COPY` da base, e os tokens
+  não-ASCII (`word`/`hword`/`hword_part`) passam pelo `unaccent` antes dos dicionários da PRÓPRIA
+  base (o stem continua) — e gera o `kb_chunks.tsv` com ela; `PostgresDocumentStore(ts_config,
+  unaccent=True)` interpreta a pergunta com A MESMA (`documents_ts_config`, uma função para os
+  dois lados). Só `kb_chunks`: o `tsv` de `memories` não se mexe. Testes de integração: «sabado»
+  encontra «Sábado» e vice-versa, «Sábados» encontra pelo stem, um termo sem relação não encontra
+  nada; **vermelho produzido** — com `unaccent=False` o mesmo corpus e a mesma pergunta falham.
+  Mudar a configuração numa base EXISTENTE não recalcula a coluna gerada: o `ensure_schema`
+  regista `event=kb_ts_config_mismatch` e `rebuild_documents_tsv(...)` é a migração (reescreve a
+  tabela com lock exclusivo — passo de operador). O defeito que fecha: a componente léxica pesa
+  0,4 na busca NORMAL, e «José e Jose são a mesma pessoa» vale para as palavras também.
+
 ### Notes
 
 - **Os backups da base de dados guardam um original até à retenção deles** — a purga não os

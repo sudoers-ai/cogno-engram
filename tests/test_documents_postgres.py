@@ -281,3 +281,114 @@ async def test_the_lexical_order_is_the_same_in_both_adapters():
     pg_values = [h.lexical_score for h in (await pg.search(
         o, profile="GUEST", text=_ORDER_QUERY, limit=20)).hits]
     assert mem_values != pytest.approx(pg_values)
+
+
+# ── unaccent: the document search folds accents on BOTH sides of the match ──────────────
+
+_WEEKEND = (("Abrimos no Sábado de manhã.", vec(1.0)),       # ordinal 0 — accented
+            ("No sabado seguinte fechamos.", vec(1.0)),      # ordinal 1 — typed without accent
+            ("Horário do domingo: fechado.", vec(1.0)))      # ordinal 2 — no Saturday at all
+
+
+async def _words(store, owner, text) -> "set[int]":
+    res = await store.search(owner, profile="GUEST", text=text, limit=10)
+    return {h.ordinal for h in res.hits}
+
+
+async def test_unaccent_matches_sabado_and_sabado_both_ways_and_still_stems():
+    pg = await fresh_postgres(DSN, ts_config="portuguese", unaccent=True)
+    o = f"acme{uuid4().hex[:6]}/p"
+    await publish(pg, o, profiles=("GUEST",), chunks=_WEEKEND)
+    assert await _words(pg, o, "sabado") == {0, 1}          # «sabado» finds «Sábado»
+    assert await _words(pg, o, "Sábado") == {0, 1}          # …and «Sábado» finds «sabado»
+    assert await _words(pg, o, "Sábados") == {0, 1}         # the stem still applies
+    assert await _words(pg, o, "orçamento") == set()        # an unrelated word finds nothing
+    assert await _words(pg, o, "domingo") == {2}            # CONTROL: the search does select
+
+
+async def test_without_unaccent_sabado_does_not_find_sabado():
+    """The red, produced: the SAME corpus and question under the base configuration — the
+    accented chunk is missed. This is the defect the flag exists to close."""
+    pg = await fresh_postgres(DSN, ts_config="portuguese", unaccent=False)
+    o = f"acme{uuid4().hex[:6]}/p"
+    await publish(pg, o, profiles=("GUEST",), chunks=_WEEKEND)
+    assert 0 not in await _words(pg, o, "sabado")
+    assert await _words(pg, o, "sabado") == {1}
+
+
+async def test_the_derived_configuration_folds_only_non_ascii_words_and_is_made_once():
+    from cogno_engram.adapters.postgres import documents_ts_config, ensure_schema
+    await fresh_postgres(DSN, ts_config="portuguese", unaccent=True)
+    conn = await _connect()
+    try:
+        await ensure_schema(conn, embedding_dim=EMB_DIM, ts_config="portuguese", unaccent=True)
+        name = documents_ts_config("portuguese", unaccent=True)
+        assert name == "cogno_portuguese_unaccent"
+        cur = await conn.execute(
+            "SELECT t.alias, array_agg(d.dictname::text ORDER BY m.mapseqno) "
+            "FROM pg_ts_config_map m JOIN pg_ts_config c ON c.oid = m.mapcfg "
+            "JOIN pg_ts_dict d ON d.oid = m.mapdict "
+            "JOIN LATERAL ts_token_type(c.cfgparser) t ON t.tokid = m.maptokentype "
+            "WHERE c.cfgname = %s AND t.alias IN ('word', 'hword', 'hword_part', 'asciiword') "
+            "GROUP BY t.alias ORDER BY t.alias", (name,))
+        mapping = {alias: dicts for alias, dicts in await cur.fetchall()}
+        assert mapping == {"asciiword": ["portuguese_stem"],
+                           "hword": ["unaccent", "portuguese_stem"],
+                           "hword_part": ["unaccent", "portuguese_stem"],
+                           "word": ["unaccent", "portuguese_stem"]}
+        cur = await conn.execute("SELECT count(*) FROM pg_ts_config WHERE cfgname = %s", (name,))
+        assert (await cur.fetchone())[0] == 1
+    finally:
+        await conn.close()
+
+
+async def test_unaccent_touches_the_document_tables_only():
+    from cogno_engram.adapters.postgres import _documents_tsv_config
+    await fresh_postgres(DSN, ts_config="portuguese", unaccent=True)
+    conn = await _connect()
+    try:
+        assert await _documents_tsv_config(conn) == "cogno_portuguese_unaccent"
+        cur = await conn.execute(
+            "SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d JOIN pg_attribute a "
+            "ON a.attrelid = d.adrelid AND a.attnum = d.adnum "
+            "WHERE d.adrelid = to_regclass('memories') AND a.attname = 'tsv'")
+        memories_expr = (await cur.fetchone())[0]
+        assert "unaccent" not in memories_expr
+    finally:
+        await conn.close()
+
+
+async def test_a_changed_configuration_is_named_as_an_error_and_rebuilt_on_request(caplog):
+    """Switching an EXISTING database to `unaccent` leaves `kb_chunks.tsv` as it was generated
+    — `CREATE TABLE IF NOT EXISTS` never touches it — so the migration says so, by name, and
+    `rebuild_documents_tsv` is the step that makes the switch real."""
+    import logging
+
+    from cogno_engram.adapters.postgres import (PostgresDocumentStore, _documents_tsv_config,
+                                                ensure_schema, rebuild_documents_tsv)
+    plain = await fresh_postgres(DSN, ts_config="portuguese", unaccent=False)
+    o = f"acme{uuid4().hex[:6]}/p"
+    await publish(plain, o, profiles=("GUEST",), chunks=_WEEKEND)
+    folded = PostgresDocumentStore(dsn=DSN, embedding_dim=EMB_DIM, ts_config="portuguese",
+                                   unaccent=True)
+    conn = await _connect()
+    try:
+        with caplog.at_level(logging.ERROR, logger="cogno_engram.postgres"):
+            await ensure_schema(conn, embedding_dim=EMB_DIM, ts_config="portuguese", unaccent=True)
+        assert "event=kb_ts_config_mismatch" in caplog.text
+        assert await _documents_tsv_config(conn) == "portuguese"        # nothing was altered
+        assert 0 not in await _words(folded, o, "sabado")               # the silent mismatch
+        await rebuild_documents_tsv(conn, ts_config="portuguese", unaccent=True)
+        assert await _documents_tsv_config(conn) == "cogno_portuguese_unaccent"
+        assert await _words(folded, o, "sabado") == {0, 1}
+        caplog.clear()
+        with caplog.at_level(logging.ERROR, logger="cogno_engram.postgres"):
+            await ensure_schema(conn, embedding_dim=EMB_DIM, ts_config="portuguese", unaccent=True)
+        assert "kb_ts_config_mismatch" not in caplog.text                 # healthy: silent
+    finally:
+        await conn.close()
+
+
+async def test_the_probe_runs_over_an_unaccent_store():
+    pg = await fresh_postgres(DSN, ts_config="portuguese", unaccent=True)
+    await documents_probe(pg, embed_model=MODEL_A)

@@ -18,7 +18,8 @@ from cogno_engram.documents import COMMIT_READY, MEDIA_MARKDOWN, KbChunk, embed_
 EMB_DIM = 8
 MODEL_A = embed_model_label("stub:alpha", EMB_DIM)
 MODEL_B = embed_model_label("stub:beta", EMB_DIM)
-KB_TABLES = ("kb_chunks", "kb_originals", "kb_versions", "kb_tombstones", "kb_documents")
+KB_TABLES = ("kb_chunks", "kb_originals", "kb_drafts", "kb_versions", "kb_tombstones",
+             "kb_documents")
 DERIVED_TS_CONFIGS = ("cogno_portuguese_unaccent", "cogno_simple_unaccent")
 
 

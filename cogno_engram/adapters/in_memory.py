@@ -26,21 +26,35 @@ from cogno_engram.documents import (
     COMMIT_READY,
     COMMIT_SUPERSEDED,
     DEFAULT_MAX_BYTES,
+    CLAIM_EXPIRED,
+    CLAIM_MISSING,
+    CLAIM_OK,
+    DISCARD_MISSING,
+    DISCARD_NOT_A_DRAFT,
+    DISCARD_OK,
+    REASON_DISCARDED,
+    REASON_INTERRUPTED,
+    TOMBSTONE_DISCARDED,
+    TOMBSTONE_INTERRUPTED,
+    KB_AWAITING_CONFIRMATION,
     KB_EMBED_SPACE_UNAVAILABLE,
     KB_ERROR,
     KB_PROCESSING,
     KB_READY,
     TOMBSTONE_DELETED,
+    TOMBSTONE_EXPIRED,
     TOMBSTONE_PURGED,
     VALID_MEDIA_TYPES,
     DocumentLimitReached,
     KbChunk,
     KbDocument,
+    KbDraft,
     KbHit,
     KbSearchResult,
     KbTombstone,
     KbVersion,
     OriginalTooLarge,
+    REASON_EXPIRED,
     chunk_id,
     clamp_unit,
     hit_order_key,
@@ -913,6 +927,9 @@ class _VersionRow:
     chunks: int = 0
     created_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None
+    estimated_tokens: int = 0
+    expires_at: Optional[datetime] = None
+    claimed_at: Optional[datetime] = None
 
 
 def _doc_cosine(a: list[float], b: list[float]) -> float:
@@ -984,6 +1001,9 @@ class InMemoryDocumentStore:
         # leave, which a count THROUGH the documents could never see.
         self._originals: dict[tuple[str, int], tuple[str, bytes]] = {}
         self._tombstones: list[KbTombstone] = []
+        # (document, version) → the prepared draft: chunks WITHOUT vectors, pages, estimate,
+        # expiry. Apart from `_chunks`, like the originals: a search never walks it.
+        self._drafts: dict[tuple[str, int], dict] = {}
         self.original_reads = 0
 
     # ── rows → records ───────────────────────────────────────────────────
@@ -994,7 +1014,9 @@ class InMemoryDocumentStore:
                          sha256=row.sha256, embed_model=row.embed_model, reason=row.reason,
                          size_bytes=row.size_bytes, pages=row.pages, chunks=row.chunks,
                          has_original=(row.document_id, row.version) in self._originals,
-                         created_at=row.created_at, finished_at=row.finished_at)
+                         created_at=row.created_at, finished_at=row.finished_at,
+                         estimated_tokens=row.estimated_tokens, expires_at=row.expires_at,
+                         claimed_at=row.claimed_at)
 
     def _versions_of(self, document_id: str) -> "list[_VersionRow]":
         return sorted((v for (d, _), v in self._versions.items() if d == document_id),
@@ -1015,6 +1037,7 @@ class InMemoryDocumentStore:
         return row if row is not None and row.owner_key == owner_key else None
 
     def _drop_version(self, document_id: str, version: int) -> None:
+        self._drafts.pop((document_id, version), None)
         self._versions.pop((document_id, version), None)
         self._chunks.pop((document_id, version), None)
         self._originals.pop((document_id, version), None)
@@ -1071,7 +1094,8 @@ class InMemoryDocumentStore:
     # ── ingestion ────────────────────────────────────────────────────────
     async def begin_version(self, owner_key: str, document_id: str, *, sha256: str,
                             embed_model: str, size_bytes: int,
-                            original: Optional[bytes] = None) -> Optional[KbVersion]:
+                            original: Optional[bytes] = None,
+                            now: Optional[datetime] = None) -> Optional[KbVersion]:
         require_owner(owner_key)
         require_model(embed_model, self.embedding_dim)
         if original is not None and len(original) > self.max_original_bytes:
@@ -1080,18 +1104,22 @@ class InMemoryDocumentStore:
         row = self._owned(owner_key, document_id)
         if row is None:
             return None
+        claimed = now or _now()
         now = _now()
         for v in self._versions_of(row.id):
             if v.sha256 == sha256 and v.embed_model == embed_model:
                 if v.state != KB_READY:
                     v.state, v.reason, v.finished_at = KB_PROCESSING, "", None
+                    v.claimed_at = claimed
+                    self._drafts.pop((v.document_id, v.version), None)   # re-prepared fresh
                 if original is not None and (row.id, v.version) not in self._originals:
                     self._originals[(row.id, v.version)] = (row.owner_key, bytes(original))
                 return self._version(v)
         existing = self._versions_of(row.id)
         number = (existing[-1].version + 1) if existing else 1
         v = _VersionRow(document_id=row.id, version=number, state=KB_PROCESSING, sha256=sha256,
-                        embed_model=embed_model, size_bytes=int(size_bytes), created_at=now)
+                        embed_model=embed_model, size_bytes=int(size_bytes), created_at=now,
+                        claimed_at=claimed)
         self._versions[(row.id, number)] = v
         if original is not None:
             self._originals[(row.id, number)] = (row.owner_key, bytes(original))
@@ -1150,7 +1178,121 @@ class InMemoryDocumentStore:
         v.state, v.reason, v.finished_at = KB_ERROR, sanitize_reason(reason), _now()
         self._chunks.pop((v.document_id, v.version), None)
         self._originals.pop((v.document_id, v.version), None)
+        self._drafts.pop((v.document_id, v.version), None)
         return True
+
+    async def get_version(self, owner_key: str, document_id: str,
+                          version: int) -> Optional[KbVersion]:
+        require_owner(owner_key)
+        row = self._owned(owner_key, document_id)
+        return self._version(self._versions.get((row.id, int(version)))) if row is not None \
+            else None
+
+    # ── the two-step ingestion ───────────────────────────────────────────
+    async def save_draft(self, owner_key: str, document_id: str, version: int, *, chunks,
+                         pages: int, estimated_tokens: int, expires_at: datetime) -> bool:
+        require_owner(owner_key)
+        row = self._owned(owner_key, document_id)
+        v = self._versions.get((row.id, int(version))) if row is not None else None
+        if v is None or v.state != KB_PROCESSING:
+            return False
+        self._drafts[(v.document_id, v.version)] = dict(
+            chunks=tuple(KbChunk(ordinal=int(c.ordinal), content=c.content,
+                                 heading_path=tuple(c.heading_path), page=c.page)
+                         for c in chunks),
+            created_at=_now())
+        v.state, v.reason, v.finished_at = KB_AWAITING_CONFIRMATION, "", None
+        v.pages, v.estimated_tokens, v.expires_at = int(pages), int(estimated_tokens), expires_at
+        return True
+
+    def _draft(self, v: _VersionRow, d: dict, *, with_chunks: bool) -> KbDraft:
+        assert v.expires_at is not None                  # set by `save_draft` with the draft
+        return KbDraft(document_id=v.document_id, version=v.version, embed_model=v.embed_model,
+                       chunk_count=len(d["chunks"]), pages=v.pages,
+                       estimated_tokens=v.estimated_tokens, expires_at=v.expires_at,
+                       chunks=d["chunks"] if with_chunks else (), created_at=d["created_at"])
+
+    async def claim_draft(self, owner_key: str, document_id: str, version: int, *,
+                          now: datetime) -> "tuple[str, Optional[KbDraft]]":
+        require_owner(owner_key)
+        row = self._owned(owner_key, document_id)
+        v = self._versions.get((row.id, int(version))) if row is not None else None
+        d = self._drafts.get((v.document_id, v.version)) if v is not None else None
+        # The claim's ONE question is "is there a draft?"; whether the version is awaiting
+        # confirmation is the commit's (`ingest.commit`), and each is proved by its own test.
+        if v is None or d is None:
+            return CLAIM_MISSING, None
+        if v.expires_at is not None and v.expires_at <= now:
+            return CLAIM_EXPIRED, None
+        self._drafts.pop((v.document_id, v.version), None)
+        v.state, v.claimed_at = KB_PROCESSING, now
+        return CLAIM_OK, self._draft(v, d, with_chunks=True)
+
+    async def pending_drafts(self, owner_key: str) -> "list[KbDraft]":
+        require_owner(owner_key)
+        out = []
+        for (doc_id, number), d in self._drafts.items():
+            row = self._docs.get(doc_id)
+            v = self._versions.get((doc_id, number))
+            if row is not None and row.owner_key == owner_key and v is not None:
+                out.append(self._draft(v, d, with_chunks=False))
+        return sorted(out, key=lambda x: (x.expires_at, x.document_id, x.version))
+
+    async def expire_drafts(self, *, now: datetime, limit: int = 100) -> int:
+        due = sorted((v.expires_at, v.document_id, v.version) for v in self._versions.values()
+                     if v.state == KB_AWAITING_CONFIRMATION and v.expires_at is not None
+                     and v.expires_at <= now)[:max(0, int(limit))]
+        for _, doc_id, number in due:
+            row = self._docs.get(doc_id)
+            v = self._versions[(doc_id, number)]
+            v.state, v.reason, v.finished_at = KB_ERROR, REASON_EXPIRED, now
+            self._drafts.pop((doc_id, number), None)
+            self._originals.pop((doc_id, number), None)
+            self._chunks.pop((doc_id, number), None)
+            if row is not None:
+                self._tombstones.append(KbTombstone(
+                    owner_key=row.owner_key, document_id=doc_id, versions=(number,),
+                    kind=TOMBSTONE_EXPIRED, actor="", removed_at=now))
+        return len(due)
+
+    def _end_version(self, v: _VersionRow, reason: str, kind: str, *, actor: str = "",
+                     at: Optional[datetime] = None) -> None:
+        """``v`` → ``error``/``reason``, its draft, original and partial chunks removed, one
+        tombstone — the one ending the expiry, the discard and the interruption share."""
+        when = at or _now()
+        v.state, v.reason, v.finished_at = KB_ERROR, reason, when
+        for store in (self._drafts, self._originals, self._chunks):
+            store.pop((v.document_id, v.version), None)
+        row = self._docs.get(v.document_id)
+        if row is not None:
+            self._tombstones.append(KbTombstone(owner_key=row.owner_key, document_id=v.document_id,
+                                                versions=(v.version,), kind=kind,
+                                                actor=str(actor or ""), removed_at=when))
+
+    async def discard_draft(self, owner_key: str, document_id: str, version: int, *,
+                            actor: str = "") -> str:
+        require_owner(owner_key)
+        row = self._owned(owner_key, document_id)
+        v = self._versions.get((row.id, int(version))) if row is not None else None
+        if v is None:
+            return DISCARD_MISSING
+        if v.state == KB_ERROR and v.reason == REASON_DISCARDED:
+            return DISCARD_OK                                   # a repeat: nothing more to do
+        if v.state != KB_AWAITING_CONFIRMATION:
+            return DISCARD_NOT_A_DRAFT
+        self._end_version(v, REASON_DISCARDED, TOMBSTONE_DISCARDED, actor=actor)
+        return DISCARD_OK
+
+    async def interrupt_stale(self, *, older_than: datetime, limit: int = 100) -> int:
+        due = sorted(((v.claimed_at or v.created_at or _now()), v.document_id, v.version)
+                     for v in self._versions.values()
+                     if v.state == KB_PROCESSING
+                     and (v.claimed_at or v.created_at or _now()) < older_than
+                     )[:max(0, int(limit))]
+        for _, doc_id, number in due:
+            self._end_version(self._versions[(doc_id, number)], REASON_INTERRUPTED,
+                              TOMBSTONE_INTERRUPTED)
+        return len(due)
 
     # ── removal ──────────────────────────────────────────────────────────
     def _remove(self, row: _DocRow, kind: str, actor: str) -> None:

@@ -80,6 +80,9 @@
   qualificação: é a mesma FORMA, não os mesmos bytes — o detalhe aqui corta a 160 sem reticências,
   lá a 120 com `…`. Mantido como estava porque este é o texto que é PONTUADO, e um corte que mude
   move scores.
+- **`docs/HOST_INTEGRATION.md`** ganha as duas costuras: como um host compõe as suas leituras com o
+  `lexical` (e o que continua a ser dele — leituras, tamanho, relógio, calibração) e como re-exporta
+  a `textfold` em vez de manter uma cópia.
 - **Os docstrings de `textfold` perdem os nomes dos módulos do host** que cada passo servia e o
   caso que ilustrava a ordem; ficam as razões.
 

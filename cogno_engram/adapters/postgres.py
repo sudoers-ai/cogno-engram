@@ -34,19 +34,34 @@ from psycopg.rows import dict_row
 
 from cogno_engram import write_loss
 from cogno_engram.documents import (
+    CLAIM_EXPIRED,
+    CLAIM_MISSING,
+    CLAIM_OK,
     COMMIT_DELETED,
+    DISCARD_MISSING,
+    DISCARD_NOT_A_DRAFT,
+    DISCARD_OK,
+    REASON_DISCARDED,
+    REASON_INTERRUPTED,
+    TOMBSTONE_DISCARDED,
+    TOMBSTONE_INTERRUPTED,
     COMMIT_READY,
     COMMIT_SUPERSEDED,
     DEFAULT_MAX_BYTES,
+    KB_AWAITING_CONFIRMATION,
     KB_EMBED_SPACE_UNAVAILABLE,
     KB_ERROR,
     KB_PROCESSING,
     KB_READY,
+    REASON_EXPIRED,
     TOMBSTONE_DELETED,
+    TOMBSTONE_EXPIRED,
     TOMBSTONE_PURGED,
     VALID_MEDIA_TYPES,
     DocumentLimitReached,
+    KbChunk,
     KbDocument,
+    KbDraft,
     KbHit,
     KbSearchResult,
     KbTombstone,
@@ -725,7 +740,29 @@ async def ensure_documents_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDIN
             chunks       integer NOT NULL DEFAULT 0,
             created_at   timestamptz NOT NULL DEFAULT now(),
             finished_at  timestamptz,
+            -- The two-step ingestion's numbers, ON THE VERSION so they outlive the draft:
+            -- what the uploader was shown, and until when they could confirm it.
+            estimated_tokens bigint NOT NULL DEFAULT 0,
+            expires_at   timestamptz,
+            -- When the version last ENTERED `processing` (begun, or claimed by a commit): the
+            -- clock `interrupt_stale` judges by — `created_at` cannot tell a draft confirmed a
+            -- minute ago from one abandoned an hour ago.
+            claimed_at   timestamptz,
             PRIMARY KEY (document_id, version)
+        )
+        """,
+        # A prepared version's chunks WITHOUT vectors, until it is confirmed (claimed) or it
+        # expires. Apart from `kb_chunks` — whose embedding is NOT NULL, the all-or-none rule —
+        # and cascading from the version, so a delete, a purge or an expiry takes it along.
+        """
+        CREATE TABLE IF NOT EXISTS kb_drafts (
+            document_id  uuid NOT NULL,
+            version      integer NOT NULL,
+            chunks       jsonb NOT NULL,
+            created_at   timestamptz NOT NULL DEFAULT now(),
+            PRIMARY KEY (document_id, version),
+            FOREIGN KEY (document_id, version)
+                REFERENCES kb_versions(document_id, version) ON DELETE CASCADE
         )
         """,
         """
@@ -781,6 +818,25 @@ async def ensure_documents_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDIN
         "ON kb_tombstones (owner_key text_pattern_ops, removed_at DESC)",
     ):
         await conn.execute(ddl)
+    # Additive, for a database created before the two-step ingestion: asked of the catalogue
+    # first, like the edge columns above, because `ADD COLUMN IF NOT EXISTS` still takes an
+    # ACCESS EXCLUSIVE lock when it has nothing to do.
+    for column, ddl in (
+        ("estimated_tokens",
+         "ALTER TABLE kb_versions ADD COLUMN IF NOT EXISTS estimated_tokens bigint NOT NULL DEFAULT 0"),
+        ("expires_at", "ALTER TABLE kb_versions ADD COLUMN IF NOT EXISTS expires_at timestamptz"),
+        ("claimed_at", "ALTER TABLE kb_versions ADD COLUMN IF NOT EXISTS claimed_at timestamptz"),
+    ):
+        cur = await conn.execute(
+            "SELECT 1 FROM information_schema.columns "
+            "WHERE table_name = 'kb_versions' AND column_name = %s", (column,))
+        if await cur.fetchone() is None:
+            await conn.execute(ddl)
+    # The expiry sweep reads only the drafts, oldest first: a PARTIAL index, which stays the
+    # size of the waiting list rather than of the history.
+    await conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_kb_versions_awaiting ON kb_versions (expires_at) "
+        f"WHERE state = '{KB_AWAITING_CONFIRMATION}'")
     built_with = await _documents_tsv_config(conn)
     if built_with is not None and built_with != config:
         logger.error("stage=schema event=kb_ts_config_mismatch table=kb_chunks built_with=%s "
@@ -2211,8 +2267,8 @@ _DOC_COLS = ("d.id, d.owner_key, d.title, d.profiles, d.media_type, d.active_ver
 # PRIMARY KEY only — the bytes themselves are read by `get_original` and nowhere else.
 _VERSION_SELECT = (
     "SELECT v.document_id, v.version, v.state, v.reason, v.sha256, v.embed_model, "
-    "v.size_bytes, v.pages, v.chunks, v.created_at, v.finished_at, "
-    "(o.document_id IS NOT NULL) AS has_original "
+    "v.size_bytes, v.pages, v.chunks, v.created_at, v.finished_at, v.estimated_tokens, "
+    "v.expires_at, v.claimed_at, (o.document_id IS NOT NULL) AS has_original "
     "FROM kb_versions v LEFT JOIN kb_originals o "
     "  ON o.document_id = v.document_id AND o.version = v.version ")
 # THE filter of the reader path — one string, so the three reads that serve a reader
@@ -2230,7 +2286,9 @@ def _version_from_row(r: Any) -> KbVersion:
                      reason=r["reason"] or "", size_bytes=int(r["size_bytes"] or 0),
                      pages=int(r["pages"] or 0), chunks=int(r["chunks"] or 0),
                      has_original=bool(r["has_original"]), created_at=r["created_at"],
-                     finished_at=r["finished_at"])
+                     finished_at=r["finished_at"],
+                     estimated_tokens=int(r["estimated_tokens"] or 0), expires_at=r["expires_at"],
+                     claimed_at=r["claimed_at"])
 
 
 class PostgresDocumentStore(_PgBase):
@@ -2375,7 +2433,8 @@ class PostgresDocumentStore(_PgBase):
 
     async def begin_version(self, owner_key: str, document_id: str, *, sha256: str,
                             embed_model: str, size_bytes: int,
-                            original: Optional[bytes] = None) -> Optional[KbVersion]:
+                            original: Optional[bytes] = None,
+                            now: Optional[datetime] = None) -> Optional[KbVersion]:
         require_owner(owner_key)
         require_model(embed_model, self.embedding_dim)
         if original is not None and len(original) > self.max_original_bytes:
@@ -2398,7 +2457,11 @@ class PostgresDocumentStore(_PgBase):
                     if same["state"] != KB_READY:
                         await conn.execute(
                             f"UPDATE kb_versions SET state = '{KB_PROCESSING}', reason = '', "
-                            "finished_at = NULL WHERE document_id = %s AND version = %s",
+                            "finished_at = NULL, claimed_at = COALESCE(%s, now()) "
+                            "WHERE document_id = %s AND version = %s",
+                            (now, doc, number))
+                        await conn.execute(                       # re-prepared fresh
+                            "DELETE FROM kb_drafts WHERE document_id = %s AND version = %s",
                             (doc, number))
                 else:
                     cur = await conn.execute(
@@ -2407,8 +2470,9 @@ class PostgresDocumentStore(_PgBase):
                     number = int((await cur.fetchone())["n"])
                     await conn.execute(
                         "INSERT INTO kb_versions (document_id, version, state, sha256, "
-                        "embed_model, size_bytes) VALUES (%s, %s, %s, %s, %s, %s)",
-                        (doc, number, KB_PROCESSING, sha256, embed_model, int(size_bytes)))
+                        "embed_model, size_bytes, claimed_at) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, COALESCE(%s, now()))",
+                        (doc, number, KB_PROCESSING, sha256, embed_model, int(size_bytes), now))
                 if original is not None:
                     await conn.execute(
                         "INSERT INTO kb_originals (document_id, version, owner_key, data) "
@@ -2510,11 +2574,196 @@ class PostgresDocumentStore(_PgBase):
                     (sanitize_reason(reason), doc, int(version)))
                 if cur.rowcount == 0:
                     return False
-                for table in ("kb_chunks", "kb_originals"):
+                for table in ("kb_chunks", "kb_originals", "kb_drafts"):
                     await conn.execute(
                         f"DELETE FROM {table} WHERE document_id = %s AND version = %s",
                         (doc, int(version)))
         return True
+
+    async def get_version(self, owner_key: str, document_id: str,
+                          version: int) -> Optional[KbVersion]:
+        require_owner(owner_key)
+        doc = _doc_uuid(document_id)
+        if doc is None:
+            return None
+        async with self._conn() as conn:
+            cur = await conn.execute(
+                _VERSION_SELECT + "JOIN kb_documents d ON d.id = v.document_id "
+                "WHERE d.owner_key = %s AND v.document_id = %s AND v.version = %s",
+                (owner_key, doc, int(version)))
+            row = await cur.fetchone()
+        return _version_from_row(row) if row is not None else None
+
+    # ── the two-step ingestion ───────────────────────────────────────────
+    async def save_draft(self, owner_key: str, document_id: str, version: int, *, chunks,
+                         pages: int, estimated_tokens: int, expires_at: datetime) -> bool:
+        require_owner(owner_key)
+        doc = _doc_uuid(document_id)
+        if doc is None:
+            return False
+        payload = json.dumps([{"ordinal": int(c.ordinal), "content": c.content,
+                               "heading_path": list(c.heading_path), "page": c.page}
+                              for c in chunks], ensure_ascii=False)
+        async with self._conn() as conn:
+            async with conn.transaction():
+                if await self._lock_document(conn, owner_key, doc) is None:
+                    return False
+                cur = await conn.execute(
+                    f"UPDATE kb_versions SET state = '{KB_AWAITING_CONFIRMATION}', reason = '', "
+                    "finished_at = NULL, pages = %s, estimated_tokens = %s, expires_at = %s "
+                    f"WHERE document_id = %s AND version = %s AND state = '{KB_PROCESSING}'",
+                    (int(pages), int(estimated_tokens), expires_at, doc, int(version)))
+                if cur.rowcount == 0:
+                    return False
+                await conn.execute(
+                    "INSERT INTO kb_drafts (document_id, version, chunks) VALUES (%s, %s, %s::jsonb) "
+                    "ON CONFLICT (document_id, version) DO UPDATE SET chunks = EXCLUDED.chunks, "
+                    "created_at = now()", (doc, int(version), payload))
+        return True
+
+    async def claim_draft(self, owner_key: str, document_id: str, version: int, *,
+                          now: datetime) -> "tuple[str, Optional[KbDraft]]":
+        require_owner(owner_key)
+        doc = _doc_uuid(document_id)
+        if doc is None:
+            return CLAIM_MISSING, None
+        async with self._conn() as conn:
+            async with conn.transaction():
+                if await self._lock_document(conn, owner_key, doc) is None:
+                    return CLAIM_MISSING, None
+                cur = await conn.execute(
+                    "SELECT v.embed_model, v.pages, v.estimated_tokens, v.expires_at, "
+                    "k.chunks, k.created_at FROM kb_versions v JOIN kb_drafts k "
+                    "  ON k.document_id = v.document_id AND k.version = v.version "
+                    "WHERE v.document_id = %s AND v.version = %s FOR UPDATE OF v",
+                    (doc, int(version)))
+                row = await cur.fetchone()
+                # The claim's ONE question is "is there a draft?" (the JOIN); whether the version
+                # is awaiting confirmation is the commit's — each proved by its own test.
+                if row is None:
+                    return CLAIM_MISSING, None
+                if row["expires_at"] is not None and row["expires_at"] <= now:
+                    return CLAIM_EXPIRED, None
+                await conn.execute(
+                    "DELETE FROM kb_drafts WHERE document_id = %s AND version = %s",
+                    (doc, int(version)))
+                await conn.execute(
+                    f"UPDATE kb_versions SET state = '{KB_PROCESSING}', claimed_at = %s "
+                    "WHERE document_id = %s AND version = %s", (now, doc, int(version)))
+        raw = row["chunks"]
+        items = json.loads(raw) if isinstance(raw, str) else raw
+        chunks = tuple(KbChunk(ordinal=int(c["ordinal"]), content=c["content"],
+                               heading_path=tuple(c.get("heading_path") or ()), page=c.get("page"))
+                       for c in items)
+        return CLAIM_OK, KbDraft(document_id=doc, version=int(version),
+                                 embed_model=row["embed_model"], chunk_count=len(chunks),
+                                 pages=int(row["pages"] or 0),
+                                 estimated_tokens=int(row["estimated_tokens"] or 0),
+                                 expires_at=row["expires_at"], chunks=chunks,
+                                 created_at=row["created_at"])
+
+    async def pending_drafts(self, owner_key: str) -> "list[KbDraft]":
+        require_owner(owner_key)
+        async with self._conn() as conn:
+            cur = await conn.execute(
+                "SELECT v.document_id, v.version, v.embed_model, v.pages, v.estimated_tokens, "
+                "v.expires_at, jsonb_array_length(k.chunks) AS n, k.created_at "
+                "FROM kb_drafts k JOIN kb_versions v "
+                "  ON v.document_id = k.document_id AND v.version = k.version "
+                "JOIN kb_documents d ON d.id = k.document_id WHERE d.owner_key = %s "
+                "ORDER BY v.expires_at, v.document_id, v.version", (owner_key,))
+            rows = await cur.fetchall()
+        return [KbDraft(document_id=str(r["document_id"]), version=int(r["version"]),
+                        embed_model=r["embed_model"], chunk_count=int(r["n"] or 0),
+                        pages=int(r["pages"] or 0),
+                        estimated_tokens=int(r["estimated_tokens"] or 0),
+                        expires_at=r["expires_at"], created_at=r["created_at"]) for r in rows]
+
+    async def expire_drafts(self, *, now: datetime, limit: int = 100) -> int:
+        async with self._conn() as conn:
+            async with conn.transaction():
+                # SKIP LOCKED: a draft being claimed right now is the claimer's, not the sweep's.
+                cur = await conn.execute(
+                    "SELECT v.document_id, v.version, d.owner_key FROM kb_versions v "
+                    "JOIN kb_documents d ON d.id = v.document_id "
+                    f"WHERE v.state = '{KB_AWAITING_CONFIRMATION}' AND v.expires_at <= %s "
+                    "ORDER BY v.expires_at, v.document_id, v.version LIMIT %s "
+                    "FOR UPDATE OF v SKIP LOCKED", (now, max(0, int(limit))))
+                due = await cur.fetchall()
+                for r in due:
+                    key = (str(r["document_id"]), int(r["version"]))
+                    await conn.execute(
+                        f"UPDATE kb_versions SET state = '{KB_ERROR}', reason = %s, "
+                        "finished_at = %s WHERE document_id = %s AND version = %s",
+                        (REASON_EXPIRED, now) + key)
+                    for table in ("kb_drafts", "kb_originals", "kb_chunks"):
+                        await conn.execute(
+                            f"DELETE FROM {table} WHERE document_id = %s AND version = %s", key)
+                    await conn.execute(
+                        "INSERT INTO kb_tombstones (owner_key, document_id, versions, kind, "
+                        "actor, removed_at) VALUES (%s, %s, %s::integer[], %s, '', %s)",
+                        (r["owner_key"], key[0], [key[1]], TOMBSTONE_EXPIRED, now))
+        return len(due)
+
+    @staticmethod
+    async def _end_version(conn, owner_key: str, doc: str, version: int, reason: str, kind: str,
+                           *, actor: str = "", at: Optional[datetime] = None) -> None:
+        """The version → ``error``/``reason``, its draft, original and partial chunks removed,
+        one tombstone — the ending the discard and the interruption share (inside the caller's
+        transaction, with the version already locked)."""
+        await conn.execute(
+            f"UPDATE kb_versions SET state = '{KB_ERROR}', reason = %s, "
+            "finished_at = COALESCE(%s, now()) WHERE document_id = %s AND version = %s",
+            (reason, at, doc, int(version)))
+        for table in ("kb_drafts", "kb_originals", "kb_chunks"):
+            await conn.execute(f"DELETE FROM {table} WHERE document_id = %s AND version = %s",
+                               (doc, int(version)))
+        await conn.execute(
+            "INSERT INTO kb_tombstones (owner_key, document_id, versions, kind, actor, removed_at) "
+            "VALUES (%s, %s, %s::integer[], %s, %s, COALESCE(%s, now()))",
+            (owner_key, doc, [int(version)], kind, str(actor or ""), at))
+
+    async def discard_draft(self, owner_key: str, document_id: str, version: int, *,
+                            actor: str = "") -> str:
+        require_owner(owner_key)
+        doc = _doc_uuid(document_id)
+        if doc is None:
+            return DISCARD_MISSING
+        async with self._conn() as conn:
+            async with conn.transaction():
+                if await self._lock_document(conn, owner_key, doc) is None:
+                    return DISCARD_MISSING
+                cur = await conn.execute(
+                    "SELECT state, reason FROM kb_versions WHERE document_id = %s AND version = %s "
+                    "FOR UPDATE", (doc, int(version)))
+                row = await cur.fetchone()
+                if row is None:
+                    return DISCARD_MISSING
+                if row["state"] == KB_ERROR and row["reason"] == REASON_DISCARDED:
+                    return DISCARD_OK                            # a repeat: nothing more to do
+                if row["state"] != KB_AWAITING_CONFIRMATION:
+                    return DISCARD_NOT_A_DRAFT
+                await self._end_version(conn, owner_key, doc, int(version), REASON_DISCARDED,
+                                        TOMBSTONE_DISCARDED, actor=actor)
+        return DISCARD_OK
+
+    async def interrupt_stale(self, *, older_than: datetime, limit: int = 100) -> int:
+        async with self._conn() as conn:
+            async with conn.transaction():
+                # SKIP LOCKED: a version a live worker holds right now is not stale — it is busy.
+                cur = await conn.execute(
+                    "SELECT v.document_id, v.version, d.owner_key FROM kb_versions v "
+                    "JOIN kb_documents d ON d.id = v.document_id "
+                    f"WHERE v.state = '{KB_PROCESSING}' "
+                    "AND COALESCE(v.claimed_at, v.created_at) < %s "
+                    "ORDER BY COALESCE(v.claimed_at, v.created_at), v.document_id, v.version "
+                    "LIMIT %s FOR UPDATE OF v SKIP LOCKED", (older_than, max(0, int(limit))))
+                due = await cur.fetchall()
+                for r in due:
+                    await self._end_version(conn, r["owner_key"], str(r["document_id"]),
+                                            int(r["version"]), REASON_INTERRUPTED,
+                                            TOMBSTONE_INTERRUPTED)
+        return len(due)
 
     # ── removal ──────────────────────────────────────────────────────────
     async def _remove(self, conn, rows: "list[Any]", kind: str, actor: str) -> int:

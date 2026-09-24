@@ -57,6 +57,13 @@
   diz por extenso onde os dois concordam e onde não. Vermelho produzido nos dois lados:
   achatar a ordem no in-memory e invertê-la no Postgres fazem-no falhar.
 
+- **`tests/test_documents_use_the_general_fold.py`** — os módulos de documentos (`documents`,
+  `ingest`, `chunking` e a secção de documentos do `in_memory`) NÃO dobram texto com a
+  `fold_label`, que é a regra de IDENTIDADE de rótulos do grafo. Marcado
+  `xfail(strict=True, reason="até a textfold chegar (#64)")`: hoje o stand-in léxico ainda a usa;
+  no dia em que a troca pela `textfold.fold` for feita o teste passa, o `strict` torna isso uma
+  falha e obriga a tirar a marca. Com controlo: a mesma contagem sobre a metade do grafo NÃO é 0.
+
 ### Notes
 
 - **Os backups da base de dados guardam um original até à retenção deles** — a purga não os

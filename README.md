@@ -242,9 +242,11 @@ payload = lexical.render(canonical_query, picked)            # each result under
   `relevant | nothing_relevant | error` — a source that broke is never reported as one that holds
   nothing.
 * **Content-free ids** (`edge:<node>.<n>`, `mem:<id>`): what a reply cites and a trace may keep.
-* **A cost bound by count** (`MAX_CANDIDATES`): ranking is CPU on your event loop; ~3 MB of
-  section-sized candidates capped here rank in well under 50 ms (`tests/test_lexical_cost.py`
-  times it, with its uncapped pair). The SIZE of each candidate is yours to cut.
+* **A cost bound by count** (`MAX_CANDIDATES`): ranking is CPU on your event loop; over ~3 MB
+  of section-sized candidates the capped ranking is ~16× cheaper than the uncapped one (~22 ms
+  against ~350 ms on a quiet box). `tests/test_lexical_cost.py` proves the cap mechanically and
+  asserts that RATIO, timed intercalated — never a number of milliseconds, which is the load's.
+  The SIZE of each candidate is yours to cut.
 
 It fetches nothing and decides nothing about who may read what — candidates arrive already
 fetched with your audience and your scopes. Why lexical and not a vector distance: a floor over

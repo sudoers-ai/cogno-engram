@@ -952,7 +952,10 @@ class InMemoryDocumentStore:
         self._docs: dict[str, _DocRow] = {}
         self._versions: dict[tuple[str, int], _VersionRow] = {}
         self._chunks: dict[tuple[str, int], dict[int, KbChunk]] = {}
-        self._originals: dict[tuple[str, int], bytes] = {}
+        # (document, version) → (owner_key, bytes). The OWNER rides with the bytes, so a count
+        # by owner sees an original whose document row is gone — the leftover a purge must not
+        # leave, which a count THROUGH the documents could never see.
+        self._originals: dict[tuple[str, int], tuple[str, bytes]] = {}
         self._tombstones: list[KbTombstone] = []
         self.original_reads = 0
 
@@ -1035,7 +1038,8 @@ class InMemoryDocumentStore:
         if v is None:
             return None
         self.original_reads += 1
-        return self._originals.get((row.id, v))
+        kept = self._originals.get((row.id, v))
+        return kept[1] if kept is not None else None
 
     # ── ingestion ────────────────────────────────────────────────────────
     async def begin_version(self, owner_key: str, document_id: str, *, sha256: str,
@@ -1055,7 +1059,7 @@ class InMemoryDocumentStore:
                 if v.state != KB_READY:
                     v.state, v.reason, v.finished_at = KB_PROCESSING, "", None
                 if original is not None and (row.id, v.version) not in self._originals:
-                    self._originals[(row.id, v.version)] = bytes(original)
+                    self._originals[(row.id, v.version)] = (row.owner_key, bytes(original))
                 return self._version(v)
         existing = self._versions_of(row.id)
         number = (existing[-1].version + 1) if existing else 1
@@ -1063,7 +1067,7 @@ class InMemoryDocumentStore:
                         embed_model=embed_model, size_bytes=int(size_bytes), created_at=now)
         self._versions[(row.id, number)] = v
         if original is not None:
-            self._originals[(row.id, number)] = bytes(original)
+            self._originals[(row.id, number)] = (row.owner_key, bytes(original))
         return self._version(v)
 
     async def add_chunks(self, owner_key: str, document_id: str, version: int,
@@ -1162,8 +1166,8 @@ class InMemoryDocumentStore:
 
     async def stored_original_bytes(self, owner_prefix: str) -> int:
         require_owner(owner_prefix)
-        owned = {d.id for d in self._docs.values() if owner_in_subtree(d.owner_key, owner_prefix)}
-        return sum(len(b) for (doc, _), b in self._originals.items() if doc in owned)
+        return sum(len(data) for owner, data in self._originals.values()
+                   if owner_in_subtree(owner, owner_prefix))
 
     # ── the reader path ──────────────────────────────────────────────────
     def _served(self, owner_key: str, profile: str) -> "list[tuple[_DocRow, _VersionRow]]":

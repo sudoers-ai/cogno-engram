@@ -620,6 +620,10 @@ async def ensure_documents_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDIN
         CREATE TABLE IF NOT EXISTS kb_originals (
             document_id  uuid NOT NULL,
             version      integer NOT NULL,
+            -- The owner rides with the bytes so `stored_original_bytes` counts them WITHOUT a
+            -- join: a count through `kb_documents` could never see a leftover whose document
+            -- row is gone, which is exactly what a purge check exists to catch.
+            owner_key    text NOT NULL,
             data         bytea NOT NULL,
             PRIMARY KEY (document_id, version),
             FOREIGN KEY (document_id, version)
@@ -2285,9 +2289,9 @@ class PostgresDocumentStore(_PgBase):
                         (doc, number, KB_PROCESSING, sha256, embed_model, int(size_bytes)))
                 if original is not None:
                     await conn.execute(
-                        "INSERT INTO kb_originals (document_id, version, data) VALUES (%s, %s, %s) "
-                        "ON CONFLICT (document_id, version) DO NOTHING",
-                        (doc, number, bytes(original)))
+                        "INSERT INTO kb_originals (document_id, version, owner_key, data) "
+                        "VALUES (%s, %s, %s, %s) ON CONFLICT (document_id, version) DO NOTHING",
+                        (doc, number, owner_key, bytes(original)))
                 return await self._version_record(conn, doc, number)
 
     async def add_chunks(self, owner_key: str, document_id: str, version: int,
@@ -2455,8 +2459,8 @@ class PostgresDocumentStore(_PgBase):
         async with self._conn() as conn:
             # `octet_length` is answered from the value's header, without de-TOASTing the bytes.
             cur = await conn.execute(
-                "SELECT COALESCE(sum(octet_length(o.data)), 0) AS n FROM kb_originals o "
-                f"JOIN kb_documents d ON d.id = o.document_id WHERE {_OWNER_SUBTREE}",
+                "SELECT COALESCE(sum(octet_length(d.data)), 0) AS n FROM kb_originals d "
+                f"WHERE {_OWNER_SUBTREE}",
                 (owner_prefix, self._subtree_like(owner_prefix)))
             row = await cur.fetchone()
         return int(row["n"])

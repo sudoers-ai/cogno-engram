@@ -430,6 +430,10 @@ async def test_ties_break_by_document_version_ordinal(docs):
     got = [(h.document_id, h.version, h.ordinal) for h in res.hits]
     assert got == sorted(got) and len(got) == 6
     assert {a, b} == {g[0] for g in got}
+    # the tie-break decides WHICH rows survive a limit, not only their order
+    cut = await docs.search(o, profile="GUEST", text="sábado", vector=vec(1.0),
+                            embed_model=MODEL_A, limit=3)
+    assert [(h.document_id, h.version, h.ordinal) for h in cut.hits] == got[:3]
 
 
 async def test_a_hit_carries_its_provenance_and_a_content_free_id(docs):

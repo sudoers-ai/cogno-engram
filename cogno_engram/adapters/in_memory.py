@@ -1,7 +1,7 @@
 """
 cogno_engram.adapters.in_memory — zero-dependency reference adapters.
 
-Pure-Python implementations of all three ports, for tests, local dev, and as the
+Pure-Python implementations of all four ports, for tests, local dev, and as the
 executable proof that the Protocols are honest. They implement the same hybrid
 retrieval fusion and multi-hop graph walk as the Postgres adapter, just over
 in-process structures (no persistence, single-process).
@@ -11,15 +11,49 @@ from __future__ import annotations
 
 import asyncio
 import math
+import re
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import AsyncIterator, Optional
 from uuid import uuid4
 
-from dataclasses import replace
 
-
+from cogno_engram import textfold
 from cogno_engram.folding import fold_label, has_diacritics
+from cogno_engram.documents import (
+    COMMIT_DELETED,
+    COMMIT_READY,
+    COMMIT_SUPERSEDED,
+    DEFAULT_MAX_BYTES,
+    KB_EMBED_SPACE_UNAVAILABLE,
+    KB_ERROR,
+    KB_PROCESSING,
+    KB_READY,
+    TOMBSTONE_DELETED,
+    TOMBSTONE_PURGED,
+    VALID_MEDIA_TYPES,
+    DocumentLimitReached,
+    KbChunk,
+    KbDocument,
+    KbHit,
+    KbSearchResult,
+    KbTombstone,
+    KbVersion,
+    OriginalTooLarge,
+    chunk_id,
+    clamp_unit,
+    hit_order_key,
+    hybrid_score,
+    owner_in_subtree,
+    profile_can_read,
+    require_model,
+    require_owner,
+    require_profile,
+    require_vector,
+    sanitize_profiles,
+    sanitize_reason,
+)
 from cogno_engram import write_loss
 from cogno_engram.trace_policy import TRACE_REVISION_WINDOW_S
 from cogno_engram.types import (
@@ -850,3 +884,388 @@ class InMemoryGraph:
         before_nodes = len(self._nodes)
         self._nodes = {k: n for k, n in self._nodes.items() if k[0] != scope}
         return (before_edges - len(self._edges)) + (before_nodes - len(self._nodes))
+
+
+# ── documents ────────────────────────────────────────────────────────────────────────
+
+@dataclass
+class _DocRow:
+    owner_key: str
+    id: str
+    title: str
+    profiles: tuple
+    media_type: str
+    active_version: Optional[int] = None
+    created_at: Optional[datetime] = None
+    updated_at: Optional[datetime] = None
+
+
+@dataclass
+class _VersionRow:
+    document_id: str
+    version: int
+    state: str
+    sha256: str
+    embed_model: str
+    reason: str = ""
+    size_bytes: int = 0
+    pages: int = 0
+    chunks: int = 0
+    created_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+
+
+def _doc_cosine(a: list[float], b: list[float]) -> float:
+    """The ONLY place the document store compares two vectors — a seam the space tests watch:
+    a search that reaches it with vectors of two different models is the defect."""
+    return _cosine(a, b)
+
+
+def _doc_terms(text: str) -> "set[str]":
+    """The words of ``text`` for the in-memory lexical stand-in: the GENERAL fold
+    (:func:`cogno_engram.textfold.fold`, no keyword step), then ``\\w+``, and NO stopwords — a
+    neutral stand-in, like Postgres ``simple`` plus accent folding. Not the graph's LABEL fold
+    (``cogno_engram.folding``): that is an IDENTITY rule, and borrowing it would make a change to
+    how labels are folded silently move how documents are matched — this section may not even
+    name it (``tests/test_documents_use_the_general_fold.py``).
+    Not ``lexical.tokens`` either: that one drops stopwords and cuts prefixes, because it is the
+    relevance engine's ruler, and this is the store's candidate test."""
+    return set(re.findall(r"\w+", textfold.fold(text)))
+
+
+def _doc_lexical(query_terms: "set[str]", content: str) -> float:
+    """Share of the query's DISTINCT words the chunk carries — a DECLARED stand-in for the
+    Postgres side's ``ts_rank_cd(tsv, query, 32)``, and NOT the same number.
+
+    What the two agree on, and what they do not, said in full because a double is only useful
+    when its limits are written down:
+
+    * **the same candidates**: ANY shared word makes a chunk a lexical candidate here, and the
+      Postgres side ORs the query's lexemes, so a chunk that carries no query word scores 0 on
+      both sides — and, on a lexical search, is absent from both;
+    * **the same range**: both are in ``[0, 1]``;
+    * **the same ORDER on a corpus where each query word occurs at most once per chunk**, under a
+      configuration that only lowercases (Postgres ``simple``, no stemming, no unaccent):
+      ``tests/test_documents_postgres.py::test_the_lexical_order_is_the_same_in_both_adapters``
+      pins it, and the ``0`` in the same place;
+    * **NOT the same value, and not the same order in general**: ``ts_rank_cd`` counts
+      OCCURRENCES and weighs their PROXIMITY (a word said three times outranks a word said once;
+      two words side by side outrank the same two far apart), while this counts distinct words
+      and nothing else. And the Postgres configuration may stem and fold accents (``portuguese``,
+      ``unaccent``), which this does not model beyond its accent fold. A test that needs the
+      real lexical VALUE belongs on the Postgres leg."""
+    if not query_terms:
+        return 0.0
+    return len(query_terms & _doc_terms(content)) / len(query_terms)
+
+
+class InMemoryDocumentStore:
+    """Reference ``DocumentStore`` — the executable statement of the rules in
+    ``cogno_engram.documents``, and the double a host codes against.
+
+    No ``await`` happens inside a method, so every method is atomic with respect to every other
+    coroutine: the swap in :meth:`commit_version` cannot be observed half-done, which is the
+    property the Postgres adapter buys with a transaction.
+
+    The originals live in their OWN mapping, apart from the rows a search walks — the same
+    separation the Postgres adapter makes with a table of their own — so no search can touch
+    them. :attr:`original_reads` counts every read of that mapping, for the test that proves it.
+    """
+
+    def __init__(self, *, embedding_dim: int = 768,
+                 max_original_bytes: int = DEFAULT_MAX_BYTES) -> None:
+        self.embedding_dim = int(embedding_dim)
+        self.max_original_bytes = int(max_original_bytes)
+        self._docs: dict[str, _DocRow] = {}
+        self._versions: dict[tuple[str, int], _VersionRow] = {}
+        self._chunks: dict[tuple[str, int], dict[int, KbChunk]] = {}
+        # (document, version) → (owner_key, bytes). The OWNER rides with the bytes, so a count
+        # by owner sees an original whose document row is gone — the leftover a purge must not
+        # leave, which a count THROUGH the documents could never see.
+        self._originals: dict[tuple[str, int], tuple[str, bytes]] = {}
+        self._tombstones: list[KbTombstone] = []
+        self.original_reads = 0
+
+    # ── rows → records ───────────────────────────────────────────────────
+    def _version(self, row: Optional[_VersionRow]) -> Optional[KbVersion]:
+        if row is None:
+            return None
+        return KbVersion(document_id=row.document_id, version=row.version, state=row.state,
+                         sha256=row.sha256, embed_model=row.embed_model, reason=row.reason,
+                         size_bytes=row.size_bytes, pages=row.pages, chunks=row.chunks,
+                         has_original=(row.document_id, row.version) in self._originals,
+                         created_at=row.created_at, finished_at=row.finished_at)
+
+    def _versions_of(self, document_id: str) -> "list[_VersionRow]":
+        return sorted((v for (d, _), v in self._versions.items() if d == document_id),
+                      key=lambda v: v.version)
+
+    def _document(self, row: _DocRow) -> KbDocument:
+        versions = self._versions_of(row.id)
+        active = self._versions.get((row.id, row.active_version)) \
+            if row.active_version is not None else None
+        return KbDocument(owner_key=row.owner_key, id=row.id, title=row.title,
+                          profiles=tuple(row.profiles), media_type=row.media_type,
+                          active=self._version(active),
+                          latest=self._version(versions[-1] if versions else None),
+                          created_at=row.created_at, updated_at=row.updated_at)
+
+    def _owned(self, owner_key: str, document_id: str) -> Optional[_DocRow]:
+        row = self._docs.get(str(document_id or ""))
+        return row if row is not None and row.owner_key == owner_key else None
+
+    def _drop_version(self, document_id: str, version: int) -> None:
+        self._versions.pop((document_id, version), None)
+        self._chunks.pop((document_id, version), None)
+        self._originals.pop((document_id, version), None)
+
+    # ── management ───────────────────────────────────────────────────────
+    async def create_document(self, owner_key: str, *, title: str, profiles, media_type: str,
+                              max_documents: Optional[int] = None) -> KbDocument:
+        require_owner(owner_key)
+        if media_type not in VALID_MEDIA_TYPES:
+            raise ValueError(f"unsupported media type {media_type!r}")
+        if max_documents is not None and \
+                sum(1 for d in self._docs.values() if d.owner_key == owner_key) >= max_documents:
+            raise DocumentLimitReached(f"owner already holds {max_documents} documents")
+        now = _now()
+        row = _DocRow(owner_key=owner_key, id=str(uuid4()), title=" ".join(str(title or "").split()),
+                      profiles=sanitize_profiles(profiles), media_type=media_type,
+                      created_at=now, updated_at=now)
+        self._docs[row.id] = row
+        return self._document(row)
+
+    async def get_document(self, owner_key: str, document_id: str) -> Optional[KbDocument]:
+        require_owner(owner_key)
+        row = self._owned(owner_key, document_id)
+        return self._document(row) if row is not None else None
+
+    async def list_documents(self, owner_key: str) -> "list[KbDocument]":
+        require_owner(owner_key)
+        rows = sorted((d for d in self._docs.values() if d.owner_key == owner_key),
+                      key=lambda d: (d.created_at or _now(), d.id))
+        return [self._document(r) for r in rows]
+
+    async def set_profiles(self, owner_key: str, document_id: str, profiles) -> bool:
+        require_owner(owner_key)
+        row = self._owned(owner_key, document_id)
+        if row is None:
+            return False
+        row.profiles = sanitize_profiles(profiles)
+        row.updated_at = _now()
+        return True
+
+    async def get_original(self, owner_key: str, document_id: str, *,
+                           version: Optional[int] = None) -> Optional[bytes]:
+        require_owner(owner_key)
+        row = self._owned(owner_key, document_id)
+        if row is None:
+            return None
+        v = row.active_version if version is None else int(version)
+        if v is None:
+            return None
+        self.original_reads += 1
+        kept = self._originals.get((row.id, v))
+        return kept[1] if kept is not None else None
+
+    # ── ingestion ────────────────────────────────────────────────────────
+    async def begin_version(self, owner_key: str, document_id: str, *, sha256: str,
+                            embed_model: str, size_bytes: int,
+                            original: Optional[bytes] = None) -> Optional[KbVersion]:
+        require_owner(owner_key)
+        require_model(embed_model, self.embedding_dim)
+        if original is not None and len(original) > self.max_original_bytes:
+            raise OriginalTooLarge(f"original of {len(original)} bytes is over the "
+                                   f"{self.max_original_bytes}-byte ceiling")
+        row = self._owned(owner_key, document_id)
+        if row is None:
+            return None
+        now = _now()
+        for v in self._versions_of(row.id):
+            if v.sha256 == sha256 and v.embed_model == embed_model:
+                if v.state != KB_READY:
+                    v.state, v.reason, v.finished_at = KB_PROCESSING, "", None
+                if original is not None and (row.id, v.version) not in self._originals:
+                    self._originals[(row.id, v.version)] = (row.owner_key, bytes(original))
+                return self._version(v)
+        existing = self._versions_of(row.id)
+        number = (existing[-1].version + 1) if existing else 1
+        v = _VersionRow(document_id=row.id, version=number, state=KB_PROCESSING, sha256=sha256,
+                        embed_model=embed_model, size_bytes=int(size_bytes), created_at=now)
+        self._versions[(row.id, number)] = v
+        if original is not None:
+            self._originals[(row.id, number)] = (row.owner_key, bytes(original))
+        return self._version(v)
+
+    async def add_chunks(self, owner_key: str, document_id: str, version: int,
+                         chunks) -> bool:
+        require_owner(owner_key)
+        row = self._owned(owner_key, document_id)
+        v = self._versions.get((row.id, int(version))) if row is not None else None
+        if v is None or v.state != KB_PROCESSING:
+            return False
+        rows = [(c, require_vector(c.embedding, self.embedding_dim, what="chunk embedding"))
+                for c in chunks]                          # validate ALL before staging any
+        staged = self._chunks.setdefault((v.document_id, v.version), {})
+        for c, emb in rows:
+            staged[int(c.ordinal)] = KbChunk(ordinal=int(c.ordinal), content=c.content,
+                                              heading_path=tuple(c.heading_path), page=c.page,
+                                              embedding=emb)
+        return True
+
+    async def commit_version(self, owner_key: str, document_id: str, version: int, *,
+                             pages: int) -> str:
+        require_owner(owner_key)
+        row = self._owned(owner_key, document_id)
+        if row is None:
+            return COMMIT_DELETED
+        v = self._versions.get((row.id, int(version)))
+        if v is None:
+            return COMMIT_SUPERSEDED              # discarded by a newer version's swap
+        newest = self._versions_of(row.id)[-1].version
+        if v.version != newest:
+            self._drop_version(row.id, v.version)
+            return COMMIT_SUPERSEDED
+        if v.state == KB_READY and row.active_version == v.version:
+            return COMMIT_READY
+        if v.state != KB_PROCESSING:
+            return COMMIT_SUPERSEDED
+        staged = self._chunks.get((row.id, v.version), {})
+        v.state, v.reason, v.finished_at = KB_READY, "", _now()
+        v.pages, v.chunks = int(pages), len(staged)
+        row.active_version = v.version
+        row.updated_at = v.finished_at
+        for old in self._versions_of(row.id):
+            if old.version < v.version:
+                self._drop_version(row.id, old.version)
+        return COMMIT_READY
+
+    async def fail_version(self, owner_key: str, document_id: str, version: int, *,
+                           reason: str) -> bool:
+        require_owner(owner_key)
+        row = self._owned(owner_key, document_id)
+        v = self._versions.get((row.id, int(version))) if row is not None else None
+        if v is None or v.state == KB_READY:
+            return False
+        v.state, v.reason, v.finished_at = KB_ERROR, sanitize_reason(reason), _now()
+        self._chunks.pop((v.document_id, v.version), None)
+        self._originals.pop((v.document_id, v.version), None)
+        return True
+
+    # ── removal ──────────────────────────────────────────────────────────
+    def _remove(self, row: _DocRow, kind: str, actor: str) -> None:
+        versions = tuple(v.version for v in self._versions_of(row.id))
+        for number in versions:
+            self._drop_version(row.id, number)
+        del self._docs[row.id]
+        self._tombstones.append(KbTombstone(owner_key=row.owner_key, document_id=row.id,
+                                            versions=versions, kind=kind,
+                                            actor=str(actor or ""), removed_at=_now()))
+
+    async def delete_document(self, owner_key: str, document_id: str, *, actor: str = "") -> bool:
+        require_owner(owner_key)
+        row = self._owned(owner_key, document_id)
+        if row is None:
+            return False
+        self._remove(row, TOMBSTONE_DELETED, actor)
+        return True
+
+    async def purge_owner_subtree(self, owner_prefix: str, *, actor: str = "") -> int:
+        require_owner(owner_prefix)
+        rows = [d for d in self._docs.values() if owner_in_subtree(d.owner_key, owner_prefix)]
+        for row in rows:
+            self._remove(row, TOMBSTONE_PURGED, actor)
+        return len(rows)
+
+    async def tombstones(self, owner_prefix: str, *, limit: int = 100) -> "list[KbTombstone]":
+        require_owner(owner_prefix)
+        rows = [(i, t) for i, t in enumerate(self._tombstones)
+                if owner_in_subtree(t.owner_key, owner_prefix)]
+        # newest first, then most recently written — the Postgres `removed_at DESC, id DESC`
+        rows.sort(key=lambda it: (it[1].removed_at or _now(), it[0]), reverse=True)
+        return [t for _, t in rows[:limit]]
+
+    async def prune_tombstones(self, *, before: datetime) -> int:
+        keep = [t for t in self._tombstones if (t.removed_at or _now()) >= before]
+        gone = len(self._tombstones) - len(keep)
+        self._tombstones = keep
+        return gone
+
+    async def stored_original_bytes(self, owner_prefix: str) -> int:
+        require_owner(owner_prefix)
+        return sum(len(data) for owner, data in self._originals.values()
+                   if owner_in_subtree(owner, owner_prefix))
+
+    # ── the reader path ──────────────────────────────────────────────────
+    def _served(self, owner_key: str, profile: str) -> "list[tuple[_DocRow, _VersionRow]]":
+        """Every (document, served version) ``profile`` may read — THE filter of the reader path:
+        this owner, a served version, that version ``ready``, the profile published to."""
+        out = []
+        for row in self._docs.values():
+            if row.owner_key != owner_key or row.active_version is None:
+                continue
+            if not profile_can_read(profile, row.profiles):
+                continue
+            v = self._versions.get((row.id, row.active_version))
+            if v is None or v.state != KB_READY:
+                continue
+            out.append((row, v))
+        return out
+
+    async def readable_documents(self, owner_key: str, *, profile: str) -> "list[KbDocument]":
+        require_owner(owner_key)
+        require_profile(profile)
+        rows = sorted(self._served(owner_key, profile),
+                      key=lambda rv: (rv[0].created_at or _now(), rv[0].id))
+        return [self._document(r) for r, _ in rows]
+
+    async def search(self, owner_key: str, *, profile: str, text: str,
+                     vector: Optional[list[float]] = None, embed_model: Optional[str] = None,
+                     limit: int = 5,
+                     weights: Optional[HybridWeights] = None) -> KbSearchResult:
+        require_owner(owner_key)
+        require_profile(profile)
+        if vector is not None and embed_model is None:
+            raise ValueError("a query vector needs the label of the model that made it")
+        if embed_model is not None:
+            require_model(embed_model, self.embedding_dim)
+        query = require_vector(vector, self.embedding_dim, what="query vector") \
+            if vector is not None else None
+        w = weights or HybridWeights()
+        terms = _doc_terms(text)
+        served = self._served(owner_key, profile)
+        models = {v.embed_model for _, v in served}
+        unavailable = sorted(models if query is None else models - {embed_model})
+        use_vector = query is not None and not unavailable        # all or none
+        hits = []
+        for row, v in served:
+            for chunk in self._chunks.get((row.id, v.version), {}).values():
+                vs = clamp_unit(_doc_cosine(query, chunk.embedding)) \
+                    if use_vector and query is not None and chunk.embedding is not None else None
+                ls = clamp_unit(_doc_lexical(terms, chunk.content))
+                if vs is None and ls <= 0:
+                    continue
+                hits.append(KbHit(
+                    id=chunk_id(row.id, v.version, chunk.ordinal), document_id=row.id,
+                    version=v.version, ordinal=chunk.ordinal, title=row.title,
+                    heading_path=tuple(chunk.heading_path), page=chunk.page,
+                    content=chunk.content, embed_model=v.embed_model, vector_score=vs,
+                    lexical_score=ls,
+                    score=hybrid_score(vs, ls, vector_weight=w.vector, lexical_weight=w.lexical)))
+        hits.sort(key=hit_order_key)
+        return KbSearchResult(
+            hits=tuple(hits[:max(0, int(limit))]),
+            degradations=(KB_EMBED_SPACE_UNAVAILABLE,) if unavailable else (),
+            models_unavailable=tuple(unavailable))
+
+    # ── maintenance ──────────────────────────────────────────────────────
+    async def stale_documents(self, *, embed_model: str, limit: int = 100) -> "list[KbDocument]":
+        require_model(embed_model, self.embedding_dim)
+        rows = []
+        for row in self._docs.values():
+            v = self._versions.get((row.id, row.active_version)) \
+                if row.active_version is not None else None
+            if v is not None and v.embed_model != embed_model:
+                rows.append(row)
+        rows.sort(key=lambda d: (d.created_at or _now(), d.id))
+        return [self._document(r) for r in rows[:limit]]

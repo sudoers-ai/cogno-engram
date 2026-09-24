@@ -136,6 +136,52 @@ top = rerank(candidates, query_text=q.text, top_k=5)   # sim + recency-decay + c
 
 Pass 1 is pure (`sim·0.60 + recency·0.25 + category·0.15`, half-life and boosts configurable via `RerankConfig`). Pass 2 is an optional **host-injected** cross-encoder callable `(query, [content]) -> [score]` — so cogno-engram ships no heavy ML dependency.
 
+## Lexical relevance — `cogno_engram.lexical`
+
+A retrieval that fetches by proximity always has a nearest, so it always returns something.
+`cogno_engram.lexical` is the part that says whether what came back is ABOUT the question — and,
+when nothing is, says *nothing relevant* instead of handing over the nearest noise:
+
+```python
+from cogno_engram import lexical
+
+asked = lexical.variants(canonical_query, contact_text)      # the rewrite + the contact's words
+pool = (lexical.graph_candidates(walks, limit=lexical.MAX_CANDIDATES + 1)
+        + lexical.memory_candidates(records))                # your reads, your audience rules
+decision, picked = lexical.decide(lexical.rank(pool, asked), failed=sources_that_broke)
+payload = lexical.render(canonical_query, picked)            # each result under a citable id
+```
+
+* **One tokenizer** (`tokens` + `STOPWORDS`): the accent/case fold (`textfold.fold`, below),
+  Portuguese plural fold, function words dropped. Hand the SAME callable to a ranking and to
+  every floor over it.
+* **One score** (`relevance`): the share of the question's meaning-carrying words a candidate
+  carries, the better of the query variants; a one-hop inheritance along a graph walk
+  (`HOP_DECAY`); a deterministic tie-break.
+* **One floor** (`RELEVANCE_FLOOR`, a point on this lexical scale — the default was calibrated
+  by a consumer over its own labelled set; pass your own) and a closed decision:
+  `relevant | nothing_relevant | error` — a source that broke is never reported as one that holds
+  nothing.
+* **Content-free ids** (`edge:<node>.<n>`, `mem:<id>`): what a reply cites and a trace may keep.
+* **A cost bound by count** (`MAX_CANDIDATES`): ranking is CPU on your event loop; ~3 MB of
+  section-sized candidates capped here rank in well under 50 ms (`tests/test_lexical_cost.py`
+  times it, with its uncapped pair). The SIZE of each candidate is yours to cut.
+
+It fetches nothing and decides nothing about who may read what — candidates arrive already
+fetched with your audience and your scopes. Why lexical and not a vector distance: a floor over
+a cosine is a number about the embedder, while the share of folded words is the same number in a
+unit test and in production. The price is stated in the module: a paraphrase that shares no word
+with the question scores zero.
+
+### One fold — `cogno_engram.textfold`
+
+`fold(text, *, punctuation=False, apostrophes=False, collapse_whitespace=False, strip=False)` is
+the accent and case fold for every lexicon you compare against: NFKD → combining marks dropped →
+`casefold`, in that order, idempotent over all of Unicode, with each consumer's extra step as a
+keyword it has to SAY. Use it rather than a private copy — a copy that drifts moves a match with
+no red anywhere. It is NOT a key fold: the graph's node identity is `folding.fold_label`, which
+must agree with Postgres `unaccent` and deliberately differs.
+
 ## EngramBench
 
 A self-contained quality harness (no DB, no model — deterministic) over the in-memory adapter, scoring the substrate's three jobs:

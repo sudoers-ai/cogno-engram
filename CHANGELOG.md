@@ -1,5 +1,113 @@
 # Changelog
 
+## Unreleased — a DOBRA de texto e a RELEVÂNCIA léxica passam a viver aqui: uma dobra, um tokenizador, um score, um piso (2026-09-24)
+
+### Added
+
+- **`cogno_engram.textfold`** — `fold(text, *, punctuation=False, apostrophes=False,
+  collapse_whitespace=False, strip=False)`: a ÚNICA dobra de acento e caixa para todo léxico que
+  um consumidor compara, com as diferenças entre consumidores como argumentos que o chamador tem
+  de DIZER. Base: NFKD → marcas combinantes fora → `casefold`, por esta ordem.
+
+  **Veio do host de referência, sem mudar um byte de código** (comparado por AST, docstrings e
+  comentários à parte: as quatro instruções de topo do módulo são idênticas às do host). O host
+  passa a RE-EXPORTÁ-LA (`from cogno_engram.textfold import fold`) e apaga o algoritmo: uma
+  definição, dois repositórios, e o teste de identidade (`is`) do lado do host. Os porquês vão
+  na FORMA: NFKD e não NFD (compatibilidade: ligaduras, numerais romanos, algarismos em círculo,
+  os alfabetos matemáticos em que se escrevem nomes de exibição); a dobra de caixa POR ÚLTIMO
+  (com ela primeiro, os caracteres cuja decomposição de compatibilidade é maiúscula saem
+  maiúsculos e uma segunda dobra muda-os outra vez — com ela por último a dobra é idempotente em
+  todo o Unicode); `casefold` e não `lower` («Straße» é «Strasse»; o sigma final em contexto).
+
+  **`folding.fold_label` fica DISTINTA, e declarada** — é a dobra de CHAVE dos nós, tem de
+  concordar com o `unaccent` do Postgres (translitera, NFD) e não segue esta. Nenhuma linha dela
+  mudou neste PR. As duas diferem em 3 757 code points, e um teste diz isso nos dois sentidos.
+
+- **`cogno_engram.lexical`** — o motor que diz se um candidato é SOBRE a pergunta, e que, quando
+  nada é, responde *nothing relevant* em vez de entregar o vizinho mais próximo. Uma recuperação
+  por PROXIMIDADE tem sempre um mais próximo, portanto devolve sempre alguma coisa; o que a
+  transforma num «não há nada» honesto é um PISO, e um piso precisa de um score que signifique o
+  mesmo onde quer que seja tirado.
+
+  **Veio do host de referência, e veio INTEIRO — não é um motor novo.** Vivia lá (a pesquisa
+  híbrida do `knowledge_search`, em sombra, e o tokenizador do material que o `consult_material`
+  lê). A regra do ecossistema é que o host fica com o negócio e a engenharia sai para as libs: o
+  que aqui chega é o algoritmo; quem pode ler o quê, o tecto de TEMPO do turno, o corte do
+  material e a calibração ficam no host. **A equivalência foi MEDIDA contra as funções que
+  substitui, não afirmada**: 0 de 1 112 064 code points divergem na dobra, 0 de 100 000 cadeias no
+  tokenizador e nos `terms` (prefixos 0/5/6/7), 0 de 400 mundos aleatórios em candidatos,
+  ranking, decisão, `render` e `variants`. O comparador foi provado a ver: contra `fold_label` dá
+  3 757 code points divergentes.
+
+  - **um tokenizador** — `tokens` + `STOPWORDS` (a `textfold.fold`, o plural português, palavras
+    funcionais fora), a ÚNICA definição de palavra que um ranking e todo piso sobre ele partilham
+    (é um objecto: um teste pode afirmar identidade em vez de concordância);
+  - **um score** — `terms`, `relevance` (a fracção das palavras da PERGUNTA que o candidato
+    carrega, a melhor das variantes — a reescrita canónica e as palavras do próprio contacto),
+    `rank` com herança de UM salto ao longo de um walk do grafo (`HOP_DECAY`) e desempate
+    determinístico, `chosen`, `variants`;
+  - **uma decisão** — `decide` sobre um alfabeto fechado (`DECISION_RELEVANT`/`_NOTHING`/`_ERROR`):
+    uma fonte que PARTIU nunca se lê como uma fonte que não tem nada;
+  - **candidatos a partir dos tipos DESTA lib** — `graph_candidates` (os `(variant, rank, node_id,
+    edges)` de um walk), `memory_candidates` (registos de memória), `edge_text`, `edge_end`, cada
+    um com um id SEM CONTEÚDO (`edge:<nó>.<n>`, `mem:<id>`) que uma resposta cita e um traço pode
+    guardar; `render` é o payload com esses ids;
+  - **as constantes** — `RELEVANCE_FLOOR` (0,3), `STEM_PREFIX` (0), `HOP_DECAY` (0,5), `TOP_K` (5)
+    e **`MAX_CANDIDATES`** (2 000), o tecto de TRABALHO por contagem.
+
+  **O piso é um ponto desta escala, e a curva que o escolheu é do CONSUMIDOR.** Não há aqui teste
+  de calibração, e isso é de propósito: o 0,3 foi escolhido sobre o conjunto rotulado de quem o
+  consome (~40 perguntas inventadas, três fontes, quatro leitores), e é esse teste que fixa esta
+  constante — uma mudança aqui que mova o óptimo fica vermelha lá, no bump do pino.
+  `test_the_default_floor_keeps_a_third_and_drops_a_quarter` diz o que 0,3 FAZ nesta escala, não
+  porque é 0,3.
+
+  **O tecto é por CONTAGEM, e o tamanho de cada candidato é do chamador.** Um ranking é CPU e,
+  num event loop, CPU não se interrompe: ~3 MB de candidatos do tamanho de uma secção prenderam o
+  loop ~325–400 ms no `rank` (medido aqui e, antes, no host). Com `MAX_CANDIDATES` ficam em
+  ~22 ms nesta máquina. 2 000 candidatos de 1,5 KB são os mesmos 3 MB outra vez: quem constrói
+  candidatos a partir de um documento grande corta-o antes; os construtores param EM `limit`
+  (pede-se um a mais e sabe-se que o tecto bateu sem construir a cauda).
+
+### Changed (em relação às cópias que substituem)
+
+- **`graph_candidates(..., baseline_nodes=0)`** — a marca `old` («esta aresta também é do caminho
+  ANTIGO») dependia de uma constante do host (quantos nós o caminho antigo anda). É um facto sobre
+  o OUTRO caminho, portanto passa a ser um argumento; `0` não marca nenhuma. O host passa o seu.
+- **`edge_end`** — era `_end`, privada, e o bench do host importava-a; um nome privado importado de
+  fora de uma lib é uma API que ninguém declarou.
+- **O docstring de `edge_text` deixa de dizer «a MESMA forma que o `format_graph_context`»** sem
+  qualificação: é a mesma FORMA, não os mesmos bytes — o detalhe aqui corta a 160 sem reticências,
+  lá a 120 com `…`. Mantido como estava porque este é o texto que é PONTUADO, e um corte que mude
+  move scores.
+- **`docs/HOST_INTEGRATION.md`** ganha as duas costuras: como um host compõe as suas leituras com o
+  `lexical` (e o que continua a ser dele — leituras, tamanho, relógio, calibração) e como re-exporta
+  a `textfold` em vez de manter uma cópia.
+- **Os docstrings de `textfold` perdem os nomes dos módulos do host** que cada passo servia e o
+  caso que ilustrava a ordem; ficam as razões.
+
+### Testes
+
+- `tests/test_textfold.py` (11) — os sete primeiros MUDARAM-SE com a função (os três passos
+  explícitos, o que a base deixa em paz, a idempotência em todo o Unicode e em 100 000 cadeias, os
+  nomes em letras matemáticas — gerados, não colados —, o conjunto onde a ORDEM mudou e o conjunto
+  onde o `casefold` mudou, sempre como CONJUNTOS e nunca como contagem: a contagem é da base
+  Unicode do Python, e cresce entre 3.10 e 3.12); os restantes são a paridade da FUNÇÃO nesses dois
+  conjuntos (responde à base nova, e as bases antigas divergem lá — o controlo), o `None`, e a
+  `fold_label` declarada distinta.
+- `tests/test_lexical.py` (23) — os sete primeiros MUDARAM-SE com o motor (termos, relevância nas
+  duas línguas, o zero que nunca passa, a variante que só entra se acrescenta palavras, o salto
+  só para a frente, o desempate, as stopwords no alfabeto do tokenizador), com os fixtures
+  RE-INVENTADOS; os restantes são desta lib (o plural e o que ele não faz, o piso nesta escala,
+  ids sem conteúdo, dedupe, `baseline_nodes`, `edge_text`, memórias sem id ou vazias, erro vs
+  nada, top-k, desempate completo, `render`).
+- `tests/test_lexical_cost.py` (3) — o gémeo de tempo e o seu par, e o tecto que pára a
+  CONSTRUÇÃO e não só o resultado. O relógio é o CPU do processo, com o GC em pausa e **sem
+  tracer**: esta CI corre a suíte sob `--cov`, e o tracer de linha quadruplicou a leitura (medido
+  na perna 3.10: 86,6 ms sob cobertura, ~22 ms sem ela). É o custo do instrumento, não do código;
+  o par é medido na mesma condição, para que o tecto não possa passar por o tracer estar ligado
+  numa metade e desligado na outra.
+
 ## Unreleased — o vocabulário de status deixa de ser escrito à mão dentro do SQL (2026-08-27)
 
 ### Changed

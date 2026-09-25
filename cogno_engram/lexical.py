@@ -323,10 +323,11 @@ def graph_candidates(walks: Iterable[tuple], limit: Optional[int] = None, *,
                 continue
             seen.add(key)
             store_id = getattr(edge, "id", None)
-            numbered = isinstance(store_id, int) and not isinstance(store_id, bool)
-            out.append(Candidate(id=f"edge:{store_id}" if numbered else f"edge:{node_id}.{n}",
-                                 source=SOURCE_GRAPH, text=edge_text(edge),
-                                 prior=store_id if numbered else len(out),
+            if isinstance(store_id, int) and not isinstance(store_id, bool):
+                cid, prior = f"edge:{store_id}", store_id
+            else:
+                cid, prior = f"edge:{node_id}.{n}", len(out)
+            out.append(Candidate(id=cid, source=SOURCE_GRAPH, text=edge_text(edge), prior=prior,
                                  old=(variant == 0 and rank < baseline_nodes),
                                  head=edge_end(getattr(edge, "source", "")),
                                  tail=edge_end(getattr(edge, "target", ""))))

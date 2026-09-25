@@ -31,8 +31,10 @@ from cogno_engram.documents import (
     KbDocument,
     KbDraft,
     KbSearchResult,
+    VERSION_TEXT_LIMIT,
     KbTombstone,
     KbVersion,
+    KbVersionText,
 )
 
 from cogno_engram.types import (
@@ -295,9 +297,9 @@ class DocumentStore(Protocol):
       document in state ``ready`` is ever read, and only when ``profile`` is one it is
       published to.
     * The MANAGEMENT path — :meth:`get_document`, :meth:`list_documents`, :meth:`get_original`,
-      :meth:`tombstones` — is what the owner's administrator calls to see and fix what they
-      uploaded. It takes no profile because the administrator sees everything they own; a host
-      must never call it on a contact's turn.
+      :meth:`version_text`, :meth:`tombstones` — is what the owner's administrator calls to see
+      and fix what they uploaded. It takes no profile because the administrator sees everything
+      they own; a host must never call it on a contact's turn.
 
     **The write path is the ingestion's** (``cogno_engram.ingest.ingest`` composes it):
     ``begin_version`` → ``add_chunks`` → ``commit_version`` (atomic swap) or ``fail_version``.
@@ -323,6 +325,21 @@ class DocumentStore(Protocol):
                            profiles: Sequence[str]) -> bool: ...
     async def get_original(self, owner_key: str, document_id: str, *,
                            version: Optional[int] = None) -> Optional[bytes]: ...
+    # The extracted TEXT of one version, as the assistant reads it: its chunks in ``ordinal``
+    # order, each as ``(ordinal, page, heading_path, text)`` with the heading path OFF the text
+    # (``chunking.chunk_text``). Readable: the SERVED version in state ``ready`` (``version=None``
+    # is that one) and a DRAFT in ``awaiting_confirmation`` (its chunks, never a vector) — so the
+    # uploader can check what was extracted BEFORE confirming its cost. ``None`` for anything else:
+    # ``processing``, ``error``, a version the swap removed, a document of another owner, an id
+    # that cannot exist. ``page`` filters by PDF page and is IGNORED on a version without pages;
+    # ``after`` is an EXCLUSIVE ordinal cursor; ``limit`` is cut to
+    # ``documents.VERSION_TEXT_MAX_LIMIT``; ``page``/``after``/``limit`` that are not integers of
+    # the right range are a ``ValueError``. Past the end → a result with no chunks, never ``None``.
+    # Never reads an original.
+    async def version_text(self, owner_key: str, document_id: str, *,
+                           version: Optional[int] = None, page: Optional[int] = None,
+                           after: Optional[int] = None,
+                           limit: int = VERSION_TEXT_LIMIT) -> Optional[KbVersionText]: ...
 
     # ── ingestion (see cogno_engram.ingest) ──────────────────────────────
     # Idempotent by ``(document, sha256, embed_model)``: an attempt at content+model already

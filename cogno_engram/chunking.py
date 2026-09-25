@@ -176,8 +176,30 @@ def _path(root: tuple[str, ...], trail: Sequence[str]) -> tuple[str, ...]:
 
 
 def _content(path: Sequence[str], body: str, config: ChunkingConfig) -> str:
+    """What a chunk's ``content`` is: the heading path, a blank line, the passage. Its inverse is
+    :func:`chunk_text`, right below — the two are one rule, pinned by a round-trip test."""
     head = config.path_separator.join(path)
     return f"{head}\n\n{body}" if head else body
+
+
+def chunk_text(content: str, heading_path: Sequence[str]) -> str:
+    """The passage of a chunk WITHOUT the heading path :func:`_content` put at its head — what a
+    person reads beside the path, which travels structured in ``heading_path``.
+
+    The separator the chunker joined the path with is a ``ChunkingConfig`` choice the store does
+    not record, so it is READ from the head itself rather than assumed: the head is stripped only
+    when it is EXACTLY the path's titles joined by one separator, then a blank line. Anything else
+    — a chunk written by another writer, a path that is not at its head — comes back whole: at
+    worst a reader sees the path twice, never a passage with its first line cut off. Pure."""
+    path = [str(t) for t in heading_path]
+    head, blank, body = str(content).partition("\n\n")
+    if not path or not blank or not head.startswith(path[0]):
+        return content
+    if len(path) == 1:
+        return body if head == path[0] else content
+    gap = head.find(path[1], len(path[0]))
+    separator = head[len(path[0]):gap] if gap > len(path[0]) else ""
+    return body if separator and head == separator.join(path) else content
 
 
 class _Emitter:

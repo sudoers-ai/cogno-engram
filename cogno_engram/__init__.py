@@ -22,8 +22,10 @@ from cogno_engram.documents import (
     KbDocument,
     KbHit,
     KbSearchResult,
+    KbTextChunk,
     KbTombstone,
     KbVersion,
+    KbVersionText,
     TextExtractor,
     embed_model_label,
 )
@@ -79,6 +81,7 @@ __all__ = [
     # documents (see cogno_engram.documents / .chunking / .ingest)
     "documents", "chunking", "ingest", "ingest_document", "documents_probe", "IngestOutcome",
     "KbDocument", "KbVersion", "KbChunk", "KbHit", "KbSearchResult", "KbTombstone",
+    "KbVersionText", "KbTextChunk",
     "TextExtractor", "embed_model_label", "KB_EMBED_SPACE_UNAVAILABLE",
     # types
     "Session", "TurnRecord", "TurnTrace", "MemoryRecord", "GraphNode", "GraphEdge", "NodeContext", "GraphStats",

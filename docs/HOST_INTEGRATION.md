@@ -222,6 +222,12 @@ await interrupt_stale(docs, older_than=clock() - timedelta(minutes=30))
 # the uploader withdraws a draft: its original goes NOW, not in 24 h
 await discard_draft(docs, owner, doc.id, draft.version, actor=admin_id)  # "discarded"|"not_a_draft"|"missing"
 
+# the admin's "view" (management path, no profile, never on a turn): the text as the assistant
+# reads it — the served version, or a draft BEFORE its cost is confirmed
+text = await docs.version_text(owner, doc.id, version=draft.version, page=None, after=None)
+# text.state in ("ready", "awaiting_confirmation"); text.chunks[i].text has the path OFF;
+# continue with after=text.next_after while text.has_more; None → nothing readable
+
 # a turn (the reader path): profile is REQUIRED, and it is the reader's, not the model's
 res = await docs.search(owner, profile=identity_role, text=original_text,
                         vector=query_vector, embed_model=model)
@@ -272,6 +278,19 @@ res = await docs.search(owner, profile=identity_role, text=original_text,
   tombstone per document (ids, versions, when, who — no title, no text). `prune_tombstones`
   bounds their retention. **Backups are out of reach:** a database backup keeps an original
   until the backup's own retention expires — record that in the operator's data policy.
+- **Reading a version's text.** `version_text` is the management read behind a "view what is in
+  this document" screen, and it answers what the ASSISTANT reads — the chunks, with their 15%
+  overlap — not the original file. Readable: the served version and a draft in
+  `awaiting_confirmation` (read from the draft itself: nothing is embedded to show it). `None`
+  for every other version; to tell "exists or existed, not served" from "never existed", compare
+  the number with `get_document(...).latest.version` — numbers are assigned increasing, never
+  reused, and the latest attempt is never the one a removal takes (a test pins it). The passage
+  comes with its heading path OFF (`KbTextChunk.text`); do not strip it in the host — the rule
+  lives beside the chunker (`chunking.chunk_text`). `page` is the PDF page and is ignored on a
+  version without pages; `after` is an exclusive ordinal cursor; `limit` is cut to
+  `VERSION_TEXT_MAX_LIMIT`. Postgres reads the version and its slice in ONE snapshot
+  (`REPEATABLE READ, READ ONLY`, no lock) and slices a draft's chunks inside the database. It is
+  part of `documents_probe`.
 - **The removal trail.** `tombstones(owner_prefix)` (newest first) is where every removal of a
   version's content is recorded — `deleted`, `purged`, `expired`, `discarded`, `interrupted`,
   `superseded` and `failed`. `superseded` is the commit's own: ONE per commit naming every

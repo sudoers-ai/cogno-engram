@@ -4,7 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from cogno_engram.chunking import DEFAULT_CHUNKING, ChunkingConfig, chunk_markdown, chunk_pages
+from cogno_engram.chunking import (
+    DEFAULT_CHUNKING,
+    ChunkingConfig,
+    chunk_markdown,
+    chunk_pages,
+    chunk_text,
+)
 from cogno_engram.documents import ExtractedPage, ExtractionError, OutlineEntry
 
 SMALL = ChunkingConfig(target_chars=200, overlap=0.15)
@@ -135,3 +141,43 @@ def test_a_blank_title_leaves_only_the_headings():
 def test_nonsense_configurations_are_refused(kwargs):
     with pytest.raises(ValueError):
         ChunkingConfig(**kwargs)
+
+
+# ── chunk_text: the inverse of the head the chunker writes, in the SAME module ──────────
+#
+# A reader of a version's text (``DocumentStore.version_text``) shows the passage beside its
+# heading path. Taking the head off anywhere else would copy the chunker's format into a second
+# place; this pins the two against each other over what the chunker actually emits.
+
+ROUND_TRIP_MD = ("Antes de tudo.\n\n# Horários\n\nTexto geral.\n\n### Sábado\n\n8h às 12h.\n\n"
+                 "Segundo parágrafo\n\ncom linha em branco.\n\n# Preços\n\n"
+                 + " ".join(f"palavra{i:03d}" for i in range(120)) + "\n")
+
+
+@pytest.mark.parametrize("separator", [" › ", " / ", "::", " — "])
+def test_chunk_text_takes_off_exactly_the_head_the_chunker_wrote(separator):
+    config = ChunkingConfig(target_chars=200, overlap=0.15, path_separator=separator)
+    pages = [ExtractedPage(1, "Primeira página.\n\nOutro parágrafo."),
+             ExtractedPage(2, " ".join(["segunda"] * 60))]
+    outline = [OutlineEntry(1, "Parte I", 1), OutlineEntry(2, "Cap. 1", 2)]
+    chunks = chunk_markdown("Guia", ROUND_TRIP_MD, config) + chunk_pages("Doc", pages, outline,
+                                                                          config)
+    assert len(chunks) > 6 and any(len(c.heading_path) >= 3 for c in chunks)   # the shape exists
+    for c in chunks:
+        text = chunk_text(c.content, c.heading_path)
+        # the head is gone, whole — and putting it back gives the stored content byte for byte
+        assert f"{separator.join(c.heading_path)}\n\n{text}" == c.content, c.ordinal
+    # CONTROL — the body keeps its OWN blank lines: only the first one (the head's) is taken
+    [two] = [c for c in chunks if "Segundo parágrafo" in c.content]
+    assert chunk_text(two.content, two.heading_path).count("\n\n") >= 1
+
+
+@pytest.mark.parametrize("content, path", [
+    ("Horários › Sábado\n\nAbrimos.", ("Manual",)),       # a head that is not THIS path
+    ("Manual › Outro\n\nAbrimos.", ("Manual", "Horários")),
+    ("Manual\nAbrimos.", ("Manual",)),                    # no blank line after the head
+    ("Abrimos às 8h.", ("Manual",)),                       # no head at all
+    ("Manual\n\nAbrimos.", ()),                          # no path to take off
+])
+def test_chunk_text_leaves_a_chunk_whole_when_its_head_is_not_the_path(content, path):
+    assert chunk_text(content, path) == content

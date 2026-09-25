@@ -67,9 +67,13 @@ from cogno_engram.documents import (
     KbDraft,
     KbHit,
     KbSearchResult,
+    KbTextChunk,
     KbTombstone,
     KbVersion,
+    KbVersionText,
     OriginalTooLarge,
+    VERSION_TEXT_LIMIT,
+    assemble_version_text,
     chunk_id,
     clamp_unit,
     hit_order_key,
@@ -81,7 +85,10 @@ from cogno_engram.documents import (
     sanitize_profiles,
     sanitize_reason,
     section_headings,
+    text_page_filter,
+    text_window,
 )
+from cogno_engram.chunking import chunk_text
 from cogno_engram.trace_policy import TRACE_REVISION_WINDOW_S
 from cogno_engram.folding import FOLD_FUNCTION_SQL, fold_label
 from cogno_engram.types import (
@@ -2442,6 +2449,70 @@ class PostgresDocumentStore(_PgBase):
                 (owner_key, doc, version))
             row = await cur.fetchone()
         return bytes(row["data"]) if row is not None else None
+
+    async def version_text(self, owner_key: str, document_id: str, *,
+                           version: Optional[int] = None, page: Optional[int] = None,
+                           after: Optional[int] = None,
+                           limit: int = VERSION_TEXT_LIMIT) -> Optional[KbVersionText]:
+        require_owner(owner_key)
+        page, start, size = text_window(page, after, limit)
+        doc = _doc_uuid(document_id)
+        if doc is None:
+            return None
+        async with self._conn() as conn:
+            # ONE snapshot for the version and its slice: a swap committing between the two reads
+            # would otherwise pair one version's state with another's chunks (or none). Read
+            # only, no lock — a reader never holds up a commit.
+            async with conn.transaction():
+                await conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+                cur = await conn.execute(
+                    "SELECT d.active_version, v.version, v.state, v.pages, "
+                    "  (o.document_id IS NOT NULL) AS has_original, "
+                    "  (k.document_id IS NOT NULL) AS has_draft "
+                    "FROM kb_documents d JOIN kb_versions v ON v.document_id = d.id "
+                    "  AND v.version = COALESCE(%s::integer, d.active_version) "
+                    "LEFT JOIN kb_originals o "
+                    "  ON o.document_id = v.document_id AND o.version = v.version "
+                    "LEFT JOIN kb_drafts k "
+                    "  ON k.document_id = v.document_id AND k.version = v.version "
+                    "WHERE d.owner_key = %s AND d.id = %s",
+                    (None if version is None else int(version), owner_key, doc))
+                v = await cur.fetchone()
+                if v is None:
+                    return None
+                number = int(v["version"])
+                wanted = text_page_filter(page, int(v["pages"] or 0))
+                if v["state"] == KB_READY and v["active_version"] == number:
+                    cur = await conn.execute(
+                        "SELECT ordinal, heading_path, page, content FROM kb_chunks "
+                        "WHERE document_id = %s AND version = %s AND ordinal > %s "
+                        "  AND (%s::integer IS NULL OR page = %s) "
+                        "ORDER BY ordinal LIMIT %s",
+                        (doc, number, start, wanted, wanted, size + 1))
+                elif v["state"] == KB_AWAITING_CONFIRMATION and v["has_draft"]:
+                    # The draft's chunks are one jsonb array: sliced HERE, so a 5000-chunk draft
+                    # never crosses the wire whole to answer for fifty.
+                    cur = await conn.execute(
+                        "SELECT (e->>'ordinal')::integer AS ordinal, "
+                        "  e->'heading_path' AS heading_path, "
+                        "  (e->>'page')::integer AS page, e->>'content' AS content "
+                        "FROM kb_drafts k CROSS JOIN LATERAL jsonb_array_elements(k.chunks) AS e "
+                        "WHERE k.document_id = %s AND k.version = %s "
+                        "  AND (e->>'ordinal')::integer > %s "
+                        "  AND (%s::integer IS NULL OR (e->>'page')::integer = %s) "
+                        "ORDER BY 1 LIMIT %s",
+                        (doc, number, start, wanted, wanted, size + 1))
+                else:
+                    return None                # processing, error — nothing whole to show
+                rows = await cur.fetchall()
+        return assemble_version_text(
+            document_id=doc, version=number, state=v["state"], pages=int(v["pages"] or 0),
+            page=page, has_original=bool(v["has_original"]),
+            fetched=[KbTextChunk(ordinal=int(r["ordinal"]), page=r["page"],
+                                 heading_path=tuple(r["heading_path"] or ()),
+                                 text=chunk_text(r["content"], tuple(r["heading_path"] or ())))
+                     for r in rows],
+            limit=size)
 
     # ── ingestion ────────────────────────────────────────────────────────
     async def _lock_document(self, conn, owner_key: str, doc: str) -> Optional[Any]:

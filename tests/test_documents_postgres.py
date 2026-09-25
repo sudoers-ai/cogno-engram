@@ -343,11 +343,11 @@ async def test_the_derived_configuration_folds_only_non_ascii_words_and_is_made_
 
 
 async def test_unaccent_touches_the_document_tables_only():
-    from cogno_engram.adapters.postgres import _documents_tsv_config
+    from cogno_engram.adapters.postgres import documents_tsv_config
     await fresh_postgres(DSN, ts_config="portuguese", unaccent=True)
     conn = await _connect()
     try:
-        assert await _documents_tsv_config(conn) == "cogno_portuguese_unaccent"
+        assert await documents_tsv_config(conn) == "cogno_portuguese_unaccent"
         cur = await conn.execute(
             "SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d JOIN pg_attribute a "
             "ON a.attrelid = d.adrelid AND a.attnum = d.adnum "
@@ -364,7 +364,7 @@ async def test_a_changed_configuration_is_named_as_an_error_and_rebuilt_on_reque
     `rebuild_documents_tsv` is the step that makes the switch real."""
     import logging
 
-    from cogno_engram.adapters.postgres import (PostgresDocumentStore, _documents_tsv_config,
+    from cogno_engram.adapters.postgres import (PostgresDocumentStore, documents_tsv_config,
                                                 ensure_schema, rebuild_documents_tsv)
     plain = await fresh_postgres(DSN, ts_config="portuguese", unaccent=False)
     o = f"acme{uuid4().hex[:6]}/p"
@@ -376,10 +376,10 @@ async def test_a_changed_configuration_is_named_as_an_error_and_rebuilt_on_reque
         with caplog.at_level(logging.ERROR, logger="cogno_engram.postgres"):
             await ensure_schema(conn, embedding_dim=EMB_DIM, ts_config="portuguese", unaccent=True)
         assert "event=kb_ts_config_mismatch" in caplog.text
-        assert await _documents_tsv_config(conn) == "portuguese"        # nothing was altered
+        assert await documents_tsv_config(conn) == "portuguese"        # nothing was altered
         assert 0 not in await _words(folded, o, "sabado")               # the silent mismatch
         await rebuild_documents_tsv(conn, ts_config="portuguese", unaccent=True)
-        assert await _documents_tsv_config(conn) == "cogno_portuguese_unaccent"
+        assert await documents_tsv_config(conn) == "cogno_portuguese_unaccent"
         assert await _words(folded, o, "sabado") == {0, 1}
         caplog.clear()
         with caplog.at_level(logging.ERROR, logger="cogno_engram.postgres"):

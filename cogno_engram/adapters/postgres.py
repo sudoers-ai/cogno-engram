@@ -665,9 +665,16 @@ async def _ensure_unaccent_config(conn, base: str) -> str:
     return derived
 
 
-async def _documents_tsv_config(conn) -> "str | None":
-    """The configuration ``kb_chunks.tsv`` was GENERATED with, read from the catalogue — ``None``
-    when there is no such column."""
+async def documents_tsv_config(conn) -> "str | None":
+    """The text-search configuration ``kb_chunks.tsv`` was GENERATED with, read from the
+    catalogue — ``None`` when there is no such column (no table yet, or a table from before it).
+
+    PUBLIC because a host needs it: ``CREATE TABLE IF NOT EXISTS`` never touches an existing
+    table, so a host whose migration compares this against ``documents_ts_config(ts_config,
+    unaccent=...)`` can decide to call :func:`rebuild_documents_tsv` instead of only reading the
+    ``event=kb_ts_config_mismatch`` line :func:`ensure_documents_schema` logs. A host that copied
+    this query, or reached for a private name, would be a second definition of the same fact —
+    the one that silently stops agreeing the day the generated column changes shape."""
     row = await (await conn.execute(
         "SELECT pg_get_expr(d.adbin, d.adrelid) FROM pg_attrdef d "
         "JOIN pg_attribute a ON a.attrelid = d.adrelid AND a.attnum = d.adnum "
@@ -677,6 +684,12 @@ async def _documents_tsv_config(conn) -> "str | None":
     expr = list(row.values())[0] if isinstance(row, dict) else row[0]
     match = re.search(r"to_tsvector\('([^']+)'::regconfig", expr or "")
     return match.group(1) if match else None
+
+
+#: The name this reader had before it was public. Kept so a host pinned to a build that
+#: imported it keeps working across the pin bump that swaps its import; not the API — use
+#: :func:`documents_tsv_config`.
+_documents_tsv_config = documents_tsv_config
 
 
 async def rebuild_documents_tsv(conn, *, ts_config: str = DEFAULT_TS_CONFIG,
@@ -837,7 +850,7 @@ async def ensure_documents_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDIN
     await conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_kb_versions_awaiting ON kb_versions (expires_at) "
         f"WHERE state = '{KB_AWAITING_CONFIRMATION}'")
-    built_with = await _documents_tsv_config(conn)
+    built_with = await documents_tsv_config(conn)
     if built_with is not None and built_with != config:
         logger.error("stage=schema event=kb_ts_config_mismatch table=kb_chunks built_with=%s "
                      "requested=%s remedy=rebuild_documents_tsv(conn, ts_config=%r, unaccent=%r) "

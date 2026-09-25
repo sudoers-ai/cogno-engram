@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased — `documents_tsv_config` é API PÚBLICA (2026-09-25)
+
+### Added
+
+- **`cogno_engram.adapters.postgres.documents_tsv_config(conn)`** — a configuração de pesquisa
+  textual com que o `kb_chunks.tsv` foi GERADO, lida do catálogo (`None` sem a coluna). Era a
+  privada `_documents_tsv_config`, e o host importava-a para decidir se chama
+  `rebuild_documents_tsv` na migração: um import privado entre libs, a forma que parte em
+  silêncio num rename. Passa a pública, com a docstring do porquê; o `ensure_documents_schema`
+  lê-a pelo nome novo.
+- **`_documents_tsv_config` fica como ALIAS** (o mesmo objecto), para que um host pinado a um
+  build que o importa não parta no bump do pino que lhe troca o import. Não é API.
+- `tests/test_documents_tsv_config_is_public.py` (sem base): o nome público e o alias são o
+  mesmo objecto; a expressão do catálogo lê-se de volta à sua configuração (tuplo e dict,
+  `None` sem coluna, `None` noutra forma); e o que `documents_ts_config` nomeia é o que o leitor
+  devolve da coluna que esse nome gera. Os testes de Postgres passam a usar o nome público.
+
 ## Unreleased — fixture renamed (2026-09-25)
 
 ### Changed

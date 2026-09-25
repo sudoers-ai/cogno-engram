@@ -30,6 +30,8 @@ from cogno_engram.documents import (
     MEDIA_MARKDOWN,
     TOMBSTONE_DELETED,
     TOMBSTONE_PURGED,
+    TOMBSTONE_SUPERSEDED,
+    VALID_TOMBSTONE_KINDS,
     DocumentLimitReached,
     KbChunk,
     OriginalTooLarge,
@@ -277,6 +279,83 @@ async def test_a_deleted_document_leaves_every_search_at_once_and_leaves_a_tombs
     assert set(vars(stone)) == {"owner_key", "document_id", "versions", "kind", "actor",
                                 "removed_at"}
     assert not await docs.delete_document(o, doc_id)            # twice is a no-op
+
+
+# ── the swap leaves a trail too: every version a commit removes is named, once ─────────────
+#
+# The commit removes versions nobody asked to remove — the ones the swap replaces, and a version
+# whose commit arrives after a newer one was begun — and their rows go with them, so without a
+# tombstone nothing would record that the replaced original was ever stored. Same shape as the
+# other removals: ids and numbers only, never content.
+
+async def _staged(docs, o, doc_id, tag: str, original: bytes):
+    """A version begun with ``original`` and one staged chunk — ready to be committed."""
+    v = await docs.begin_version(o, doc_id, sha256=tag * 64, embed_model=MODEL_A,
+                                 size_bytes=len(original), original=original)
+    assert await docs.add_chunks(o, doc_id, v.version, [
+        KbChunk(ordinal=0, content=f"sábado versão {tag}", embedding=vec(1.0))])
+    return v
+
+
+async def test_the_swap_names_the_version_it_replaced_in_a_superseded_tombstone(docs):
+    o = owner()
+    first, second = b"# Manual\nprimeira\n", b"# Manual\nsegunda versao\n"
+    doc_id = await publish(docs, o, profiles=("GUEST",), original=first)
+    assert await docs.tombstones(o) == []          # CONTROL: a first commit replaces nothing
+    v2 = await _staged(docs, o, doc_id, "2", second)
+    assert await docs.stored_original_bytes(o) == len(first) + len(second)   # CONTROL: both kept
+
+    assert await docs.commit_version(o, doc_id, v2.version, pages=0) == COMMIT_READY
+    assert await docs.get_original(o, doc_id, version=1) is None      # the swap took it …
+    assert await docs.stored_original_bytes(o) == len(second)
+    [stone] = await docs.tombstones(o)                                 # … and SAID so
+    assert (stone.owner_key, stone.document_id, stone.kind, stone.versions, stone.actor) == \
+        (o, doc_id, TOMBSTONE_SUPERSEDED, (1,), "")
+    assert stone.removed_at is not None
+    assert set(vars(stone)) == {"owner_key", "document_id", "versions", "kind", "actor",
+                                "removed_at"}                         # no content, like the rest
+    # a repeated commit of the served version removes nothing and writes nothing
+    assert await docs.commit_version(o, doc_id, v2.version, pages=0) == COMMIT_READY
+    assert len(await docs.tombstones(o)) == 1
+
+
+async def test_one_swap_is_one_tombstone_naming_every_version_it_removed(docs):
+    """The served version AND a failed attempt beside it: the swap deletes both rows, so the
+    one tombstone names both — the same rule as a delete, which names every version."""
+    o = owner()
+    doc_id = await publish(docs, o, profiles=("GUEST",))
+    failed = await _staged(docs, o, doc_id, "2", b"segunda")
+    assert await docs.fail_version(o, doc_id, failed.version, reason="timeout")
+    v3 = await _staged(docs, o, doc_id, "3", b"terceira")
+    assert await docs.commit_version(o, doc_id, v3.version, pages=0) == COMMIT_READY
+    [stone] = await docs.tombstones(o)
+    assert (stone.kind, stone.versions) == (TOMBSTONE_SUPERSEDED, (1, 2))
+    assert await docs.get_version(o, doc_id, 1) is None
+    assert await docs.get_version(o, doc_id, 2) is None
+
+
+async def test_a_commit_that_arrives_after_a_newer_version_leaves_a_tombstone_for_itself(docs):
+    """The other removal the commit makes: a version committed while a NEWER one exists is
+    discarded on the spot — its chunks and its original with it."""
+    o = owner()
+    doc = await docs.create_document(o, title="M", profiles=["GUEST"], media_type=MEDIA_MARKDOWN)
+    late = await _staged(docs, o, doc.id, "1", b"primeira")
+    newer = await _staged(docs, o, doc.id, "2", b"segunda!")
+    assert await docs.commit_version(o, doc.id, late.version, pages=0) == COMMIT_SUPERSEDED
+    assert await docs.get_version(o, doc.id, late.version) is None
+    assert await docs.stored_original_bytes(o) == len(b"segunda!")
+    [stone] = await docs.tombstones(o)
+    assert (stone.kind, stone.versions) == (TOMBSTONE_SUPERSEDED, (late.version,))
+    # the newer one then swaps in over NOTHING older — no second tombstone
+    assert await docs.commit_version(o, doc.id, newer.version, pages=0) == COMMIT_READY
+    assert len(await docs.tombstones(o)) == 1
+    # and a commit of a version that is already gone removes nothing and writes nothing
+    assert await docs.commit_version(o, doc.id, late.version, pages=0) == COMMIT_SUPERSEDED
+    assert len(await docs.tombstones(o)) == 1
+
+
+def test_superseded_is_in_the_closed_alphabet_of_tombstones():
+    assert TOMBSTONE_SUPERSEDED == "superseded" and TOMBSTONE_SUPERSEDED in VALID_TOMBSTONE_KINDS
 
 
 async def test_a_purge_of_a_subtree_never_touches_a_sibling_prefix(docs):

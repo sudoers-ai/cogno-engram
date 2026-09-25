@@ -58,6 +58,7 @@ from cogno_engram.documents import (
     TOMBSTONE_DELETED,
     TOMBSTONE_EXPIRED,
     TOMBSTONE_PURGED,
+    TOMBSTONE_SUPERSEDED,
     VALID_MEDIA_TYPES,
     DocumentLimitReached,
     KbChunk,
@@ -2549,9 +2550,11 @@ class PostgresDocumentStore(_PgBase):
                 if v is None:
                     return COMMIT_SUPERSEDED
                 if number != int(v["newest"]):
-                    await conn.execute(
-                        "DELETE FROM kb_versions WHERE document_id = %s AND version = %s",
-                        (doc, number))
+                    cur = await conn.execute(
+                        "DELETE FROM kb_versions WHERE document_id = %s AND version = %s "
+                        "RETURNING version", (doc, number))
+                    gone = [int(r["version"]) for r in await cur.fetchall()]
+                    await self._supersede_tombstone(conn, owner_key, doc, gone)
                     return COMMIT_SUPERSEDED
                 if v["state"] == KB_READY and row["active_version"] == number:
                     return COMMIT_READY
@@ -2567,11 +2570,26 @@ class PostgresDocumentStore(_PgBase):
                     "UPDATE kb_documents SET active_version = %s, updated_at = now() WHERE id = %s",
                     (number, doc))
                 # Older versions go with their chunks and originals (cascade) in the SAME
-                # transaction — the swap is whole or it did not happen.
-                await conn.execute(
-                    "DELETE FROM kb_versions WHERE document_id = %s AND version < %s",
-                    (doc, number))
+                # transaction — the swap is whole or it did not happen — and so does the
+                # tombstone naming them: the numbers come from the DELETE itself (RETURNING), so
+                # the record is exactly what the cascade took.
+                cur = await conn.execute(
+                    "DELETE FROM kb_versions WHERE document_id = %s AND version < %s "
+                    "RETURNING version", (doc, number))
+                replaced = sorted(int(r["version"]) for r in await cur.fetchall())
+                await self._supersede_tombstone(conn, owner_key, doc, replaced)
         return COMMIT_READY
+
+    @staticmethod
+    async def _supersede_tombstone(conn, owner_key: str, doc: str, versions: "list[int]") -> None:
+        """ONE ``superseded`` tombstone naming every version a commit removed, inside the
+        commit's transaction — or nothing when it removed none. No actor: a swap is a side
+        effect of an upload, not somebody's request."""
+        if versions:
+            await conn.execute(
+                "INSERT INTO kb_tombstones (owner_key, document_id, versions, kind, actor) "
+                "VALUES (%s, %s, %s::integer[], %s, '')",
+                (owner_key, doc, list(versions), TOMBSTONE_SUPERSEDED))
 
     async def fail_version(self, owner_key: str, document_id: str, version: int, *,
                            reason: str) -> bool:

@@ -267,7 +267,14 @@ res = await docs.search(owner, profile=identity_role, text=original_text,
 - **Purge.** A tenant purge calls `purge_owner_subtree(tenant_prefix)`: every document under
   the prefix goes, with the chunks and the stored originals of every version, and one
   tombstone per document (ids, versions, when, who — no title, no text). `prune_tombstones`
-  bounds their retention. **Backups are out of reach:** a database backup keeps an original
+  bounds their retention.
+- **The removal trail.** `tombstones(owner_prefix)` (newest first) is where a removal is
+  recorded — `deleted`, `purged`, `expired`, `discarded`, `interrupted`, and `superseded`: the
+  commit's own, ONE per commit naming every version it removed (the versions the swap replaced,
+  or a version whose commit arrived after a newer one was begun), with no actor — nobody asked
+  for it, it is a side effect of an upload. Only the SERVED version (and a draft or a version
+  still being built) keeps its original: a host that offers "download the original" offers it
+  for those, and reads an older version's absence from the trail, never re-extracts it. **Backups are out of reach:** a database backup keeps an original
   until the backup's own retention expires — record that in the operator's data policy.
 - **Model swap.** A global embedder change leaves every version on the old label; until it is
   re-indexed, searches are lexical and marked. `stale_documents(embed_model=new)` lists the work

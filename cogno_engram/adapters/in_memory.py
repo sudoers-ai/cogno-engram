@@ -44,6 +44,7 @@ from cogno_engram.documents import (
     TOMBSTONE_DELETED,
     TOMBSTONE_EXPIRED,
     TOMBSTONE_PURGED,
+    TOMBSTONE_SUPERSEDED,
     VALID_MEDIA_TYPES,
     DocumentLimitReached,
     KbChunk,
@@ -1154,6 +1155,7 @@ class InMemoryDocumentStore:
         newest = self._versions_of(row.id)[-1].version
         if v.version != newest:
             self._drop_version(row.id, v.version)
+            self._supersede_tombstone(row, (v.version,), _now())
             return COMMIT_SUPERSEDED
         if v.state == KB_READY and row.active_version == v.version:
             return COMMIT_READY
@@ -1164,10 +1166,23 @@ class InMemoryDocumentStore:
         v.pages, v.chunks = int(pages), len(staged)
         row.active_version = v.version
         row.updated_at = v.finished_at
-        for old in self._versions_of(row.id):
-            if old.version < v.version:
-                self._drop_version(row.id, old.version)
+        replaced = tuple(old.version for old in self._versions_of(row.id)
+                         if old.version < v.version)
+        for number in replaced:
+            self._drop_version(row.id, number)
+        self._supersede_tombstone(row, replaced, v.finished_at)
         return COMMIT_READY
+
+    def _supersede_tombstone(self, row: _DocRow, versions: "tuple[int, ...]",
+                             when: Optional[datetime]) -> None:
+        """ONE ``superseded`` tombstone naming every version a commit removed — the rows, their
+        chunks and their originals — or nothing when it removed none. No actor: a swap is a
+        side effect of an upload, not somebody's request."""
+        if versions:
+            self._tombstones.append(KbTombstone(owner_key=row.owner_key, document_id=row.id,
+                                                versions=tuple(versions),
+                                                kind=TOMBSTONE_SUPERSEDED, actor="",
+                                                removed_at=when or _now()))
 
     async def fail_version(self, owner_key: str, document_id: str, version: int, *,
                            reason: str) -> bool:

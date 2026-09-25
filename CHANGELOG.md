@@ -1,5 +1,34 @@
 # Changelog
 
+## Unreleased — a TROCA deixa lápide: `superseded` para cada versão que o commit apaga (P8, 2026-09-25)
+
+### Fixed
+
+- **`commit_version` apagava versões sem rasto.** A troca atómica apaga todas as versões mais
+  antigas — e, por cascata, os trechos e o ORIGINAL guardado de cada uma — na mesma transacção, e
+  a linha da versão vai com elas; um commit que chega depois de uma versão mais nova ter começado
+  apaga-se a si próprio da mesma maneira. Nenhum dos dois caminhos escrevia lápide, ao contrário
+  de apagar, purgar, expirar, descartar e interromper: o original substituído desaparecia sem que
+  nada registasse que tinha existido. Agora os DOIS adaptadores escrevem UMA lápide
+  **`superseded`** (`documents.TOMBSTONE_SUPERSEDED`, no alfabeto fechado) por commit, com todas
+  as versões que ele apagou — a mesma regra do `delete_document`, que nomeia todas —, sem `actor`
+  (ninguém o pediu: é efeito de um upload) e sem conteúdo. Em Postgres os números saem do próprio
+  `DELETE … RETURNING`, dentro da transacção da troca: a lápide é exactamente o que a cascata
+  levou. Um commit que não apaga nada (o primeiro, ou a repetição de um já servido) não escreve.
+- **Porquê agora:** a vista «ver o que está no documento» do host (P8) só oferece o original da
+  versão SERVIDA — não há histórico de versões —, e é o rasto que lhe diz porque é que uma versão
+  antiga já não tem original.
+- **Testes** (conteúdo inventado): `tests/test_documents_store.py` nos dois adaptadores — a troca
+  nomeia a versão substituída (com o controlo de que antes dela os dois originais estão guardados
+  e não há lápide, e de que repetir o commit não escreve outra); uma troca é UMA lápide com a
+  versão servida E a falhada ao lado; o commit tardio deixa a sua. E a PARIDADE
+  (`tests/test_documents_postgres.py::test_the_removal_trail_is_the_same_sequence_in_both_adapters`):
+  o mesmo guião — duas trocas, um commit tardio, um delete — dá a MESMA sequência de lápides em
+  memória e em Postgres.
+- **Fica de fora, dito:** `fail_version` também apaga os trechos e o original de uma tentativa
+  falhada sem lápide (a linha da versão fica, com `error` e o motivo). Não é uma troca e não entra
+  aqui.
+
 ## Unreleased — `KbDocument.sections`: o ÍNDICE de um documento, para quem só tem o título (2026-09-25)
 
 ### Added

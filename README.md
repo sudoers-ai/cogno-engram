@@ -103,7 +103,11 @@ rules live in one module, `cogno_engram.documents`:
   heading, ~2000 **characters**, 15% overlap, heading path on every chunk → embed → stage →
   swap); the previous version answers until the new one is ready and keeps answering if it
   fails. It returns the embedder's own usage (`embedding_tokens`, `embedding_calls`) and takes
-  a `gate` (refuse before embedding: zero calls) and a `pace` (tokens per minute).
+  a `gate` (refuse before embedding: zero calls) and a `pace` (tokens per minute). The swap
+  removes every OLDER version — its chunks and its stored original with it — and leaves ONE
+  `superseded` tombstone naming them, so there is no version history: after a swap the old
+  original is gone (`get_original(version=old)` is `None`) and the tombstone is the record that
+  it existed. A version whose commit arrives after a newer one was begun is removed the same way.
 - **Or in two steps, when the cost must be confirmed first.** `prepare()` extracts, chunks and
   ESTIMATES, and parks the version in `awaiting_confirmation` — no embedder, no gate, nothing
   spent; a bad file fails HERE. `estimated_tokens` and `expires_at` (prepare's clock + 24 h) are

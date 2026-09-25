@@ -41,6 +41,8 @@ background (``processing``) while the previous one keeps answering, becomes ``re
 atomic swap, or ends in ``error`` with a reason from a closed alphabet — and the previous one
 still answers. Deleting a document takes it out of every search at once, removes its stored
 originals of EVERY version, and leaves a TOMBSTONE (what was removed, when, by whom — no content).
+The swap leaves one too: the versions it replaces go with their chunks and originals, and a
+``superseded`` tombstone names them.
 
 **Two steps when the cost must be confirmed first.** An upload can stop half-way on purpose: it
 is extracted and chunked, its embedding cost is ESTIMATED from the chunks, and the version waits
@@ -133,9 +135,15 @@ TOMBSTONE_PURGED = "purged"        # removed by a subtree purge
 TOMBSTONE_EXPIRED = "expired"      # a draft nobody confirmed: its chunks and original removed
 TOMBSTONE_DISCARDED = "discarded"  # a draft its uploader withdrew — at once, not in 24 h
 TOMBSTONE_INTERRUPTED = "interrupted"   # a `processing` version whose worker is gone
+#: Versions a COMMIT removed because a newer one exists: every older version the swap deletes
+#: (with their chunks and originals, in the same transaction), and a version whose commit
+#: arrives after a newer one was begun. Nobody asked for these removals — they are a side effect
+#: of an upload — and the version row goes with them, so this is the only record left that the
+#: replaced version (and its original) ever existed.
+TOMBSTONE_SUPERSEDED = "superseded"
 VALID_TOMBSTONE_KINDS: frozenset[str] = frozenset({TOMBSTONE_DELETED, TOMBSTONE_PURGED,
                                                    TOMBSTONE_EXPIRED, TOMBSTONE_DISCARDED,
-                                                   TOMBSTONE_INTERRUPTED})
+                                                   TOMBSTONE_INTERRUPTED, TOMBSTONE_SUPERSEDED})
 
 # ── discarding a draft ───────────────────────────────────────────────────────────────
 DISCARD_OK = "discarded"           # the draft is gone (or already was — a repeat is free)

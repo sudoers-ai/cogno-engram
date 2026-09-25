@@ -13,7 +13,8 @@ beside it — the shape that makes the generic estimate of ``scope = $1`` differ
 one): the statement is prepared at its FIRST execution (``prepare_threshold=0``) and the plan is
 forced per connection (``plan_cache_mode``), which is what a pooled connection reaches after its
 fifth execution without waiting for it. The twin: the same ORDER and the same top-5 under both
-plans. Measured before the fix on this shape: 100 of 100 positions differed and the top-5 did too.
+plans. Measured before the fix on this shape: 99 and 100 of 100 positions differed (two runs), and
+the top-5 and the rendered block did too.
 
 The unit half needs no database: ``graph_candidates`` over the same edges in two orders gives the
 same ids and the same top-k when the edges carry store ids, and the positional fallback (no store

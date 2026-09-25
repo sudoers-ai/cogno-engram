@@ -268,8 +268,14 @@ payload = lexical.render(canonical_query, picked)            # each result under
   sits among the candidates. Anything that clears the floor is untouched, a broken source still
   answers `error`, and no anchors means the old decision exactly. Who the asker is, and which
   labels a reading of the question named, are yours.
-* **Content-free ids** (`edge:<node>.<n>`, `mem:<id>`): what a reply cites and a trace may keep.
-  An anchor's own walk passes a variant other than `0` and an ordinal node id (`edge:a0.<n>`).
+* **Content-free ids** (`edge:<edge id>`, `mem:<id>`): what a reply cites and a trace may keep.
+  A graph candidate is numbered by the STORE's edge id (`GraphEdge.id`), and that id is also its
+  last tie-break — never its position in the walk, because a walk's row order is not a fact the
+  data fixes (a prepared statement's generic plan returned the same edges in another order, and
+  with many candidates tied on score the top-k followed the plan). An edge with no store id (in
+  memory) keeps the positional `edge:<node>.<n>`; an anchor's own walk passes a variant other than
+  `0` and an ordinal node id (`edge:a0.<n>`). The Postgres `walk()` itself returns its edges in a
+  fixed order: the shallowest depth each was reached at, then the edge id.
 * **A cost bound by count** (`MAX_CANDIDATES`): ranking is CPU on your event loop; over ~3 MB
   of section-sized candidates the capped ranking is ~16× cheaper than the uncapped one (~22 ms
   against ~350 ms on a quiet box). `tests/test_lexical_cost.py` proves the cap mechanically and

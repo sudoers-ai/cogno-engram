@@ -65,20 +65,20 @@ def test_the_first_person_list_is_held_in_the_tokenizers_own_alphabet():
 def test_an_anchor_trims_function_words_at_its_ENDS_and_keeps_them_inside():
     assert anchor("o Orientador") == ("orientador",)
     assert anchor("Rua das Acácias") == ("rua", "das", "acacia"), "the inner «das» stays"
-    assert anchor("  Marisa Lobo ") == ("marisa", "lobo")
+    assert anchor("  Zulmira Pervinca ") == ("zulmira", "pervinca")
     assert anchor("ela") == () and anchor("") == () and anchor(None) == ()
 
 
 def test_about_is_whole_words_in_order_on_either_END_and_graph_only():
-    edge = graph_candidates([_walk(_e("Dulce Amaral", "TRANSFERS_TO", "Marisa Lobo"))])[0]
-    assert about(edge, ["Marisa"]) and about(edge, ["marisa lobo"]) and about(edge, ["DULCE"])
+    edge = graph_candidates([_walk(_e("Dulce Amaral", "TRANSFERS_TO", "Zulmira Pervinca"))])[0]
+    assert about(edge, ["Zulmira"]) and about(edge, ["zulmira pervinca"]) and about(edge, ["DULCE"])
     assert about(edge, ["Dúlce"]), "the tokenizer's fold: accents and case"
-    assert not about(edge, ["Mari"]), "whole words — «Mari» is not «Marisa»"
-    assert not about(edge, ["Lobo Marisa"]), "in order"
+    assert not about(edge, ["Zulmi"]), "whole words — «Zulmi» is not «Zulmira»"
+    assert not about(edge, ["Pervinca Zulmira"]), "in order"
     assert not about(edge, ["transfers"]), "the RELATION is not an end"
     assert not about(edge, []), "no anchor, nothing is about it"
-    mem = memory_candidates([_Record("m1", "Marisa Lobo prefers email")])[0]
-    assert mem.source == SOURCE_MEMORY and not about(mem, ["Marisa"]), "a memory has no ends"
+    mem = memory_candidates([_Record("m1", "Zulmira Pervinca prefers email")])[0]
+    assert mem.source == SOURCE_MEMORY and not about(mem, ["Zulmira"]), "a memory has no ends"
 
 
 def test_only_a_GRAPH_candidate_is_about_an_anchor_even_when_another_carries_the_ends():
@@ -87,15 +87,15 @@ def test_only_a_GRAPH_candidate_is_about_an_anchor_even_when_another_carries_the
     removed it survived the suite). Here a memory and a section carry the anchor in ``head`` and
     ``tail`` — and are still not about it, neither for :func:`about` nor for the tier; the graph
     edge with the SAME ends is the control that the ends themselves do match."""
-    ends = {"head": "marisa lobo", "tail": "marisa lobo"}
+    ends = {"head": "zulmira pervinca", "tail": "zulmira pervinca"}
     mem = Candidate(id="mem:1", source=SOURCE_MEMORY, text="nothing in common", **ends)
     mat = Candidate(id="mat:0.0", source=SOURCE_MATERIAL, text="nothing in common", **ends)
     edge = Candidate(id="edge:1.0", source=SOURCE_GRAPH, text="nothing in common", **ends)
-    assert about(edge, ["Marisa"]), "the control: these ends DO carry the anchor"
-    assert not about(mem, ["Marisa"]) and not about(mat, ["Marisa"])
+    assert about(edge, ["Zulmira"]), "the control: these ends DO carry the anchor"
+    assert not about(mem, ["Zulmira"]) and not about(mat, ["Zulmira"])
     ranked = rank([mem, mat, edge], ["unrelated question words"])
-    assert [c.id for _, c in partial(ranked, ["Marisa"])] == ["edge:1.0"]
-    decision, picked = decide(ranked, anchors=["Marisa"])
+    assert [c.id for _, c in partial(ranked, ["Zulmira"])] == ["edge:1.0"]
+    decision, picked = decide(ranked, anchors=["Zulmira"])
     assert decision == DECISION_PARTIAL and [c.id for _, c in picked] == ["edge:1.0"]
 
 
@@ -163,18 +163,18 @@ def test_SHAPE_one_hop_on_from_what_the_question_names_and_never_two():
 def test_SHAPE_a_named_person_diluted_by_a_long_question():
     walk = [_walk(
         _e("Escola Horizonte", "OFFERS", "curso de espanhol"),
-        _e("Dulce Amaral", "TRANSFERS_TO", "Marisa Lobo"),
-        _e("Marisa Lobo", "WORKS_IN", "financeiro"),
+        _e("Dulce Amaral", "TRANSFERS_TO", "Zulmira Pervinca"),
+        _e("Zulmira Pervinca", "WORKS_IN", "financeiro"),
     )]
-    asked = variants("can Marisa approve refunds above the limit",
-                     "a Marisa aprova reembolso acima do limite?")
+    asked = variants("can Zulmira approve refunds above the limit",
+                     "a Zulmira aprova reembolso acima do limite?")
     ranked = rank(graph_candidates(walk), asked)
     best = max(s for s, c in ranked if "TRANSFERS_TO" in c.text)
     assert 0 < best < RELEVANCE_FLOOR, "one word of the question — a quarter, a fifth"
     assert decide(ranked)[0] == DECISION_NOTHING                          # BEFORE
-    decision, picked = decide(ranked, anchors=["Marisa"])                 # AFTER
+    decision, picked = decide(ranked, anchors=["Zulmira"])                 # AFTER
     assert decision == DECISION_PARTIAL
-    assert {c.text.split(" --")[0] for _, c in picked} == {"Dulce Amaral", "Marisa Lobo"}
+    assert {c.text.split(" --")[0] for _, c in picked} == {"Dulce Amaral", "Zulmira Pervinca"}
 
 
 # ── what the tier must NOT do ────────────────────────────────────────────────────────

@@ -486,7 +486,7 @@ def _about(candidate: Candidate, words: "Sequence[tuple[str, ...]]") -> bool:
 
 def about(candidate: Candidate, anchors: Iterable[Any]) -> bool:
     """Is ``candidate`` an edge whose SOURCE or TARGET carries one of the ``anchors``' words,
-    whole and in order? «Marisa» is carried by the end «Marisa Lobo» and not by «Marisol»; the
+    whole and in order? «Zulmira» is carried by the end «Zulmira Pervinca» and not by «Zulmirinha»; the
     fold is the tokenizer's (accents and case), so «Otávio» is carried by «OTAVIO BRANDÃO».
 
     Graph candidates only: an edge RELATES two things, so "is it about this one" has an answer. A

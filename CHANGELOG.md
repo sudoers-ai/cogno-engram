@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased — fixture renamed (2026-09-25)
+
+### Changed
+
+- `tests/test_lexical_anchors.py` and one docstring example in `cogno_engram/lexical.py`: a person's
+  name used as fixture data is replaced by an INVENTED one with the same shape (two tokens, a first
+  name that is a whole-word part of the label). Fixtures in this repository are invented; no
+  behaviour changes.
+
 ## Unreleased — ÂNCORAS: quem a pergunta NOMEIA, e a decisão `partial` (2026-09-24)
 
 ### Added

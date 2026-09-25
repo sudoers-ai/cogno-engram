@@ -290,9 +290,15 @@ def graph_candidates(walks: Iterable[tuple], limit: Optional[int] = None, *,
     """Edges from ``walks`` — ``(variant, rank, node_id, edges)`` per start node, in fetch order.
 
     Deduplicated by ``(source, relation, target)``: two start nodes one hop apart walk the same
-    edge, and it is one fact. The id is ``edge:<start node id>.<n>`` — an integer the store
-    assigned and an ordinal, nothing a person wrote. ``limit`` STOPS the build at that many —
-    the work is bounded, not only the result (:data:`MAX_CANDIDATES`).
+    edge, and it is one fact. **The id and the prior come from the STORE's edge id** when the edge
+    carries one (``GraphEdge.id``): the id is ``edge:<edge id>`` and the prior — the last
+    tie-break of :func:`rank` — is that id. Never the POSITION: a walk's rows come back in an
+    order a query plan may change, and with many candidates tied on score a position-derived
+    prior made the top-k a function of the plan (the same data, another answer). An edge with no
+    store id (built in memory, or from a store that numbers nothing) keeps the positional
+    ``edge:<start node id>.<n>`` and prior — a store with no plan has no plan to change. Either
+    way the id is content-free: integers, nothing a person wrote. ``limit`` STOPS the build at
+    that many — the work is bounded, not only the result (:data:`MAX_CANDIDATES`).
 
     ``baseline_nodes``: the first that-many start nodes of variant 0 are the ones a BASELINE
     retrieval walks (a proximity search that takes the nearest N nodes of the first query), so
@@ -316,8 +322,11 @@ def graph_candidates(walks: Iterable[tuple], limit: Optional[int] = None, *,
             if key in seen:
                 continue
             seen.add(key)
-            out.append(Candidate(id=f"edge:{node_id}.{n}", source=SOURCE_GRAPH,
-                                 text=edge_text(edge), prior=len(out),
+            store_id = getattr(edge, "id", None)
+            numbered = isinstance(store_id, int) and not isinstance(store_id, bool)
+            out.append(Candidate(id=f"edge:{store_id}" if numbered else f"edge:{node_id}.{n}",
+                                 source=SOURCE_GRAPH, text=edge_text(edge),
+                                 prior=store_id if numbered else len(out),
                                  old=(variant == 0 and rank < baseline_nodes),
                                  head=edge_end(getattr(edge, "source", "")),
                                  tail=edge_end(getattr(edge, "target", ""))))

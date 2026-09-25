@@ -324,6 +324,14 @@ class GraphEdge:
     # because the dataclass had nowhere to put it. Surfacing it costs nothing and answers a
     # question the contact-graph view is built to ask.
     created_at: "Optional[datetime]" = None
+    # The STORE's own id for the edge, when it was read back from a store that has one (the
+    # Postgres adapter's ``knowledge_edges.id``); ``None`` otherwise — an edge built to WRITE, or
+    # read from a store that numbers nothing. Content-free (an integer), and what a consumer that
+    # must be DETERMINISTIC keys on: a walk's rows come back in an order the query planner is free
+    # to change, and a candidate numbered by its POSITION in that order changes with the plan
+    # (``lexical.graph_candidates``). Not part of equality: two reads of the same fact are the
+    # same edge whatever a store called it.
+    id: "Optional[int]" = field(default=None, compare=False)
 
     def __post_init__(self) -> None:
         """One normalisation, both stores.

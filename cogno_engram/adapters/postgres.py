@@ -1039,6 +1039,56 @@ class _PgBase:
                 await conn.close()
 
 
+# ── the HNSW index under a filter: ITERATIVE scan (pgvector 0.8+) ─────────────────────
+#
+# An HNSW index returns the `hnsw.ef_search` (default 40) nearest rows of the WHOLE table, and a
+# `WHERE scope = …` is applied to those — so a scope whose rows are all farther than 40 rows of
+# OTHER scopes comes back EMPTY. Measured on this library's own graph table (pgvector 0.8.2,
+# `tests/test_hnsw_iterative_scan_postgres.py`): a scope of 600 nodes among 5 000 of another
+# scope nearer the query answered 0 rows. WHETHER the planner reads the index depends on the
+# plan it prices — at 768 dimensions the same 600-node scope was answered by an exact scan, and a
+# 2-node scope by the index, 0 rows of 2 — so the setting goes where the index CAN answer, not
+# where a plan was seen to. pgvector 0.8 added the cure: `hnsw.iterative_scan` keeps reading the
+# index until the LIMIT is met.
+#
+# Only the NODE search needs it. The memory search orders by an EXPRESSION (the hybrid score, or
+# the distance minus a feedback term), which an HNSW index cannot serve, so it scans the scope
+# exactly — pinned in the same test file by its behaviour in the defect's shape. The document
+# chunks have no vector index at all (see `kb_chunks` below).
+#
+# * `strict_order` and not `relaxed_order`: the callers take the FIRST rows as the nearest
+#   (a walk starts from them, a baseline is "the first two"), so the order must stay exact.
+# * `SET LOCAL` (here `set_config(…, true)`, the parameterisable spelling) inside a transaction:
+#   the setting lives exactly as long as the query, and a pooled connection returns clean.
+# * guarded IN the statement on the installed extension's version: on a pgvector older than 0.8
+#   the settings do not exist and setting them would fail the read, so there the statement sets
+#   nothing and the query runs as it always did.
+
+#: The most index tuples one filtered nearest-neighbour search may read before it stops — the
+#: iterative scan's COST bound, set explicitly so a server-level default cannot silently change
+#: it. The value is pgvector's own default, kept on two measured facts (pgvector 0.8.2, one
+#: laptop, intercalated runs, minimum–maximum over five):
+#:
+#: * it must exceed the rows of OTHER scopes nearer the query than the asked scope's own — at
+#:   5 000 and 15 000 of them the scope gets its `limit` rows (7–8 ms and 25–28 ms at 8
+#:   dimensions); at 25 000 it comes back SHORT, which is what a bound means;
+#: * a search that never reaches `limit` reads up to this many tuples, and that is the WORST
+#:   case, now bounded: ~39–47 ms at 768 dimensions (the platform's width), against ~1 ms for the
+#:   uncorrected read that returns nothing.
+#:
+#: A scope whose rows are all beyond this many nearer rows of other scopes comes back SHORT —
+#: never wrong and never out of order. Raise it when a graph's OTHER scopes outgrow it.
+HNSW_MAX_SCAN_TUPLES = 20_000
+
+#: The statement that turns the iterative scan on for the CURRENT transaction — a no-op on a
+#: pgvector older than 0.8 (the `WHERE` finds no row, so nothing is set).
+HNSW_ITERATIVE_SCAN = (
+    "SELECT set_config('hnsw.iterative_scan', 'strict_order', true), "
+    "set_config('hnsw.max_scan_tuples', %s, true) "
+    "FROM pg_extension WHERE extname = 'vector' "
+    "AND string_to_array(split_part(extversion, '-', 1), '.')::int[] >= ARRAY[0, 8, 0]")
+
+
 class PostgresStore(_PgBase):
     """Reference ``MemoryStore`` + ``SupportsVectorSearch``."""
 
@@ -1877,6 +1927,16 @@ class PostgresKnowledgeGraph(_PgBase):
     async def find_nodes_by_embedding(self, scope: str, embedding: list[float],
                                       *, audience: str, limit: int = 5,
                                       related_only: bool = False) -> list[GraphNode]:
+        """The ``limit`` nodes of ``scope`` nearest ``embedding``, as ``audience`` may see them.
+
+        **With pgvector's ITERATIVE scan** (:data:`HNSW_ITERATIVE_SCAN`), and that is not an
+        optimisation: the HNSW index is shared by every scope, and the ``scope``/audience/
+        ``related_only`` conditions are applied to what the index returns. With the default
+        ``hnsw.ef_search`` of 40 the index hands over the 40 nearest nodes of the WHOLE table; a
+        scope whose nodes are all farther than 40 nodes of other scopes then gets ZERO rows —
+        not fewer, zero — although it holds hundreds. Iterative scan keeps reading the index, in
+        exact distance order, until ``limit`` rows pass the conditions or
+        :data:`HNSW_MAX_SCAN_TUPLES` index tuples were read."""
         _require_scope(scope)
         # The EXISTS is the whole feature: a caller that will WALK from these nodes wants
         # candidates that can be walked from. An isolated node is a legitimate row — the node
@@ -1893,13 +1953,17 @@ class PostgresKnowledgeGraph(_PgBase):
                    "WHERE (e.source_id = n.id OR e.target_id = n.id) "
                    f"AND e.status = '{EDGE_ACCEPTED}')") if related_only else ""
         async with self._conn() as conn:
-            cur = await conn.execute(
-                "SELECT n.id, n.scope, n.label, n.node_type, n.attributes "
-                "FROM knowledge_nodes n WHERE n.scope = %s AND n.embedding IS NOT NULL "
-                f"AND {_NODE_VISIBLE}{related} "
-                "ORDER BY n.embedding <=> %s::vector LIMIT %s",
-                (scope, audience, audience, audience, _vec(embedding), limit))
-            rows = await cur.fetchall()
+            # ONE transaction, so the `set_config(..., true)` (SET LOCAL) lives exactly as long
+            # as this query — on a pooled connection the next borrower never inherits it.
+            async with conn.transaction():
+                await conn.execute(HNSW_ITERATIVE_SCAN, (str(HNSW_MAX_SCAN_TUPLES),))
+                cur = await conn.execute(
+                    "SELECT n.id, n.scope, n.label, n.node_type, n.attributes "
+                    "FROM knowledge_nodes n WHERE n.scope = %s AND n.embedding IS NOT NULL "
+                    f"AND {_NODE_VISIBLE}{related} "
+                    "ORDER BY n.embedding <=> %s::vector LIMIT %s",
+                    (scope, audience, audience, audience, _vec(embedding), limit))
+                rows = await cur.fetchall()
         return [GraphNode(scope=r["scope"], label=r["label"], node_type=r["node_type"],
                           attributes=r["attributes"], id=r["id"]) for r in rows]
 

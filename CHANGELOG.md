@@ -1,5 +1,54 @@
 # Changelog
 
+## Unreleased — the nearest nodes of a scope are never an empty answer: pgvector's ITERATIVE scan under the scope filter (2026-09-25)
+
+### Fixed
+
+- **`PostgresKnowledgeGraph.find_nodes_by_embedding` returned ZERO rows for a scope crowded out of
+  the HNSW candidates.** One HNSW index serves every scope of `knowledge_nodes`, and `WHERE scope
+  = …` (plus the audience and `related_only` conditions) is applied to what the index returns;
+  with the default `hnsw.ef_search` of 40 the index hands over the 40 nearest nodes of the whole
+  table, so a scope whose nodes are all farther than 40 nodes of other scopes got nothing —
+  not fewer, nothing. Produced in `tests/test_hnsw_iterative_scan_postgres.py` against a real
+  Postgres + pgvector 0.8.2: 600 nodes in the asked scope, 5 000 of another scope nearer the query
+  → **0 rows**; with the fix → the `limit` rows, in non-decreasing distance.
+- **The fix:** the query runs in its own transaction with `hnsw.iterative_scan = strict_order` and
+  `hnsw.max_scan_tuples = HNSW_MAX_SCAN_TUPLES` (20 000), set by `set_config(…, true)` — `SET
+  LOCAL`, so a pooled connection returns clean. `strict_order` because callers take the first
+  rows as the nearest. Guarded in the statement itself on the installed extension's version: on
+  pgvector < 0.8 nothing is set and the query runs as before.
+- **The ceiling, and why 20 000** (pgvector's own default, now explicit, measured on a laptop,
+  min–max of five intercalated runs): it must exceed the rows of OTHER scopes nearer the query —
+  at 5 000 and 15 000 the scope gets its rows (7–8 ms and 25–28 ms at 8 dimensions), at 25 000 it
+  comes back short, which is what a bound means; a search that never fills `limit` reads up to it,
+  the worst case, ~39–47 ms at 768 dimensions (the uncorrected read: ~1 ms, and empty).
+- **Where it does NOT apply, measured:** the memory search orders by an EXPRESSION (the hybrid
+  score, or the distance minus a feedback term), which an HNSW index cannot serve — it scans the
+  scope exactly. A test pins that behaviour in the same crowded shape, and a rewrite of its ORDER
+  BY into a plain distance (which the index CAN serve) turns it red. The document chunks have no
+  vector index. `walk` and `graph_candidates` are untouched.
+
+### Tests
+
+`tests/test_hnsw_iterative_scan_postgres.py` (6, all data invented; skips without a Postgres):
+- the PREMISE: the planner answers the query from `idx_nodes_embedding` (`EXPLAIN`);
+- the DEFECT: without the iterative scan the crowded scope comes back empty, while an exact scan
+  shows the rows are there;
+- the FIX: `limit` rows of the asked scope, in non-decreasing distance, overlapping the exact top
+  rows;
+- the CONTROL: a small scope nearer the query than the crowd is right with the scan off and on,
+  and the crowd's own scope still gets its rows;
+- the memory search in the same shape;
+- the setting lives only for its transaction.
+
+**Mutations, each killed:**
+- no `SET` → the fix test;
+- no transaction (autocommit drops the setting before the query) → the fix test;
+- a ceiling below the crowd (1 000) → the fix test;
+- the memory ORDER BY rewritten into a plain distance → the memory test;
+- `relaxed_order` → killed by the setting test ONLY: in this world the relaxed scan happened to
+  return the rows in order, so the order assertion does not tell the two apart.
+
 ## Unreleased — VER o que está num documento: `version_text`, o texto de uma versão como o assistente o lê (P8, 2026-09-25)
 
 ### Added

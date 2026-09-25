@@ -67,6 +67,7 @@ from cogno_engram.documents import (
     require_vector,
     sanitize_profiles,
     sanitize_reason,
+    section_headings,
 )
 from cogno_engram import write_loss
 from cogno_engram.trace_policy import TRACE_REVISION_WINDOW_S
@@ -1359,7 +1360,14 @@ class InMemoryDocumentStore:
         require_profile(profile)
         rows = sorted(self._served(owner_key, profile),
                       key=lambda rv: (rv[0].created_at or _now(), rv[0].id))
-        return [self._document(r) for r, _ in rows]
+        return [replace(self._document(r), sections=self._sections(r.id, v.version))
+                for r, v in rows]
+
+    def _sections(self, document_id: str, version: int) -> "tuple[str, ...]":
+        """The served version's section headings — :func:`section_headings` over its chunks."""
+        chunks = self._chunks.get((document_id, version), {}).values()
+        return section_headings((depth, c.ordinal, heading) for c in chunks
+                                for depth, heading in enumerate(c.heading_path))
 
     async def search(self, owner_key: str, *, profile: str, text: str,
                      vector: Optional[list[float]] = None, embed_model: Optional[str] = None,

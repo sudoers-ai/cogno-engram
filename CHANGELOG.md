@@ -1,5 +1,29 @@
 # Changelog
 
+## Unreleased — `KbDocument.sections`: o ÍNDICE de um documento, para quem só tem o título (2026-09-25)
+
+### Added
+
+- **`KbDocument.sections: tuple[str, ...]`**, preenchido por `readable_documents` nos DOIS
+  adaptadores: os títulos de SECÇÃO da versão ACTIVA de cada documento que o perfil pode ler,
+  pela ordem do documento (a primeira aparência, menor `ordinal`), sem vazios nem repetidos, no
+  máximo `MAX_SECTIONS_PER_DOCUMENT` = 50. `()` em qualquer outra leitura e num documento que
+  não se divide.
+- **`section_headings(rows)`**, PURA, a regra ÚNICA dos dois adaptadores: a profundidade de
+  secção é a PRIMEIRA profundidade do `heading_path` com pelo menos dois títulos distintos. A 0
+  é o título do documento, e um `#` único tem um valor só; é na seguinte que o documento se
+  divide no que cobre. Nada fixo num nível: sem `#` único dá o nível 1, com ele o nível 2, e um
+  documento que nunca se divide dá `()`.
+- **Postgres:** UMA consulta agregada sobre o conjunto servido (`unnest … WITH ORDINALITY`,
+  `min(ordinal)` por título e profundidade), nunca uma por documento; corre mesmo sem linhas,
+  como a leitura das versões, para a sonda de saúde tocar no `kb_chunks.heading_path`.
+- **Porquê:** um host que diz a um guarda o que um documento COBRE só tinha o título, e um
+  título como «Relatório Anual» não diz que uma das secções é a receita de aluguel.
+- `tests/test_documents_sections.py`: a regra pura (nível 2 sob um `#` único, nível 1 sem ele,
+  `()` sem divisão, a ordem da primeira aparência, o tecto) e os dois adaptadores (o perfil só
+  vê o índice do que pode ler; o índice é o da versão ACTIVA, não o de uma em construção;
+  `list_documents` não o traz). Dados inventados.
+
 ## Unreleased — `documents_tsv_config` é API PÚBLICA (2026-09-25)
 
 ### Added

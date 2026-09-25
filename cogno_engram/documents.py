@@ -299,6 +299,40 @@ class KbVersion:
     claimed_at: Optional[datetime] = None
 
 
+#: The most section headings one document reports (:attr:`KbDocument.sections`). A ceiling in
+#: the STORE, so no caller can be handed an outline the size of the document; the caller cuts
+#: again to what its own budget allows.
+MAX_SECTIONS_PER_DOCUMENT = 50
+
+
+def section_headings(rows: "Iterable[tuple[int, int, str]]", *,
+                     limit: int = MAX_SECTIONS_PER_DOCUMENT) -> "tuple[str, ...]":
+    """A document's SECTION headings from ``(depth, first_ordinal, heading)`` rows — PURE, the
+    ONE rule both adapters apply.
+
+    ``depth`` is the index into a chunk's ``heading_path`` and ``first_ordinal`` the lowest
+    ordinal of a chunk carrying ``heading`` at that depth. The SECTION depth is the FIRST depth
+    with at least two distinct headings: depth 0 is the document's own title (one value), a
+    document whose top heading is unique (``# Manual``) has one value there too, and the next
+    depth is where it splits into what it covers. Nothing is hard-coded to a level — a document
+    with no unique top heading yields its level 1, one with a unique ``#`` its level 2, and one
+    that never splits yields ``()``. Blank headings are dropped; each heading appears once, at
+    its first appearance in the document; at most ``limit``."""
+    first: "dict[int, dict[str, int]]" = {}
+    for depth, ordinal, heading in rows:
+        text = " ".join(str(heading or "").split())
+        if not text:
+            continue
+        seen = first.setdefault(int(depth), {})
+        if text not in seen or int(ordinal) < seen[text]:
+            seen[text] = int(ordinal)
+    for depth in sorted(first):
+        if len(first[depth]) >= 2:
+            ordered = sorted(first[depth].items(), key=lambda kv: (kv[1], kv[0]))
+            return tuple(h for h, _ in ordered[:max(0, int(limit))])
+    return ()
+
+
 @dataclass(frozen=True)
 class KbDocument:
     """A document and the two versions a caller needs to render its state.
@@ -316,6 +350,12 @@ class KbDocument:
     latest: Optional[KbVersion] = None
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
+    #: The SECTION headings of the ACTIVE version, in document order (:func:`section_headings`)
+    #: — filled by ``readable_documents`` only, because it is the reader's outline: what a
+    #: caller can say the document is ABOUT when its title alone does not (a manual titled
+    #: *Relatório 2026* whose sections name the rent, the payroll, the taxes). ``()`` from every
+    #: other read, and for a document with no section depth.
+    sections: tuple[str, ...] = ()
 
     @property
     def status(self) -> str:

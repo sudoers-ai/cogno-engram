@@ -25,6 +25,7 @@ import json
 import logging
 import re
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import datetime
 from typing import Any, AsyncIterator, Optional
 from uuid import UUID, uuid4
@@ -77,6 +78,7 @@ from cogno_engram.documents import (
     require_vector,
     sanitize_profiles,
     sanitize_reason,
+    section_headings,
 )
 from cogno_engram.trace_policy import TRACE_REVISION_WINDOW_S
 from cogno_engram.folding import FOLD_FUNCTION_SQL, fold_label
@@ -2857,7 +2859,25 @@ class PostgresDocumentStore(_PgBase):
             cur = await conn.execute(
                 f"SELECT {_DOC_COLS} FROM kb_documents d {_SERVED} ORDER BY d.created_at, d.id",
                 (owner_key, profile))
-            return await self._records(conn, await cur.fetchall())
+            rows = await cur.fetchall()
+            docs = await self._records(conn, rows)
+            # ONE aggregate over the whole served set, never a query per document — and run EVEN
+            # WITH NO ROWS, like the version read in `_records`, so the health probe (an owner
+            # that holds nothing) still touches `kb_chunks.heading_path`.
+            cur = await conn.execute(
+                "SELECT c.document_id, h.depth - 1 AS depth, min(c.ordinal) AS first_ordinal, "
+                "       h.heading "
+                "FROM kb_chunks c "
+                "JOIN kb_documents d ON d.id = c.document_id AND c.version = d.active_version "
+                "CROSS JOIN LATERAL unnest(c.heading_path) WITH ORDINALITY AS h(heading, depth) "
+                "WHERE c.document_id = ANY(%s::uuid[]) "
+                "GROUP BY c.document_id, h.depth, h.heading",
+                ([str(r["id"]) for r in rows],))
+            per_doc: "dict[str, list[tuple[int, int, str]]]" = {}
+            for r in await cur.fetchall():
+                per_doc.setdefault(str(r["document_id"]), []).append(
+                    (int(r["depth"]), int(r["first_ordinal"]), r["heading"]))
+        return [replace(d, sections=section_headings(per_doc.get(d.id, ()))) for d in docs]
 
     async def search(self, owner_key: str, *, profile: str, text: str,
                      vector: Optional[list[float]] = None, embed_model: Optional[str] = None,

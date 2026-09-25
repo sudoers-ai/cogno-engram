@@ -21,7 +21,8 @@ from __future__ import annotations
 from cogno_engram import GraphEdge
 from cogno_engram.lexical import (DECISION_ERROR, DECISION_NOTHING, DECISION_PARTIAL,
                                   DECISION_RELEVANT, FIRST_PERSON, RELEVANCE_FLOOR, SOURCE_GRAPH,
-                                  SOURCE_MEMORY, STOPWORDS, TOP_K, about, anchor,
+                                  SOURCE_MATERIAL, SOURCE_MEMORY, STOPWORDS, TOP_K, Candidate,
+                                  about, anchor,
                                   decide, graph_candidates, memory_candidates, partial, rank,
                                   render, speaks_of_self, tokens, variants)
 
@@ -78,6 +79,24 @@ def test_about_is_whole_words_in_order_on_either_END_and_graph_only():
     assert not about(edge, []), "no anchor, nothing is about it"
     mem = memory_candidates([_Record("m1", "Marisa Lobo prefers email")])[0]
     assert mem.source == SOURCE_MEMORY and not about(mem, ["Marisa"]), "a memory has no ends"
+
+
+def test_only_a_GRAPH_candidate_is_about_an_anchor_even_when_another_carries_the_ends():
+    """The graph-only rule has to be OBSERVABLE: the builders give a memory or a section empty
+    ends, so a test over them passes whether or not the rule exists (a reviewer's mutation that
+    removed it survived the suite). Here a memory and a section carry the anchor in ``head`` and
+    ``tail`` — and are still not about it, neither for :func:`about` nor for the tier; the graph
+    edge with the SAME ends is the control that the ends themselves do match."""
+    ends = {"head": "marisa lobo", "tail": "marisa lobo"}
+    mem = Candidate(id="mem:1", source=SOURCE_MEMORY, text="nothing in common", **ends)
+    mat = Candidate(id="mat:0.0", source=SOURCE_MATERIAL, text="nothing in common", **ends)
+    edge = Candidate(id="edge:1.0", source=SOURCE_GRAPH, text="nothing in common", **ends)
+    assert about(edge, ["Marisa"]), "the control: these ends DO carry the anchor"
+    assert not about(mem, ["Marisa"]) and not about(mat, ["Marisa"])
+    ranked = rank([mem, mat, edge], ["unrelated question words"])
+    assert [c.id for _, c in partial(ranked, ["Marisa"])] == ["edge:1.0"]
+    decision, picked = decide(ranked, anchors=["Marisa"])
+    assert decision == DECISION_PARTIAL and [c.id for _, c in picked] == ["edge:1.0"]
 
 
 # ── the three shapes, each in BOTH worlds ────────────────────────────────────────────

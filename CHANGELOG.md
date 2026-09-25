@@ -30,14 +30,17 @@
   COM arestas, passa a receber as arestas dessa entidade como resposta parcial onde antes recebia
   «nada relevante». É o preço de nunca dizer «nada» sobre uma pessoa que o grafo conhece; o render
   é o que o mantém honesto.
-- **Testes** (`tests/test_lexical_anchors.py`, 14, conteúdo inventado): as três formas medidas
+- **Testes** (`tests/test_lexical_anchors.py`, 15, conteúdo inventado): as três formas medidas
   (quem pergunta; um salto adiante do que a pergunta nomeia; uma pessoa diluída numa pergunta
   longa), cada uma nos DOIS mundos (sem âncoras: `nothing_relevant`; com: `partial`); o controlo
   de que a camada nunca compete com um resultado relevante (com uma âncora que TEM arestas); a
   fonte partida que ganha à camada, e o seu par; palavras inteiras e por ordem, nos dois extremos,
   só no grafo; o alfabeto da 1.ª pessoa. **Mutações, cada uma morta:** camada desligada (5
   vermelhos), sem o salto (2), só a origem como extremo (2), a camada antes do `error` (1), a
-  camada a competir com um resultado relevante (1).
+  camada a competir com um resultado relevante (1); e a mutação do revisor que SOBREVIVIA — tirar a
+  guarda «só o grafo» do `_about` (as memórias e o material vêm com extremos vazios, por isso a
+  regra era inobservável) — morre agora num teste com uma memória e uma secção que TRAZEM a âncora
+  nos extremos (1 vermelho com a mutação, verde sem ela).
 
 ## Unreleased — o custo do ranking prova-se por RAZÃO intercalada e o tecto por MECANISMO; os «< 50 ms» passam a medição (2026-09-24)
 

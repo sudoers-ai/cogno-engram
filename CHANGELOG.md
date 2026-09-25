@@ -1,5 +1,43 @@
 # Changelog
 
+## Unreleased — fix(graph): a ordem do `walk` é a da CONSULTA, não a do plano; um candidato do grafo é numerado pelo id da ARESTA na base (P1, 2026-09-25)
+
+### O defeito, medido
+
+Numa implantação (medido só a ler), `PostgresKnowledgeGraph.walk` a partir de UM nó devolveu o
+MESMO conjunto de 85 arestas em ORDEM DIFERENTE no plano custom e no genérico da mesma instrução.
+O `SELECT DISTINCT` final não tinha `ORDER BY`, e uma ligação de pool que PREPAROU a instrução
+pode ser respondida com um plano genérico. O `lexical.graph_candidates` numerava cada aresta pela
+POSIÇÃO e o `rank` desempatava por ela. Com ≥ 25 candidatos empatados no mesmo score, o top-5 era
+função do plano, e o bloco entregue ao executor mudava com ele: em 74 chamadas, 10 blocos com
+CONTEÚDO diferente e outras 10 só com a ordem trocada.
+
+### O conserto
+
+- `walk`: uma linha por aresta, `ORDER BY` a profundidade MÍNIMA a que o passeio a alcançou e
+  depois `e.id`.
+- `GraphEdge.id`: o id da aresta na base, quando lida de uma base que o tem (`compare=False`:
+  duas leituras do mesmo facto são a mesma aresta).
+- `graph_candidates`: o id é `edge:<id da aresta>` e o prior (o último desempate do `rank`) é esse
+  id, quando a aresta o traz. Uma aresta sem id da base (em memória) fica com `edge:<nó>.<n>` e o
+  prior posicional, como antes.
+
+### Provas
+
+`tests/test_walk_order_is_the_querys_not_the_plans.py`:
+
+- **Postgres:** um fixture INVENTADO com empates (uma professora, 80 turmas, salas à
+  profundidade 2, oito âmbitos pequenos ao lado); a instrução é preparada à 1.ª execução
+  (`prepare_threshold=0`) e o plano é forçado por ligação (`plan_cache_mode`).
+  - ANTES, na `main` com o teste novo: 99 e 100 de 100 posições diferentes (duas corridas) entre
+    custom e genérico, e o
+    bloco renderizado (`render`) diferente.
+  - DEPOIS: a mesma ordem, o mesmo top-5 e o mesmo bloco nos dois planos.
+- **Unit:** as mesmas arestas noutra ordem dão os mesmos ids e o mesmo top-k; sem id da base, o
+  id posicional fica; o id não entra na igualdade.
+- **Mutações:** sem o `ORDER BY`, o teste da ordem falha; com o `SELECT DISTINCT` antigo, falha
+  com «99 positions differ»; com o id pela posição, falha o teste unit da permutação.
+
 ## Unreleased — VER o que está num documento: `version_text`, o texto de uma versão como o assistente o lê (P8, 2026-09-25)
 
 ### Added

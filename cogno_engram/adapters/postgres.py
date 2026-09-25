@@ -1745,7 +1745,7 @@ def _edge_from_row(scope: str, row: Any) -> GraphEdge:
                      attributes=row.get("attributes") or {},
                      status=row.get("status") or EDGE_ACCEPTED,
                      audience=row.get("audience") or AUDIENCE_UNCLASSIFIED,
-                     created_at=row.get("created_at"))
+                     created_at=row.get("created_at"), id=row.get("id"))
 
 
 class PostgresKnowledgeGraph(_PgBase):
@@ -1937,13 +1937,23 @@ class PostgresKnowledgeGraph(_PgBase):
                     ) nxt ON true
                     WHERE w.depth < %s AND NOT (nxt.node_id = ANY(w.path))
                 )
-                SELECT DISTINCT e.id, sn.label AS source, tn.label AS target,
+                -- ONE row per edge, and in an order the QUERY decides — never the plan. The
+                -- `SELECT DISTINCT` this replaced had no ORDER BY, so its row order was whatever
+                -- the plan's de-duplication produced, and the plan is not fixed: a statement a
+                -- pooled connection has PREPARED may be answered with a generic plan, which
+                -- returned the same set of edges in another order. A caller that numbers or
+                -- tie-breaks by position (a ranking over edges that tie on score) then answered
+                -- differently from the same data. The order: the SHALLOWEST depth at which the
+                -- walk reached the edge, then the edge id.
+                SELECT e.id, sn.label AS source, tn.label AS target,
                        e.relation, e.confidence, e.source_session, e.attributes, e.status,
                        e.audience, e.created_at
-                FROM walk w
+                FROM (SELECT edge_id, MIN(depth) AS depth FROM walk
+                      WHERE edge_id IS NOT NULL GROUP BY edge_id) w
                 JOIN knowledge_edges e ON e.id = w.edge_id
                 JOIN knowledge_nodes sn ON sn.id = e.source_id
                 JOIN knowledge_nodes tn ON tn.id = e.target_id
+                ORDER BY w.depth, e.id
                 """,
                 (scope, start_label, scope, audience, audience, audience, max_depth))
             rows = await cur.fetchall()

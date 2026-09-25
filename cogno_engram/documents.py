@@ -41,6 +41,9 @@ background (``processing``) while the previous one keeps answering, becomes ``re
 atomic swap, or ends in ``error`` with a reason from a closed alphabet — and the previous one
 still answers. Deleting a document takes it out of every search at once, removes its stored
 originals of EVERY version, and leaves a TOMBSTONE (what was removed, when, by whom — no content).
+The swap leaves one too: the versions it replaces go with their chunks and originals, and a
+``superseded`` tombstone names them; so does a version that ends in ``error`` (``failed``, with
+the reason from the closed alphabet).
 
 **Two steps when the cost must be confirmed first.** An upload can stop half-way on purpose: it
 is extracted and chunked, its embedding cost is ESTIMATED from the chunks, and the version waits
@@ -133,9 +136,20 @@ TOMBSTONE_PURGED = "purged"        # removed by a subtree purge
 TOMBSTONE_EXPIRED = "expired"      # a draft nobody confirmed: its chunks and original removed
 TOMBSTONE_DISCARDED = "discarded"  # a draft its uploader withdrew — at once, not in 24 h
 TOMBSTONE_INTERRUPTED = "interrupted"   # a `processing` version whose worker is gone
+#: Versions a COMMIT removed because a newer one exists: every older version the swap deletes
+#: (with their chunks and originals, in the same transaction), and a version whose commit
+#: arrives after a newer one was begun. Nobody asked for these removals — they are a side effect
+#: of an upload — and the version row goes with them, so this is the only record left that the
+#: replaced version (and its original) ever existed.
+TOMBSTONE_SUPERSEDED = "superseded"
+#: A version that ENDED IN ERROR (``fail_version``): its chunks, draft and stored original are
+#: removed and the row stays with its reason. The one kind whose tombstone carries a ``reason``
+#: — the version's own, from :data:`VALID_KB_REASONS` (never the free text a failure raised).
+TOMBSTONE_FAILED = "failed"
 VALID_TOMBSTONE_KINDS: frozenset[str] = frozenset({TOMBSTONE_DELETED, TOMBSTONE_PURGED,
                                                    TOMBSTONE_EXPIRED, TOMBSTONE_DISCARDED,
-                                                   TOMBSTONE_INTERRUPTED})
+                                                   TOMBSTONE_INTERRUPTED, TOMBSTONE_SUPERSEDED,
+                                                   TOMBSTONE_FAILED})
 
 # ── discarding a draft ───────────────────────────────────────────────────────────────
 DISCARD_OK = "discarded"           # the draft is gone (or already was — a repeat is free)
@@ -436,7 +450,9 @@ class KbSearchResult:
 class KbTombstone:
     """What a removal leaves behind: WHICH document, WHICH versions, WHEN, by WHOM, and WHY —
     never its title, its text or its bytes. ``actor`` is the caller's opaque label for who asked
-    (blank when unknown)."""
+    (blank when unknown). ``kind`` is the why; ``reason`` refines it for a ``failed`` tombstone
+    only — the version's reason, from :data:`VALID_KB_REASONS` — and is blank for every other
+    kind, whose kind IS the reason."""
 
     owner_key: str
     document_id: str
@@ -444,6 +460,7 @@ class KbTombstone:
     kind: str
     actor: str = ""
     removed_at: Optional[datetime] = None
+    reason: str = ""
 
 
 def clamp_unit(x: float) -> float:

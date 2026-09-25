@@ -103,7 +103,11 @@ rules live in one module, `cogno_engram.documents`:
   heading, ~2000 **characters**, 15% overlap, heading path on every chunk → embed → stage →
   swap); the previous version answers until the new one is ready and keeps answering if it
   fails. It returns the embedder's own usage (`embedding_tokens`, `embedding_calls`) and takes
-  a `gate` (refuse before embedding: zero calls) and a `pace` (tokens per minute).
+  a `gate` (refuse before embedding: zero calls) and a `pace` (tokens per minute). The swap
+  removes every OLDER version — its chunks and its stored original with it — and leaves ONE
+  `superseded` tombstone naming them, so there is no version history: after a swap the old
+  original is gone (`get_original(version=old)` is `None`) and the tombstone is the record that
+  it existed. A version whose commit arrives after a newer one was begun is removed the same way.
 - **Or in two steps, when the cost must be confirmed first.** `prepare()` extracts, chunks and
   ESTIMATES, and parks the version in `awaiting_confirmation` — no embedder, no gate, nothing
   spent; a bad file fails HERE. `estimated_tokens` and `expires_at` (prepare's clock + 24 h) are
@@ -117,6 +121,9 @@ rules live in one module, `cogno_engram.documents`:
   older (a crashed prepare, a commit that died after claiming its draft) as
   `error`/`interrupted`, so no version stays `processing` beyond its process. `ingest()` is
   `prepare()` + `commit()` back to back.
+- **Every removal leaves a tombstone** (`tombstones(owner_prefix)`): ids, version numbers, when,
+  who and why (`kind`; a `failed` one also carries the version's closed-alphabet `reason`) —
+  never a title, a byte or a line of text.
 - **Delete is immediate and leaves a tombstone.** The originals of every version go with it
   (they live in their own table, which no search joins); a job finishing after the delete
   writes nothing.

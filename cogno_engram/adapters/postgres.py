@@ -45,6 +45,7 @@ from cogno_engram.documents import (
     REASON_DISCARDED,
     REASON_INTERRUPTED,
     TOMBSTONE_DISCARDED,
+    TOMBSTONE_FAILED,
     TOMBSTONE_INTERRUPTED,
     COMMIT_READY,
     COMMIT_SUPERSEDED,
@@ -58,6 +59,7 @@ from cogno_engram.documents import (
     TOMBSTONE_DELETED,
     TOMBSTONE_EXPIRED,
     TOMBSTONE_PURGED,
+    TOMBSTONE_SUPERSEDED,
     VALID_MEDIA_TYPES,
     DocumentLimitReached,
     KbChunk,
@@ -596,7 +598,7 @@ async def ensure_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDING_DIM,
 #   kb_originals   the uploaded bytes, in a table of their OWN so no search can reach them —
 #                  the reader path never joins it, and a `SELECT *` over a version cannot drag
 #                  ten megabytes along
-#   kb_tombstones  what a delete or a purge removed: ids, versions, when, who — no content
+#   kb_tombstones  what every removal left: ids, versions, when, who, why — no content
 #
 # Every child cascades from its parent, so a delete of a document row removes its versions,
 # chunks and originals in the SAME statement, and a late writer's insert finds no parent.
@@ -820,7 +822,9 @@ async def ensure_documents_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDIN
             versions     integer[] NOT NULL DEFAULT '{}',
             kind         text NOT NULL,
             actor        text NOT NULL DEFAULT '',
-            removed_at   timestamptz NOT NULL DEFAULT now()
+            removed_at   timestamptz NOT NULL DEFAULT now(),
+            -- A `failed` tombstone's reason, from the closed alphabet; '' for every other kind.
+            reason       text NOT NULL DEFAULT ''
         )
         """,
         # `text_pattern_ops`: the subtree read (`owner_key = %s OR owner_key LIKE 'p/%'`) is
@@ -836,15 +840,21 @@ async def ensure_documents_schema(conn, *, embedding_dim: int = DEFAULT_EMBEDDIN
     # Additive, for a database created before the two-step ingestion: asked of the catalogue
     # first, like the edge columns above, because `ADD COLUMN IF NOT EXISTS` still takes an
     # ACCESS EXCLUSIVE lock when it has nothing to do.
-    for column, ddl in (
-        ("estimated_tokens",
+    for table, column, ddl in (
+        ("kb_versions", "estimated_tokens",
          "ALTER TABLE kb_versions ADD COLUMN IF NOT EXISTS estimated_tokens bigint NOT NULL DEFAULT 0"),
-        ("expires_at", "ALTER TABLE kb_versions ADD COLUMN IF NOT EXISTS expires_at timestamptz"),
-        ("claimed_at", "ALTER TABLE kb_versions ADD COLUMN IF NOT EXISTS claimed_at timestamptz"),
+        ("kb_versions", "expires_at",
+         "ALTER TABLE kb_versions ADD COLUMN IF NOT EXISTS expires_at timestamptz"),
+        ("kb_versions", "claimed_at",
+         "ALTER TABLE kb_versions ADD COLUMN IF NOT EXISTS claimed_at timestamptz"),
+        # A database created before `failed` tombstones: every existing row is another kind,
+        # and '' is exactly what those carry.
+        ("kb_tombstones", "reason",
+         "ALTER TABLE kb_tombstones ADD COLUMN IF NOT EXISTS reason text NOT NULL DEFAULT ''"),
     ):
         cur = await conn.execute(
             "SELECT 1 FROM information_schema.columns "
-            "WHERE table_name = 'kb_versions' AND column_name = %s", (column,))
+            "WHERE table_name = %s AND column_name = %s", (table, column))
         if await cur.fetchone() is None:
             await conn.execute(ddl)
     # The expiry sweep reads only the drafts, oldest first: a PARTIAL index, which stays the
@@ -2549,9 +2559,11 @@ class PostgresDocumentStore(_PgBase):
                 if v is None:
                     return COMMIT_SUPERSEDED
                 if number != int(v["newest"]):
-                    await conn.execute(
-                        "DELETE FROM kb_versions WHERE document_id = %s AND version = %s",
-                        (doc, number))
+                    cur = await conn.execute(
+                        "DELETE FROM kb_versions WHERE document_id = %s AND version = %s "
+                        "RETURNING version", (doc, number))
+                    gone = [int(r["version"]) for r in await cur.fetchall()]
+                    await self._supersede_tombstone(conn, owner_key, doc, gone)
                     return COMMIT_SUPERSEDED
                 if v["state"] == KB_READY and row["active_version"] == number:
                     return COMMIT_READY
@@ -2567,11 +2579,26 @@ class PostgresDocumentStore(_PgBase):
                     "UPDATE kb_documents SET active_version = %s, updated_at = now() WHERE id = %s",
                     (number, doc))
                 # Older versions go with their chunks and originals (cascade) in the SAME
-                # transaction — the swap is whole or it did not happen.
-                await conn.execute(
-                    "DELETE FROM kb_versions WHERE document_id = %s AND version < %s",
-                    (doc, number))
+                # transaction — the swap is whole or it did not happen — and so does the
+                # tombstone naming them: the numbers come from the DELETE itself (RETURNING), so
+                # the record is exactly what the cascade took.
+                cur = await conn.execute(
+                    "DELETE FROM kb_versions WHERE document_id = %s AND version < %s "
+                    "RETURNING version", (doc, number))
+                replaced = sorted(int(r["version"]) for r in await cur.fetchall())
+                await self._supersede_tombstone(conn, owner_key, doc, replaced)
         return COMMIT_READY
+
+    @staticmethod
+    async def _supersede_tombstone(conn, owner_key: str, doc: str, versions: "list[int]") -> None:
+        """ONE ``superseded`` tombstone naming every version a commit removed, inside the
+        commit's transaction — or nothing when it removed none. No actor: a swap is a side
+        effect of an upload, not somebody's request."""
+        if versions:
+            await conn.execute(
+                "INSERT INTO kb_tombstones (owner_key, document_id, versions, kind, actor) "
+                "VALUES (%s, %s, %s::integer[], %s, '')",
+                (owner_key, doc, list(versions), TOMBSTONE_SUPERSEDED))
 
     async def fail_version(self, owner_key: str, document_id: str, version: int, *,
                            reason: str) -> bool:
@@ -2584,15 +2611,26 @@ class PostgresDocumentStore(_PgBase):
                 if await self._lock_document(conn, owner_key, doc) is None:
                     return False
                 cur = await conn.execute(
-                    f"UPDATE kb_versions SET state = '{KB_ERROR}', reason = %s, finished_at = now() "
-                    f"WHERE document_id = %s AND version = %s AND state <> '{KB_READY}'",
-                    (sanitize_reason(reason), doc, int(version)))
-                if cur.rowcount == 0:
+                    "SELECT state FROM kb_versions WHERE document_id = %s AND version = %s "
+                    "FOR UPDATE", (doc, int(version)))
+                before = await cur.fetchone()
+                if before is None or before["state"] == KB_READY:
                     return False
+                why = sanitize_reason(reason)
+                await conn.execute(
+                    f"UPDATE kb_versions SET state = '{KB_ERROR}', reason = %s, finished_at = now() "
+                    "WHERE document_id = %s AND version = %s", (why, doc, int(version)))
                 for table in ("kb_chunks", "kb_originals", "kb_drafts"):
                     await conn.execute(
                         f"DELETE FROM {table} WHERE document_id = %s AND version = %s",
                         (doc, int(version)))
+                # One tombstone per ENDING: a version already in `error` had its content removed
+                # — and recorded — when it ended, so re-marking it writes nothing.
+                if before["state"] != KB_ERROR:
+                    await conn.execute(
+                        "INSERT INTO kb_tombstones (owner_key, document_id, versions, kind, actor, "
+                        "reason) VALUES (%s, %s, %s::integer[], %s, '', %s)",
+                        (owner_key, doc, [int(version)], TOMBSTONE_FAILED, why))
         return True
 
     async def get_version(self, owner_key: str, document_id: str,
@@ -2826,14 +2864,15 @@ class PostgresDocumentStore(_PgBase):
         require_owner(owner_prefix)
         async with self._conn() as conn:
             cur = await conn.execute(
-                "SELECT d.owner_key, d.document_id, d.versions, d.kind, d.actor, d.removed_at "
-                f"FROM kb_tombstones d WHERE {_OWNER_SUBTREE} "
+                "SELECT d.owner_key, d.document_id, d.versions, d.kind, d.actor, d.removed_at, "
+                f"d.reason FROM kb_tombstones d WHERE {_OWNER_SUBTREE} "
                 "ORDER BY d.removed_at DESC, d.id DESC LIMIT %s",
                 (owner_prefix, self._subtree_like(owner_prefix), int(limit)))
             rows = await cur.fetchall()
         return [KbTombstone(owner_key=r["owner_key"], document_id=str(r["document_id"]),
                             versions=tuple(int(x) for x in (r["versions"] or ())), kind=r["kind"],
-                            actor=r["actor"] or "", removed_at=r["removed_at"]) for r in rows]
+                            actor=r["actor"] or "", removed_at=r["removed_at"],
+                            reason=r["reason"] or "") for r in rows]
 
     async def prune_tombstones(self, *, before: datetime) -> int:
         async with self._conn() as conn:

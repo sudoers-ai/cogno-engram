@@ -342,11 +342,16 @@ class DocumentStore(Protocol):
     async def add_chunks(self, owner_key: str, document_id: str, version: int,
                          chunks: Sequence[KbChunk]) -> bool: ...
     # The ATOMIC SWAP: in one transaction the version becomes ``ready`` and served, and every
-    # OLDER version (its chunks and its original) is removed. Returns ``documents.COMMIT_*``.
+    # OLDER version (its chunks and its original) is removed, leaving ONE tombstone
+    # (``superseded``) that names them. A version whose commit arrives after a newer one was
+    # begun is removed the same way (``COMMIT_SUPERSEDED``, and a tombstone naming it). Returns
+    # ``documents.COMMIT_*``.
     async def commit_version(self, owner_key: str, document_id: str, version: int, *,
                              pages: int) -> str: ...
     # The served version, if any, keeps answering. ``False`` when there was nothing to mark.
-    # Failing a DRAFT (``awaiting_confirmation``) drops the draft with it.
+    # Failing a DRAFT (``awaiting_confirmation``) drops the draft with it. The version's chunks,
+    # draft and stored original are removed and a ``failed`` tombstone records it, with the
+    # sanitised reason; re-marking a version already in ``error`` writes no second one.
     async def fail_version(self, owner_key: str, document_id: str, version: int, *,
                            reason: str) -> bool: ...
     # One version of one document of this owner, any state — ``None`` when there is none.

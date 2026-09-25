@@ -19,7 +19,10 @@ wherever it is taken.
   counting;
 * a ranking (:func:`rank`) with a ONE-HOP inheritance along a graph walk and a deterministic
   tie-break, and the decision over it (:func:`decide`): relevant, *nothing relevant*, or
-  *error* — a source that broke is never reported as a source that holds nothing;
+  *error* — a source that broke is never reported as a source that holds nothing — and, when the
+  caller names who the question is ABOUT (:func:`anchor`, :func:`speaks_of_self`), *partial*:
+  nothing answers the question directly, but the graph holds edges about who it names
+  (:func:`partial`), which is said instead of *nothing relevant*;
 * candidates built from this library's OWN types (:func:`graph_candidates` over the
   ``(variant, rank, node_id, edges)`` a walk produces, :func:`memory_candidates` over memory
   records), each under a CONTENT-FREE id a reply can cite.
@@ -46,6 +49,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any, Iterable, Optional, Sequence
 
 from cogno_engram.textfold import fold
@@ -192,6 +196,8 @@ DECISION_RELEVANT = "relevant"
 DECISION_NOTHING = "nothing_relevant"
 DECISION_ERROR = "error"          # a source that should have answered could not, and nothing
                                   # relevant came from the others — never "nothing relevant"
+DECISION_PARTIAL = "partial"      # nothing clears the floor for the QUESTION, but the graph holds
+                                  # edges about who or what the question NAMES — see :func:`partial`
 
 _CLIP = 600
 
@@ -291,6 +297,12 @@ def graph_candidates(walks: Iterable[tuple], limit: Optional[int] = None, *,
     ``baseline_nodes``: the first that-many start nodes of variant 0 are the ones a BASELINE
     retrieval walks (a proximity search that takes the nearest N nodes of the first query), so
     their edges are marked ``old``. ``0`` marks none.
+
+    A walk that did not start from a query variant — an ANCHOR's walk (see :func:`partial`), seeded
+    on a label the question names rather than on the nodes nearest its embedding — passes any
+    ``variant`` other than ``0`` (``-1`` by convention) and a content-free ``node_id`` of the
+    caller's (an ordinal such as ``a0``): it is never marked ``old``, and an edge it shares with a
+    query walk stays ONE candidate under the id it got first.
     """
     seen: "set[tuple]" = set()
     out: "list[Candidate]" = []
@@ -380,12 +392,141 @@ def variants(query: str, original: str = "") -> "list[str]":
     return out
 
 
-def render(query: str, picked: Sequence[tuple]) -> str:
+# ── anchors: who and what the question is ABOUT ──────────────────────────────────────
+#
+# **The defect this is for.** The score is the share of the QUESTION's words a candidate
+# carries, and two shapes of question defeat it while the answer sits among the candidates:
+#
+# * the question speaks of the one asking («meus horários de outubro») and the edge that
+#   answers it names that person and none of the question's words (``<the asker> --[TEACHES]-->
+#   <a class>``): the SUBJECT of the question is a word the score cannot see;
+# * the question names an entity and asks several things about it, and the edge names the entity
+#   and nothing else that was asked: one word of four is a quarter, under the floor.
+#
+# Measured on a consumer's replay of real calls: wherever the proximity walk held an edge a human
+# labelled relevant and this module answered *nothing relevant*, that edge WAS a candidate and
+# scored under the floor. It was not a fetch that missed it — so fetching more of the person's
+# edges does not move that shape; a rule about what an edge TOUCHING the named entity means does.
+#
+# **The rule, and why it is a TIER and not a boost.** An ANCHOR is a label the question is about:
+# an entity it names, or the asker when it speaks in the first person. The CALLER decides which —
+# who the asker is, and what named what, are not this module's to know. A graph candidate is ABOUT
+# an anchor when one of its two ENDS carries the anchor's words, whole and in order. When nothing
+# clears the floor, :func:`decide` answers :data:`DECISION_PARTIAL` with those candidates instead
+# of *nothing relevant* — not "this answers the question" but "nothing answers it directly, and
+# this is what is recorded about who it names" (:func:`render` says exactly that). Anything that
+# clears the floor is untouched: the tier never competes with a relevant result, moves no score and
+# no floor, and a caller that passes no anchors gets the decision it always got.
+#
+# What it costs is stated, not assumed: a question about an attribute nobody recorded («does <the
+# clinic> have parking?») that names an entity WITH edges now gets that entity's edges as a
+# partial answer where it used to get *nothing relevant*. That is the price of never saying
+# "nothing" about a person the graph does know, and the render is what keeps it honest.
+
+#: First-person SINGULAR words, Portuguese and English, in the tokenizer's alphabet: a question
+#: carrying one speaks of the one ASKING. Some are also :data:`STOPWORDS` (``eu``, ``meu``,
+#: ``minha``, ``my``) — they carry no TOPIC, which is exactly why the score never sees them — but
+#: they carry a REFERENCE, and a reference is what an anchor is. The PLURAL (``nós``, ``nosso``,
+#: ``we``, ``our``) is left out on purpose: said by a business's own staff it means the business,
+#: not the person. English ``I`` is one character, never a token; :func:`speaks_of_self` reads it
+#: on its own.
+FIRST_PERSON = frozenset(tokens("eu me mim comigo meu minha meus minhas my me mine myself"))
+
+# `I` over the folded text, as a whole word (so «iPhone» and «Turma II» do not count).
+_I = re.compile(r"(?<![a-z0-9])i(?![a-z0-9])")
+
+
+def speaks_of_self(text: str) -> bool:
+    """Does ``text`` speak in the first person singular — :data:`FIRST_PERSON`, or English ``I``?
+    The caller turns a ``True`` into an anchor on the one asking; this module never knows who
+    that is."""
+    return (bool(FIRST_PERSON.intersection(tokens(text or "")))
+            or bool(_I.search(fold(text or ""))))
+
+
+def anchor(label: Any) -> "tuple[str, ...]":
+    """An anchor's words, in order: the label's :func:`tokens` with function words trimmed from
+    both ENDS («o Orientador» → ``("orientador",)``) and KEPT inside («Rua das Acácias» keeps its
+    ``das``, so it still matches the edge end it names). ``()`` when no content word is left — a
+    pronoun or an article alone is not an anchor. Memoised: a caller asks :func:`about` once per
+    candidate, and a call holds a handful of anchors against up to :data:`MAX_CANDIDATES`."""
+    return _anchor(str(label or ""))
+
+
+@lru_cache(maxsize=4096)
+def _anchor(label: str) -> "tuple[str, ...]":
+    words = tokens(label)
+    while words and words[0] in STOPWORDS:
+        words.pop(0)
+    while words and words[-1] in STOPWORDS:
+        words.pop()
+    return tuple(words)
+
+
+def _anchor_words(labels: Iterable[Any]) -> "tuple[tuple[str, ...], ...]":
+    out: "list[tuple[str, ...]]" = []
+    for label in labels:
+        words = anchor(label)
+        if words and words not in out:
+            out.append(words)
+    return tuple(out)
+
+
+def _carries(end: str, words: "tuple[str, ...]") -> bool:
+    ends = end.split()
+    n = len(words)
+    return any(tuple(ends[i:i + n]) == words for i in range(len(ends) - n + 1))
+
+
+def _about(candidate: Candidate, words: "Sequence[tuple[str, ...]]") -> bool:
+    if candidate.source != SOURCE_GRAPH:
+        return False
+    return any(_carries(end, w) for end in (candidate.head, candidate.tail) if end for w in words)
+
+
+def about(candidate: Candidate, anchors: Iterable[Any]) -> bool:
+    """Is ``candidate`` an edge whose SOURCE or TARGET carries one of the ``anchors``' words,
+    whole and in order? «Marisa» is carried by the end «Marisa Lobo» and not by «Marisol»; the
+    fold is the tokenizer's (accents and case), so «Otávio» is carried by «OTAVIO BRANDÃO».
+
+    Graph candidates only: an edge RELATES two things, so "is it about this one" has an answer. A
+    memory or a section of material has no ends — it is about whatever its words say, and that is
+    what the score already measures."""
+    return _about(candidate, _anchor_words(anchors))
+
+
+def partial(ranked: Sequence[tuple], anchors: Iterable[Any],
+            k: int = TOP_K) -> "list[tuple[float, Candidate]]":
+    """The :data:`DECISION_PARTIAL` answer over an ALREADY-RANKED list: the candidates
+    :func:`about` an anchor, in the ranking's own order (their own score first — a word of the
+    question still counts — then each source's recall order), then the edges ONE hop on from them
+    (an edge whose source is the target of one of those: the rule :data:`HOP_DECAY` applies to
+    scores, applied to the tier), top ``k``. Forward only, one hop, never iterated — two hops
+    leave the entity, and the tier would stop being about it."""
+    words = _anchor_words(anchors)
+    if not words:
+        return []
+    direct = [(s, c) for s, c in ranked if _about(c, words)]
+    ids = {c.id for _, c in direct}
+    tails = {c.tail for _, c in direct if c.tail}
+    hop = [(s, c) for s, c in ranked
+           if c.source == SOURCE_GRAPH and c.id not in ids and c.head in tails]
+    return (direct + hop)[:k]
+
+
+def render(query: str, picked: Sequence[tuple], *,
+           decision: str = DECISION_RELEVANT) -> str:
     """The payload an executor would read — each result under its id, so a reply can cite
-    ``[edge:12.0]``."""
+    ``[edge:12.0]``. A :data:`DECISION_PARTIAL` answer SAYS it is one: nothing recorded answers
+    the question directly, and what follows is only what is recorded about who or what it names —
+    a reader that took it for the answer would be the defect this tier must not create."""
     if not picked:
         return f"Nothing relevant recorded about {query!r}."
-    lines = [f"What we have recorded about {query!r} (most relevant first; cite by id):"]
+    if decision == DECISION_PARTIAL:
+        lines = [f"Nothing recorded answers {query!r} directly. Recorded about who or what it "
+                 f"names (it may not answer the question; cite by id):"]
+    else:
+        lines = [f"What we have recorded about {query!r} (most relevant first; cite by id):"]
     for _, c in picked:
         text = " ".join(c.text.split())
         lines.append(f"[{c.id}] {text[:_CLIP]}")
@@ -393,11 +534,24 @@ def render(query: str, picked: Sequence[tuple]) -> str:
 
 
 def decide(ranked: Sequence[tuple], *, failed: Sequence[str] = (),
-           floor: float = RELEVANCE_FLOOR) -> "tuple[str, list]":
+           floor: float = RELEVANCE_FLOOR,
+           anchors: Sequence[Any] = ()) -> "tuple[str, list]":
     """``(decision, picked)`` over an ALREADY-RANKED list (ranking is the CPU; it runs once).
     *Nothing relevant* only when every source that should have answered DID — a source that
-    broke and a source that holds nothing are different facts."""
+    broke and a source that holds nothing are different facts.
+
+    ``anchors`` — the labels the question is ABOUT (see :func:`partial`) — are read only when
+    nothing clears the floor and no source broke: then the candidates about them are the answer,
+    as :data:`DECISION_PARTIAL`, and *nothing relevant* is said only when there are none. Empty
+    (the default), the decision is exactly the one this function made before anchors existed. A
+    broken source still wins over the tier: "nothing answers it directly" is a claim about every
+    source, and one of them could not be asked."""
     picked = chosen(ranked, floor)
     if picked:
         return DECISION_RELEVANT, picked
-    return (DECISION_ERROR if failed else DECISION_NOTHING), picked
+    if failed:
+        return DECISION_ERROR, picked
+    tier = partial(ranked, anchors) if anchors else []
+    if tier:
+        return DECISION_PARTIAL, tier
+    return DECISION_NOTHING, picked

@@ -1,5 +1,47 @@
 # Changelog
 
+## Unreleased — ÂNCORAS: quem a pergunta NOMEIA, e a decisão `partial` (2026-09-24)
+
+### Added
+
+- **`cogno_engram.lexical`: âncoras e a camada `partial`.** Uma ÂNCORA é um rótulo de quem ou
+  do que a pergunta fala — uma entidade que ela nomeia, ou quem pergunta quando fala na 1.ª
+  pessoa; QUEM é cada uma decide-o o chamador. Uma aresta é «sobre» uma âncora quando o SEU
+  EXTREMO (origem ou alvo) contém as palavras dela, inteiras e por ordem, com a dobra do
+  tokenizador (`anchor`, `about`). Quando NADA passa o piso, `decide(..., anchors=[…])` responde
+  **`partial`** (`DECISION_PARTIAL`) com essas arestas e as que estão UM salto adiante delas
+  (`partial`, top `TOP_K`), em vez de `nothing_relevant`; `render(..., decision=)` diz que a
+  resposta é parcial («Nothing recorded answers … directly. Recorded about who or what it names
+  (it may not answer the question …)»). `FIRST_PERSON` + `speaks_of_self` lêem a 1.ª pessoa do
+  SINGULAR (pt/en, alfabeto do tokenizador; o plural fica de fora, porque na boca do staff é a
+  empresa).
+- **Porquê — medido no replay de um consumidor, sobre chamadas reais:** em todas as chamadas em
+  que o passeio por proximidade tinha uma aresta rotulada relevante e esta decisão disse «nada
+  relevante», essa aresta JÁ ERA candidata e pontuou abaixo do piso. Não era recolha: uma pergunta
+  na 1.ª pessoa não partilha palavra com `<quem pergunta> --[TEACHES]--> <turma>`, e uma pergunta
+  longa sobre uma pessoa dilui a única palavra comum. Juntar mais arestas da pessoa não mexe
+  nisso; dizer o que significa uma aresta QUE TOCA a entidade nomeada mexe.
+- **O que NÃO muda:** tudo o que passa o piso (a camada nunca compete com um resultado relevante,
+  não mexe em pontuação nem no piso); uma fonte partida continua a dar `error`; sem âncoras, a
+  decisão é exactamente a de antes. `graph_candidates` documenta a convenção do passeio de uma
+  âncora (variante ≠ 0, id de nó ordinal `a<k>`): nunca `old`, e uma aresta partilhada com o
+  passeio da pergunta é UMA candidata, com o id que ganhou primeiro.
+- **O custo, dito:** uma pergunta sobre um atributo que ninguém registou, que nomeia uma entidade
+  COM arestas, passa a receber as arestas dessa entidade como resposta parcial onde antes recebia
+  «nada relevante». É o preço de nunca dizer «nada» sobre uma pessoa que o grafo conhece; o render
+  é o que o mantém honesto.
+- **Testes** (`tests/test_lexical_anchors.py`, 15, conteúdo inventado): as três formas medidas
+  (quem pergunta; um salto adiante do que a pergunta nomeia; uma pessoa diluída numa pergunta
+  longa), cada uma nos DOIS mundos (sem âncoras: `nothing_relevant`; com: `partial`); o controlo
+  de que a camada nunca compete com um resultado relevante (com uma âncora que TEM arestas); a
+  fonte partida que ganha à camada, e o seu par; palavras inteiras e por ordem, nos dois extremos,
+  só no grafo; o alfabeto da 1.ª pessoa. **Mutações, cada uma morta:** camada desligada (5
+  vermelhos), sem o salto (2), só a origem como extremo (2), a camada antes do `error` (1), a
+  camada a competir com um resultado relevante (1); e a mutação do revisor que SOBREVIVIA — tirar a
+  guarda «só o grafo» do `_about` (as memórias e o material vêm com extremos vazios, por isso a
+  regra era inobservável) — morre agora num teste com uma memória e uma secção que TRAZEM a âncora
+  nos extremos (1 vermelho com a mutação, verde sem ela).
+
 ## Unreleased — o custo do ranking prova-se por RAZÃO intercalada e o tecto por MECANISMO; os «< 50 ms» passam a medição (2026-09-24)
 
 ### Changed

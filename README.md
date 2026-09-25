@@ -239,9 +239,20 @@ payload = lexical.render(canonical_query, picked)            # each result under
   (`HOP_DECAY`); a deterministic tie-break.
 * **One floor** (`RELEVANCE_FLOOR`, a point on this lexical scale — the default was calibrated
   by a consumer over its own labelled set; pass your own) and a closed decision:
-  `relevant | nothing_relevant | error` — a source that broke is never reported as one that holds
-  nothing.
+  `relevant | nothing_relevant | error | partial` — a source that broke is never reported as one
+  that holds nothing.
+* **Anchors — who the question is ABOUT** (`anchor`, `speaks_of_self`, `about`, `partial`):
+  pass `decide(..., anchors=[labels])` with the entities the question names — and the asker's own
+  label when `speaks_of_self(text)` — and, when NOTHING clears the floor, the graph edges whose
+  SOURCE or TARGET carries an anchor's words (whole, in order, the tokenizer's fold) plus one hop
+  on from them come back as `partial` instead of `nothing_relevant`; `render(..., decision=)`
+  says the answer is partial. It exists because a question in the first person («meus horários»)
+  and a long question about one person dilute the edge that answers them under the floor while it
+  sits among the candidates. Anything that clears the floor is untouched, a broken source still
+  answers `error`, and no anchors means the old decision exactly. Who the asker is, and which
+  labels a reading of the question named, are yours.
 * **Content-free ids** (`edge:<node>.<n>`, `mem:<id>`): what a reply cites and a trace may keep.
+  An anchor's own walk passes a variant other than `0` and an ordinal node id (`edge:a0.<n>`).
 * **A cost bound by count** (`MAX_CANDIDATES`): ranking is CPU on your event loop; over ~3 MB
   of section-sized candidates the capped ranking is ~16× cheaper than the uncapped one (~22 ms
   against ~350 ms on a quiet box). `tests/test_lexical_cost.py` proves the cap mechanically and

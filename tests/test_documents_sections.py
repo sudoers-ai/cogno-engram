@@ -134,3 +134,17 @@ async def test_the_outline_is_the_ACTIVE_versions_and_other_reads_carry_none(doc
 
 async def test_an_owner_with_nothing_readable_is_an_empty_list(docs):
     assert await docs.readable_documents(_owner(), profile="ADMIN") == []
+
+
+async def test_a_heading_that_COMES_BACK_keeps_its_FIRST_place_in_both_adapters(docs):
+    """Parity on the ORDER, which decides which sections survive the ceilings (50 here, 12 in a
+    host): a section that reappears later («Receita» again in another chapter) keeps the place
+    of its FIRST appearance. The Postgres leg aggregates by (document, depth, heading) BEFORE the
+    pure rule, so only its `min(ordinal)` can hold this — with `max` it would read (B, A)."""
+    o = _owner()
+    comeback = [((TITLE, "Relatório Anual", "Receita"), "1"),
+                ((TITLE, "Relatório Anual", "Despesas"), "2"),
+                ((TITLE, "Relatório Anual", "Receita"), "3")]
+    await _publish(docs, o, comeback)
+    (served,) = await docs.readable_documents(o, profile="ADMIN")
+    assert served.sections == ("Receita", "Despesas")

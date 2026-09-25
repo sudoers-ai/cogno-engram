@@ -234,6 +234,12 @@ res = await docs.search(owner, profile=identity_role, text=original_text,
   `kb_*` table in turn and requires the probe to fail. (The graph probe could not see the
   engram's `turns` schema once, and the janitor failed silently for days behind a green
   `/health`; this is the same check for these tables, owned here so it moves with the pin.)
+- **Outline.** `readable_documents` fills `KbDocument.sections` — the section headings of the
+  ACTIVE version, in document order, at the first `heading_path` depth with two distinct
+  headings (at most `MAX_SECTIONS_PER_DOCUMENT`) — so a host can say what a document COVERS
+  without a search. They are the tenant's text taken from the CONTENT, so sanitise them like
+  titles before they reach a prompt, and treat them as possibly holding personal data (a title
+  can be refused at upload; a heading inside the file never was).
 - **Accents.** Pass `unaccent=True` (and the same `ts_config`) to BOTH `ensure_schema` and
   `PostgresDocumentStore` — the tables and the questions must fold alike, and the derived
   configuration name comes from the one function both call (`documents_ts_config`). Changing

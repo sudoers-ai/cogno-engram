@@ -124,6 +124,16 @@ rules live in one module, `cogno_engram.documents`:
 - **Every removal leaves a tombstone** (`tombstones(owner_prefix)`): ids, version numbers, when,
   who and why (`kind`; a `failed` one also carries the version's closed-alphabet `reason`) —
   never a title, a byte or a line of text.
+- **What was extracted can be read back — the management view.** `version_text(owner_key,
+  document_id, *, version=None, page=None, after=None, limit=50)` returns a version's chunks in
+  order, each as `(ordinal, page, heading_path, text)` — the passage WITHOUT the heading path at
+  its head (`chunking.chunk_text`, the inverse of what the chunker writes) — for the SERVED
+  version (`version=None`) or a DRAFT in `awaiting_confirmation`, so the uploader can check the
+  text BEFORE confirming its cost. Anything else (`processing`, `error`, a version the swap
+  removed, another owner's document) is `None`. `page` filters by PDF page (ignored on a version
+  without pages), `after` is an exclusive ordinal cursor (`has_more`/`next_after` continue it),
+  and no call returns more than `VERSION_TEXT_MAX_LIMIT` (200) chunks. No profile: never on a
+  contact's turn. It never reads the original.
 - **Delete is immediate and leaves a tombstone.** The originals of every version go with it
   (they live in their own table, which no search joins); a job finishing after the delete
   writes nothing.

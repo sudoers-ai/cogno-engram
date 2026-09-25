@@ -1,5 +1,56 @@
 # Changelog
 
+## Unreleased — VER o que está num documento: `version_text`, o texto de uma versão como o assistente o lê (P8, 2026-09-25)
+
+### Added
+
+- **`DocumentStore.version_text(owner_key, document_id, *, version=None, page=None, after=None,
+  limit=VERSION_TEXT_LIMIT) -> Optional[KbVersionText]`**, nos DOIS adaptadores e no port — a
+  leitura de GESTÃO por trás de um «ver o que está no documento». Devolve os trechos de UMA versão
+  por `ordinal`, cada um `KbTextChunk(ordinal, page, heading_path, text)`, com `KbVersionText(
+  document_id, version, state, pages, page, has_original, chunks, has_more, next_after)`.
+  - **O que se lê:** a versão SERVIDA em `ready` (`version=None` é essa) e um RASCUNHO em
+    `awaiting_confirmation`, lido do próprio rascunho (nenhum vector, nada embebido para o
+    mostrar) — o cliente confere o texto extraído ANTES de confirmar e pagar. Tudo o resto é
+    `None`: `processing` (um rascunho reclamado incluído — nunca meio texto), `error`, uma versão
+    que a troca apagou, um documento de outro dono (prefixos irmãos incluídos), um id que não
+    pode existir. `owner_key` em branco → `ValueError`. Para lá do fim → um resultado sem trechos,
+    nunca `None`.
+  - **`text` sem o caminho de títulos à cabeça.** `chunking.chunk_text(content, heading_path)` é
+    o inverso de `_content`, AO LADO dele: tira a cabeça só quando ela é EXACTAMENTE os títulos do
+    caminho unidos por um separador (lido da própria cabeça — o `ChunkingConfig` não fica
+    guardado) e uma linha em branco; qualquer outra coisa volta inteira. Um teste de ida-e-volta
+    sobre o que o chunker emite (Markdown e páginas, quatro separadores) prende os dois.
+  - **Paginação:** `page` filtra pela página do PDF e é IGNORADA numa versão sem páginas (Markdown,
+    `pages == 0`); `after` é um cursor por ordinal EXCLUSIVO; `has_more`/`next_after` continuam-no
+    sem segunda ida à base (cada adaptador lê `limit + 1`); `limit` por omissão
+    `VERSION_TEXT_LIMIT` = 50, cortado a `VERSION_TEXT_MAX_LIMIT` = 200 (o tecto protege a loja:
+    cortar não é erro). Inteiros ou `ValueError` — um `"3"` de uma query string converte-o o
+    chamador. A leitura é UMA só regra nos dois adaptadores (`documents.text_window`,
+    `text_page_filter`, `assemble_version_text`).
+  - **Em Postgres:** a versão e a sua fatia num só instantâneo (`REPEATABLE READ, READ ONLY`, sem
+    tranca — um leitor nunca atrasa um commit); os trechos de um rascunho fatiam-se DENTRO da base
+    (`jsonb_array_elements`), por isso um rascunho de 5000 trechos não atravessa o fio inteiro para
+    responder por cinquenta. Nunca lê o original: um papel sem `SELECT` em `kb_originals.data`
+    lê o texto (teste), e em memória `original_reads` não se mexe.
+  - Entra no `documents_probe`. `KbVersionText` e `KbTextChunk` exportados na raiz.
+- **Porquê:** quem carrega um documento precisa de VER o que ficou lá — hoje o documento traz
+  título, perfis, estado e contagens, e nenhum byte de conteúdo. O host serve a rota do texto
+  sobre isto, sem nova extracção.
+- **Para o host separar os seus dois 404:** `None` não diz porquê; `get_document(...).latest.version`
+  diz. Os números de versão só crescem e nunca se reutilizam, e a tentativa mais recente nunca é a
+  que uma remoção leva — preso por um teste que passa por todas as maneiras de apagar uma versão.
+- **Testes** (conteúdo inventado): `tests/test_documents_version_text.py` nos dois adaptadores —
+  a versão servida, por ordem, com o caminho fora do texto (e o controlo de que caminho + linha em
+  branco + texto é o `content` que a pesquisa devolve); o rascunho ANTES da confirmação, e que o
+  que se conferiu é o que fica servido; nada de `processing`/reclamado/`error`/expirado/
+  descartado/substituído/apagado, cada um com o seu controlo; outro dono; o cursor exclusivo
+  (3+3+1, nada duas vezes); o tecto e o valor por omissão; janelas inválidas; a página do PDF e a
+  continuação DENTRO dela; a página ignorada no Markdown; a numeração. `tests/test_documents_chunking.py`:
+  a ida-e-volta do `chunk_text` e os casos em que a cabeça não é o caminho. E a PARIDADE
+  (`tests/test_documents_postgres.py::test_the_version_text_is_the_same_slices_in_both_adapters`):
+  as mesmas janelas dão os mesmos resultados, campo a campo, em memória e em Postgres.
+
 ## Unreleased — toda a remoção de um original deixa lápide: `superseded` para cada versão que o commit apaga, `failed` para a que acaba em erro (P8, 2026-09-25)
 
 ### Fixed

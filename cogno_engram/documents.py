@@ -158,6 +158,14 @@ DISCARD_MISSING = "missing"        # no such version of a document of this owner
 VALID_DISCARD_OUTCOMES: frozenset[str] = frozenset({DISCARD_OK, DISCARD_NOT_A_DRAFT,
                                                     DISCARD_MISSING})
 
+# ── reading a version's text back (the management view) ──────────────────────────────
+#: How many chunks one :meth:`DocumentStore.version_text` call returns when the caller does not
+#: say, and the most it ever returns: a larger ``limit`` is CUT to the ceiling, never an error —
+#: the ceiling is the store's protection, not the caller's mistake. A version may hold thousands
+#: of chunks (``ChunkingConfig.max_chunks``); a call never ships more than this many.
+VERSION_TEXT_LIMIT = 50
+VERSION_TEXT_MAX_LIMIT = 200
+
 # ── claiming a draft for its commit ──────────────────────────────────────────────────
 #: How long an unconfirmed draft lives by default. A mechanism default — a host passes its own.
 DRAFT_TTL = timedelta(hours=24)
@@ -461,6 +469,90 @@ class KbTombstone:
     actor: str = ""
     removed_at: Optional[datetime] = None
     reason: str = ""
+
+
+@dataclass(frozen=True)
+class KbTextChunk:
+    """One chunk of a version's text, for a person to READ: ``text`` is the passage WITHOUT the
+    heading path the chunker put at the head of ``KbChunk.content`` (the path travels, structured,
+    in ``heading_path``; a chunk whose head is not exactly that path comes back whole — see
+    :func:`cogno_engram.chunking.chunk_text`). ``page`` is the PDF page (1-based), ``None`` for a
+    format without pages. Nothing here is a vector."""
+
+    ordinal: int
+    page: Optional[int]
+    heading_path: tuple[str, ...]
+    text: str
+
+
+@dataclass(frozen=True)
+class KbVersionText:
+    """A slice of ONE version's extracted text — what the assistant reads, chunk by chunk.
+
+    ``state`` is ``ready`` (the SERVED version) or ``awaiting_confirmation`` (a draft, read before
+    its cost is confirmed); no other state has text to show. ``pages`` is the version's page count,
+    ``None`` for a format without pages (Markdown). ``page`` is the page filter APPLIED — ``None``
+    when none was asked, and always ``None`` on a version without pages, where a page filter is
+    ignored. The slice is in ``ordinal`` order; ``has_more`` says whether chunks remain past it
+    (under the same filter), and ``next_after`` is the ``after`` that continues it (``None``
+    exactly when ``has_more`` is false). ``has_original`` says whether this version's uploaded
+    bytes are stored — they are read by ``get_original`` only, never here.
+
+    The chunks OVERLAP (``ChunkingConfig.overlap``, 15% by default): read in a row, the tail of
+    one repeats at the head of the next. They are shown as the assistant reads them, not as the
+    original file."""
+
+    document_id: str
+    version: int
+    state: str
+    pages: Optional[int]
+    page: Optional[int]
+    has_original: bool
+    chunks: tuple[KbTextChunk, ...] = ()
+    has_more: bool = False
+    next_after: Optional[int] = None
+
+
+def _is_int(x: object) -> bool:
+    return isinstance(x, int) and not isinstance(x, bool)
+
+
+def text_window(page: Optional[int], after: Optional[int],
+                limit: int) -> tuple[Optional[int], int, int]:
+    """``(page, after, limit)`` of a :meth:`DocumentStore.version_text` call, validated — the ONE
+    reading both adapters apply. INTEGERS only (a ``"3"`` from a query string is the caller's to
+    convert, not this library's to guess): ``page`` ``None`` or ≥ 1; ``after`` ``None`` → ``-1``
+    (every ordinal is ≥ 0, so "after −1" is "from the start"); ``limit`` ≥ 1, CUT to
+    :data:`VERSION_TEXT_MAX_LIMIT` above. Anything else is a ``ValueError``."""
+    if page is not None and not (_is_int(page) and page >= 1):
+        raise ValueError(f"page must be a 1-based page number or None, got {page!r}")
+    if after is not None and not _is_int(after):
+        raise ValueError(f"after must be a chunk ordinal or None, got {after!r}")
+    if not (_is_int(limit) and limit >= 1):
+        raise ValueError(f"limit must be an integer of at least 1, got {limit!r}")
+    return page, -1 if after is None else after, min(limit, VERSION_TEXT_MAX_LIMIT)
+
+
+def text_page_filter(page: Optional[int], pages: int) -> Optional[int]:
+    """The page filter a version actually applies: ``page`` on a version WITH pages, ``None`` on
+    one without (Markdown, ``pages == 0``) — whose chunks all carry ``page=None``, so a filter
+    there would hide the whole text instead of choosing part of it."""
+    return page if page is not None and int(pages or 0) > 0 else None
+
+
+def assemble_version_text(*, document_id: str, version: int, state: str, pages: int,
+                          page: Optional[int], has_original: bool,
+                          fetched: Sequence[KbTextChunk], limit: int) -> KbVersionText:
+    """The ONE place a slice becomes a :class:`KbVersionText`, for both adapters: they fetch up to
+    ``limit + 1`` chunks in ``ordinal`` order (the extra one only answers "is there more?"), and
+    this keeps ``limit`` of them and derives ``has_more``/``next_after`` from the rest."""
+    kept = tuple(fetched[:limit])
+    has_more = len(fetched) > limit
+    return KbVersionText(document_id=document_id, version=int(version), state=state,
+                         pages=int(pages) if int(pages or 0) > 0 else None,
+                         page=text_page_filter(page, pages), has_original=bool(has_original),
+                         chunks=kept, has_more=has_more,
+                         next_after=kept[-1].ordinal if has_more and kept else None)
 
 
 def clamp_unit(x: float) -> float:

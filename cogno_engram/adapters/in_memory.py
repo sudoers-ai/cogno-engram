@@ -15,7 +15,7 @@ import re
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Iterable, Optional
 from uuid import uuid4
 
 
@@ -53,9 +53,13 @@ from cogno_engram.documents import (
     KbDraft,
     KbHit,
     KbSearchResult,
+    KbTextChunk,
     KbTombstone,
     KbVersion,
+    KbVersionText,
     OriginalTooLarge,
+    VERSION_TEXT_LIMIT,
+    assemble_version_text,
     REASON_EXPIRED,
     chunk_id,
     clamp_unit,
@@ -70,8 +74,11 @@ from cogno_engram.documents import (
     sanitize_profiles,
     sanitize_reason,
     section_headings,
+    text_page_filter,
+    text_window,
 )
 from cogno_engram import write_loss
+from cogno_engram.chunking import chunk_text
 from cogno_engram.trace_policy import TRACE_REVISION_WINDOW_S
 from cogno_engram.types import (
     AUDIENCE_STAFF,
@@ -1093,6 +1100,37 @@ class InMemoryDocumentStore:
         self.original_reads += 1
         kept = self._originals.get((row.id, v))
         return kept[1] if kept is not None else None
+
+    async def version_text(self, owner_key: str, document_id: str, *,
+                           version: Optional[int] = None, page: Optional[int] = None,
+                           after: Optional[int] = None,
+                           limit: int = VERSION_TEXT_LIMIT) -> Optional[KbVersionText]:
+        require_owner(owner_key)
+        page, start, size = text_window(page, after, limit)
+        row = self._owned(owner_key, document_id)
+        if row is None:
+            return None
+        number = row.active_version if version is None else int(version)
+        v = self._versions.get((row.id, number)) if number is not None else None
+        if v is None:
+            return None
+        if v.state == KB_READY and v.version == row.active_version:
+            source: "Iterable[KbChunk]" = self._chunks.get((row.id, v.version), {}).values()
+        elif v.state == KB_AWAITING_CONFIRMATION and (row.id, v.version) in self._drafts:
+            source = self._drafts[(row.id, v.version)]["chunks"]
+        else:
+            return None                    # processing, error — nothing whole to show
+        wanted = text_page_filter(page, v.pages)
+        fetched = sorted((c for c in source if c.ordinal > start
+                          and (wanted is None or c.page == wanted)),
+                         key=lambda c: c.ordinal)[:size + 1]
+        return assemble_version_text(
+            document_id=row.id, version=v.version, state=v.state, pages=v.pages, page=page,
+            has_original=(row.id, v.version) in self._originals,
+            fetched=[KbTextChunk(ordinal=c.ordinal, page=c.page,
+                                 heading_path=tuple(c.heading_path),
+                                 text=chunk_text(c.content, c.heading_path)) for c in fetched],
+            limit=size)
 
     # ── ingestion ────────────────────────────────────────────────────────
     async def begin_version(self, owner_key: str, document_id: str, *, sha256: str,

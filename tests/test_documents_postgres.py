@@ -121,8 +121,8 @@ async def test_the_reader_path_never_reads_an_original(pg):
     try:
         await conn.execute(f"CREATE ROLE {role} LOGIN PASSWORD 'reader-pw'")
         await conn.execute(f"GRANT USAGE ON SCHEMA public TO {role}")
-        await conn.execute(f"GRANT SELECT ON kb_documents, kb_versions, kb_chunks, kb_tombstones "
-                           f"TO {role}")
+        await conn.execute(f"GRANT SELECT ON kb_documents, kb_versions, kb_chunks, kb_tombstones, "
+                           f"kb_drafts TO {role}")
         await conn.execute(f"GRANT SELECT (document_id, version) ON kb_originals TO {role}")
         parts = urlsplit(DSN)
         host = parts.hostname or "localhost"
@@ -136,6 +136,9 @@ async def test_the_reader_path_never_reads_an_original(pg):
         assert [d.id for d in await reader.readable_documents(o, profile="GUEST")] == [doc_id]
         [listed] = await reader.list_documents(o)
         assert listed.active.has_original                    # asked of the KEY, not the bytes
+        # the management view of the TEXT does not touch the bytes either
+        text = await reader.version_text(o, doc_id)
+        assert text.has_original and [c.ordinal for c in text.chunks] == [0]
         with pytest.raises(psycopg.errors.InsufficientPrivilege):      # CONTROL
             await reader.get_original(o, doc_id)
     finally:
@@ -227,6 +230,50 @@ async def test_a_tombstone_table_without_reason_is_migrated_and_its_old_rows_rea
         await conn.close()
     [old] = await pg.tombstones(o)
     assert (old.kind, old.actor, old.reason) == ("deleted", "admin-1", "")
+
+
+# ── parity: a version's text is the same slices in both adapters ────────────────────────
+
+async def test_the_version_text_is_the_same_slices_in_both_adapters(pg):
+    """The same upload, read through every window the host uses — whole, paged by the cursor,
+    one PDF page, a draft — gives field-for-field the same answer from the double and from
+    Postgres (the document id aside, which is each store's own uuid)."""
+    from dataclasses import asdict, replace
+
+    from cogno_engram.documents import MEDIA_PDF
+    from cogno_engram.ingest import ingest, prepare
+    from documents_support import FakePdfExtractor, Page, StubEmbedder
+
+    pages = [Page(1, "Capa."), Page(2, "\n\n".join(" ".join(f"item{p}x{w:02d}" for w in range(40))
+                                                    for p in range(10))), Page(3, "Fim.")]
+    md = "# Guia\n\nIntro.\n\n## Horários\n\nSábado 8h-12h.\n\n## Preços\n\nR$ 450,00.\n"
+
+    async def read(store) -> list:
+        o = f"acme{uuid4().hex[:6]}/p"
+        pdf = (await store.create_document(o, title="Regulamento", profiles=["GUEST"],
+                                           media_type=MEDIA_PDF)).id
+        await ingest(store, o, pdf, data=b"%PDF invented", embedder=StubEmbedder(),
+                     embed_model=MODEL_A, extractor=FakePdfExtractor(pages=pages))
+        mdoc = (await store.create_document(o, title="Guia", profiles=["GUEST"],
+                                            media_type=MEDIA_MARKDOWN)).id
+        await prepare(store, o, mdoc, data=md.encode(), embed_model=MODEL_A)
+        out, after = [], None
+        for _ in range(20):                    # the whole PDF, 2 at a time — BOUNDED, never hangs
+            part = await store.version_text(o, pdf, after=after, limit=2)
+            out.append(part)
+            if not part.has_more:
+                break
+            after = part.next_after
+        out += [await store.version_text(o, pdf, page=2), await store.version_text(o, pdf, page=2,
+                                                                                    limit=1),
+                await store.version_text(o, mdoc, version=1), await store.version_text(o, mdoc)]
+        return [None if t is None else asdict(replace(t, document_id="-")) for t in out]
+
+    memory = await read(InMemoryDocumentStore(embedding_dim=EMB_DIM))
+    postgres = await read(pg)
+    assert memory == postgres
+    assert len(memory) >= 5 and memory[-1] is None             # the draft has no SERVED text
+    assert memory[-2]["state"] == "awaiting_confirmation"
 
 
 # ── the ceiling under concurrency ────────────────────────────────────────────────────────

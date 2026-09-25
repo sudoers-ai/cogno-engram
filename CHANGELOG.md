@@ -29,7 +29,8 @@ CONTEÚDO diferente e outras 10 só com a ordem trocada.
 - **Postgres:** um fixture INVENTADO com empates (uma professora, 80 turmas, salas à
   profundidade 2, oito âmbitos pequenos ao lado); a instrução é preparada à 1.ª execução
   (`prepare_threshold=0`) e o plano é forçado por ligação (`plan_cache_mode`).
-  - ANTES, na `main` com o teste novo: 99 de 100 posições diferentes entre custom e genérico, e o
+  - ANTES, na `main` com o teste novo: 99 e 100 de 100 posições diferentes (duas corridas) entre
+    custom e genérico, e o
     bloco renderizado (`render`) diferente.
   - DEPOIS: a mesma ordem, o mesmo top-5 e o mesmo bloco nos dois planos.
 - **Unit:** as mesmas arestas noutra ordem dão os mesmos ids e o mesmo top-k; sem id da base, o

@@ -35,6 +35,7 @@ from cogno_engram.documents import (
     REASON_DISCARDED,
     REASON_INTERRUPTED,
     TOMBSTONE_DISCARDED,
+    TOMBSTONE_FAILED,
     TOMBSTONE_INTERRUPTED,
     KB_AWAITING_CONFIRMATION,
     KB_EMBED_SPACE_UNAVAILABLE,
@@ -1191,10 +1192,18 @@ class InMemoryDocumentStore:
         v = self._versions.get((row.id, int(version))) if row is not None else None
         if v is None or v.state == KB_READY:
             return False
+        already_ended = v.state == KB_ERROR
         v.state, v.reason, v.finished_at = KB_ERROR, sanitize_reason(reason), _now()
         self._chunks.pop((v.document_id, v.version), None)
         self._originals.pop((v.document_id, v.version), None)
         self._drafts.pop((v.document_id, v.version), None)
+        # One tombstone per ENDING: a version already in `error` had its content removed — and
+        # recorded — when it ended, so re-marking it removes nothing and writes nothing.
+        if row is not None and not already_ended:
+            self._tombstones.append(KbTombstone(owner_key=row.owner_key, document_id=row.id,
+                                                versions=(v.version,), kind=TOMBSTONE_FAILED,
+                                                actor="", removed_at=v.finished_at,
+                                                reason=v.reason))
         return True
 
     async def get_version(self, owner_key: str, document_id: str,

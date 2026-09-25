@@ -121,6 +121,9 @@ rules live in one module, `cogno_engram.documents`:
   older (a crashed prepare, a commit that died after claiming its draft) as
   `error`/`interrupted`, so no version stays `processing` beyond its process. `ingest()` is
   `prepare()` + `commit()` back to back.
+- **Every removal leaves a tombstone** (`tombstones(owner_prefix)`): ids, version numbers, when,
+  who and why (`kind`; a `failed` one also carries the version's closed-alphabet `reason`) —
+  never a title, a byte or a line of text.
 - **Delete is immediate and leaves a tombstone.** The originals of every version go with it
   (they live in their own table, which no search joins); a job finishing after the delete
   writes nothing.

@@ -182,7 +182,7 @@ async def _removal_trail(store, o: str) -> "list[tuple[str, str, tuple[int, ...]
     v2 = await staged(a, "2")
     assert await store.commit_version(o, a, v2, pages=0) == "ready"     # swap: (1,)
     v3 = await staged(a, "3")
-    assert await store.fail_version(o, a, v3, reason="timeout")        # v3 error, beside v2
+    assert await store.fail_version(o, a, v3, reason="timeout")        # failed: (3,) timeout
     v4 = await staged(a, "4")
     assert await store.commit_version(o, a, v4, pages=0) == "ready"     # swap: (2, 3)
     b = (await store.create_document(o, title="B", profiles=["GUEST"],
@@ -192,7 +192,7 @@ async def _removal_trail(store, o: str) -> "list[tuple[str, str, tuple[int, ...]
     assert await store.commit_version(o, b, newer, pages=0) == "ready"       # nothing older
     assert await store.delete_document(o, b, actor="admin-1")                # delete: (2,)
     label = {a: "A", b: "B"}
-    return [(label[t.document_id], t.kind, t.versions, t.actor)
+    return [(label[t.document_id], t.kind, t.versions, t.actor, t.reason)
             for t in await store.tombstones(o, limit=50)]
 
 
@@ -203,9 +203,30 @@ async def test_the_removal_trail_is_the_same_sequence_in_both_adapters(pg):
     memory = await _removal_trail(InMemoryDocumentStore(embedding_dim=EMB_DIM), o)
     postgres = await _removal_trail(pg, o)
     assert memory == postgres
-    # newest first — and every version the commits removed is named exactly once
-    assert memory == [("B", "deleted", (2,), "admin-1"), ("B", "superseded", (1,), ""),
-                      ("A", "superseded", (2, 3), ""), ("A", "superseded", (1,), "")]
+    # newest first — every version the commits removed named exactly once, and the failure's
+    # reason on its own stone only
+    assert memory == [("B", "deleted", (2,), "admin-1", ""), ("B", "superseded", (1,), "", ""),
+                      ("A", "superseded", (2, 3), "", ""), ("A", "failed", (3,), "", "timeout"),
+                      ("A", "superseded", (1,), "", "")]
+
+
+# ── a database from before `failed` tombstones gets the column, and its rows read blank ──
+
+async def test_a_tombstone_table_without_reason_is_migrated_and_its_old_rows_read_blank(pg):
+    from cogno_engram.adapters.postgres import ensure_schema
+    o = f"acme{uuid4().hex[:6]}/p"
+    doc_id = await publish(pg, o)
+    assert await pg.delete_document(o, doc_id, actor="admin-1")
+    conn = await _connect()
+    try:
+        await conn.execute("ALTER TABLE kb_tombstones DROP COLUMN reason")     # the old shape
+        with pytest.raises(Exception):                                          # CONTROL: bites
+            await pg.tombstones(o)
+        await ensure_schema(conn, embedding_dim=EMB_DIM)
+    finally:
+        await conn.close()
+    [old] = await pg.tombstones(o)
+    assert (old.kind, old.actor, old.reason) == ("deleted", "admin-1", "")
 
 
 # ── the ceiling under concurrency ────────────────────────────────────────────────────────

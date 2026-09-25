@@ -250,7 +250,10 @@ res = await docs.search(owner, profile=identity_role, text=original_text,
 - **Migration.** `ensure_schema` creates the five `kb_*` tables (`CREATE ... IF NOT EXISTS`,
   additive). A host whose migration delegates to it gets them with no new step; a pin bump
   that includes this change needs that migration run on the live database before the first
-  upload, like any schema change.
+  upload, like any schema change. The same holds for the columns added later by a
+  catalogue-checked `ADD COLUMN` (`kb_versions.estimated_tokens`/`expires_at`/`claimed_at`,
+  `kb_tombstones.reason`): `tombstones()` reads `reason`, so until the migration runs it — and
+  `documents_probe` — fail on the old table.
 - **Two steps.** `prepare` records everything the FILE can get wrong before anything is spent;
   `commit` is the only step that calls the embedder. `commit` outcomes a host must handle:
   `ready`, `unchanged` (a repeat — bill nothing: `embedding_tokens` is 0), `not_prepared`,
@@ -267,15 +270,19 @@ res = await docs.search(owner, profile=identity_role, text=original_text,
 - **Purge.** A tenant purge calls `purge_owner_subtree(tenant_prefix)`: every document under
   the prefix goes, with the chunks and the stored originals of every version, and one
   tombstone per document (ids, versions, when, who — no title, no text). `prune_tombstones`
-  bounds their retention.
-- **The removal trail.** `tombstones(owner_prefix)` (newest first) is where a removal is
-  recorded — `deleted`, `purged`, `expired`, `discarded`, `interrupted`, and `superseded`: the
-  commit's own, ONE per commit naming every version it removed (the versions the swap replaced,
-  or a version whose commit arrived after a newer one was begun), with no actor — nobody asked
-  for it, it is a side effect of an upload. Only the SERVED version (and a draft or a version
-  still being built) keeps its original: a host that offers "download the original" offers it
-  for those, and reads an older version's absence from the trail, never re-extracts it. **Backups are out of reach:** a database backup keeps an original
+  bounds their retention. **Backups are out of reach:** a database backup keeps an original
   until the backup's own retention expires — record that in the operator's data policy.
+- **The removal trail.** `tombstones(owner_prefix)` (newest first) is where every removal of a
+  version's content is recorded — `deleted`, `purged`, `expired`, `discarded`, `interrupted`,
+  `superseded` and `failed`. `superseded` is the commit's own: ONE per commit naming every
+  version it removed (the versions the swap replaced, or a version whose commit arrived after a
+  newer one was begun), with no actor — nobody asked for it, it is a side effect of an upload.
+  `failed` is `fail_version`'s: the version ended in `error`, its chunks, draft and original
+  went, and the stone carries the version's `reason` (the closed alphabet — never the detail a
+  failure raised); `reason` is blank on every other kind. Only the SERVED version (and a draft
+  or a version still being built) keeps its original: a host that offers "download the
+  original" offers it for those, and reads an older version's absence from the trail, never
+  re-extracts it.
 - **Model swap.** A global embedder change leaves every version on the old label; until it is
   re-indexed, searches are lexical and marked. `stale_documents(embed_model=new)` lists the work
   and `reindex()` rebuilds one document from its stored original.

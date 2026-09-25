@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — a TROCA deixa lápide: `superseded` para cada versão que o commit apaga (P8, 2026-09-25)
+## Unreleased — toda a remoção de um original deixa lápide: `superseded` para cada versão que o commit apaga, `failed` para a que acaba em erro (P8, 2026-09-25)
 
 ### Fixed
 
@@ -15,19 +15,39 @@
   (ninguém o pediu: é efeito de um upload) e sem conteúdo. Em Postgres os números saem do próprio
   `DELETE … RETURNING`, dentro da transacção da troca: a lápide é exactamente o que a cascata
   levou. Um commit que não apaga nada (o primeiro, ou a repetição de um já servido) não escreve.
+- **`fail_version` também apagava sem rasto** — os trechos, o rascunho e o original de uma
+  tentativa que acaba em `error` (a linha fica, com o motivo). Decisão do Director: é o mesmo
+  princípio, toda a remoção de um original deixa rasto. Agora escreve uma lápide **`failed`**
+  (`documents.TOMBSTONE_FAILED`) com o MOTIVO da versão — o do alfabeto fechado
+  `VALID_KB_REASONS`, já saneado por `sanitize_reason`, portanto um motivo desconhecido (um
+  caminho, um pedaço do ficheiro que uma excepção trouxesse) chega como `internal` e NUNCA como
+  texto livre. `KbTombstone` ganha `reason` (último campo, `""` por omissão; vazio em todas as
+  outras espécies, cuja espécie JÁ é o motivo). Uma lápide por FIM: voltar a marcar uma versão que
+  já está em `error` não remove nada e não escreve outra.
+- **Migração (aditiva):** `kb_tombstones` ganha `reason text NOT NULL DEFAULT ''` — na criação e,
+  numa base anterior, por `ADD COLUMN` verificado no catálogo, como as colunas do `kb_versions`
+  (as linhas antigas lêem `""`). `tombstones()` lê a coluna, por isso um pino que traga isto
+  precisa do `ensure_schema` corrido na base viva antes — até lá o `documents_probe` acusa a
+  tabela, que é o que deve fazer.
 - **Porquê agora:** a vista «ver o que está no documento» do host (P8) só oferece o original da
   versão SERVIDA — não há histórico de versões —, e é o rasto que lhe diz porque é que uma versão
-  antiga já não tem original.
-- **Testes** (conteúdo inventado): `tests/test_documents_store.py` nos dois adaptadores — a troca
-  nomeia a versão substituída (com o controlo de que antes dela os dois originais estão guardados
-  e não há lápide, e de que repetir o commit não escreve outra); uma troca é UMA lápide com a
-  versão servida E a falhada ao lado; o commit tardio deixa a sua. E a PARIDADE
-  (`tests/test_documents_postgres.py::test_the_removal_trail_is_the_same_sequence_in_both_adapters`):
-  o mesmo guião — duas trocas, um commit tardio, um delete — dá a MESMA sequência de lápides em
-  memória e em Postgres.
-- **Fica de fora, dito:** `fail_version` também apaga os trechos e o original de uma tentativa
-  falhada sem lápide (a linha da versão fica, com `error` e o motivo). Não é uma troca e não entra
-  aqui.
+  já não tem original.
+- **Testes** (conteúdo inventado), em `tests/test_documents_store.py` nos dois adaptadores:
+  - a troca nomeia a versão substituída, com dois controlos: antes dela os dois originais estão
+    guardados e não há lápide, e repetir o commit não escreve outra;
+  - uma troca é UMA lápide com a versão servida E a falhada ao lado (que já deixou a sua
+    `failed`);
+  - o commit tardio deixa a sua;
+  - a falha deixa `failed` com o motivo (e voltar a marcá-la não escreve segunda); o detalhe de
+    uma falha chega como `internal`; falhar a versão servida ou uma que não existe não escreve
+    nada, com controlo.
+  
+  Em `tests/test_documents_postgres.py`:
+  - uma `kb_tombstones` sem a coluna é migrada, e as linhas antigas lêem `""`, com o controlo de
+    que sem migração a leitura falha;
+  - a PARIDADE (`test_the_removal_trail_is_the_same_sequence_in_both_adapters`): o mesmo guião —
+    duas trocas, uma falha, um commit tardio, um delete — dá a MESMA sequência de lápides (espécie,
+    versões, actor, motivo) em memória e em Postgres.
 
 ## Unreleased — `KbDocument.sections`: o ÍNDICE de um documento, para quem só tem o título (2026-09-25)
 

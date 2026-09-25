@@ -29,6 +29,7 @@ from cogno_engram.documents import (
     KB_READY,
     MEDIA_MARKDOWN,
     TOMBSTONE_DELETED,
+    TOMBSTONE_FAILED,
     TOMBSTONE_PURGED,
     TOMBSTONE_SUPERSEDED,
     VALID_TOMBSTONE_KINDS,
@@ -277,7 +278,8 @@ async def test_a_deleted_document_leaves_every_search_at_once_and_leaves_a_tombs
     assert stone.removed_at is not None
     # no content in a tombstone: its fields are ids, numbers and labels only
     assert set(vars(stone)) == {"owner_key", "document_id", "versions", "kind", "actor",
-                                "removed_at"}
+                                "removed_at", "reason"}
+    assert stone.reason == ""                                   # only a `failed` one has a reason
     assert not await docs.delete_document(o, doc_id)            # twice is a no-op
 
 
@@ -313,7 +315,8 @@ async def test_the_swap_names_the_version_it_replaced_in_a_superseded_tombstone(
         (o, doc_id, TOMBSTONE_SUPERSEDED, (1,), "")
     assert stone.removed_at is not None
     assert set(vars(stone)) == {"owner_key", "document_id", "versions", "kind", "actor",
-                                "removed_at"}                         # no content, like the rest
+                                "removed_at", "reason"}               # no content, like the rest
+    assert stone.reason == ""
     # a repeated commit of the served version removes nothing and writes nothing
     assert await docs.commit_version(o, doc_id, v2.version, pages=0) == COMMIT_READY
     assert len(await docs.tombstones(o)) == 1
@@ -321,15 +324,17 @@ async def test_the_swap_names_the_version_it_replaced_in_a_superseded_tombstone(
 
 async def test_one_swap_is_one_tombstone_naming_every_version_it_removed(docs):
     """The served version AND a failed attempt beside it: the swap deletes both rows, so the
-    one tombstone names both — the same rule as a delete, which names every version."""
+    one tombstone names both — the same rule as a delete, which names every version. (The
+    failed attempt already left its own `failed` tombstone when its content went.)"""
     o = owner()
     doc_id = await publish(docs, o, profiles=("GUEST",))
     failed = await _staged(docs, o, doc_id, "2", b"segunda")
     assert await docs.fail_version(o, doc_id, failed.version, reason="timeout")
     v3 = await _staged(docs, o, doc_id, "3", b"terceira")
     assert await docs.commit_version(o, doc_id, v3.version, pages=0) == COMMIT_READY
-    [stone] = await docs.tombstones(o)
-    assert (stone.kind, stone.versions) == (TOMBSTONE_SUPERSEDED, (1, 2))
+    swap, fail = await docs.tombstones(o)                          # newest first
+    assert (swap.kind, swap.versions) == (TOMBSTONE_SUPERSEDED, (1, 2))
+    assert (fail.kind, fail.versions, fail.reason) == (TOMBSTONE_FAILED, (2,), "timeout")
     assert await docs.get_version(o, doc_id, 1) is None
     assert await docs.get_version(o, doc_id, 2) is None
 
@@ -356,6 +361,51 @@ async def test_a_commit_that_arrives_after_a_newer_version_leaves_a_tombstone_fo
 
 def test_superseded_is_in_the_closed_alphabet_of_tombstones():
     assert TOMBSTONE_SUPERSEDED == "superseded" and TOMBSTONE_SUPERSEDED in VALID_TOMBSTONE_KINDS
+    assert TOMBSTONE_FAILED == "failed" and TOMBSTONE_FAILED in VALID_TOMBSTONE_KINDS
+
+
+# ── a failure removes content too: `failed`, with the reason and never the detail ──────────
+
+async def test_a_failed_version_leaves_a_failed_tombstone_with_its_reason(docs):
+    o = owner()
+    doc = await docs.create_document(o, title="M", profiles=["GUEST"], media_type=MEDIA_MARKDOWN)
+    v = await _staged(docs, o, doc.id, "1", b"um original qualquer")
+    assert await docs.stored_original_bytes(o) > 0                  # CONTROL: stored …
+    assert await docs.tombstones(o) == []                          # … and nothing recorded yet
+
+    assert await docs.fail_version(o, doc.id, v.version, reason="no_text")
+    assert await docs.stored_original_bytes(o) == 0                # the failure took it …
+    [stone] = await docs.tombstones(o)                             # … and SAID so
+    assert (stone.owner_key, stone.document_id, stone.kind, stone.versions, stone.actor,
+            stone.reason) == (o, doc.id, TOMBSTONE_FAILED, (v.version,), "", "no_text")
+    assert stone.removed_at is not None
+    # the row stays with the same reason — the tombstone does not replace it
+    assert (await docs.get_version(o, doc.id, v.version)).reason == "no_text"
+    # re-marking a version already in `error` removes nothing and writes nothing
+    assert await docs.fail_version(o, doc.id, v.version, reason="timeout")
+    assert len(await docs.tombstones(o)) == 1
+
+
+async def test_a_failure_s_detail_never_reaches_the_tombstone(docs):
+    """The reason is SANITISED to the closed alphabet before it is stored: whatever an exception
+    said — a path, a byte of the file — lands as `internal`, on the version and on the stone."""
+    o = owner()
+    doc = await docs.create_document(o, title="M", profiles=["GUEST"], media_type=MEDIA_MARKDOWN)
+    v = await _staged(docs, o, doc.id, "1", b"x")
+    assert await docs.fail_version(o, doc.id, v.version, reason="/srv/uploads/a.pdf exploded")
+    [stone] = await docs.tombstones(o)
+    assert stone.reason == "internal" and "uploads" not in repr(stone)
+
+
+async def test_nothing_to_fail_writes_no_failed_tombstone(docs):
+    o = owner()
+    doc_id = await publish(docs, o)
+    assert not await docs.fail_version(o, doc_id, 1, reason="timeout")    # the served one
+    assert not await docs.fail_version(o, doc_id, 99, reason="timeout")   # no such version
+    assert await docs.tombstones(o) == []
+    v2 = await _staged(docs, o, doc_id, "2", b"y")                       # CONTROL
+    assert await docs.fail_version(o, doc_id, v2.version, reason="timeout")
+    assert [s.kind for s in await docs.tombstones(o)] == [TOMBSTONE_FAILED]
 
 
 async def test_a_purge_of_a_subtree_never_touches_a_sibling_prefix(docs):

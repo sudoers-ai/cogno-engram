@@ -71,6 +71,16 @@ store = PostgresStore(dsn=dsn, mask_pii=True)
 hits = await store.load_memories("acme/phone1", query=RetrievalQuery(text="...", embedding=[...]))
 ```
 
+**Nearest nodes under a scope filter — pgvector 0.8+ recommended.** One HNSW index serves every
+scope of `knowledge_nodes`, and the scope and audience conditions are applied to what the index
+returns; with the default `hnsw.ef_search` of 40, a scope whose nodes are all farther than 40 nodes
+of OTHER scopes would come back empty. `find_nodes_by_embedding` therefore turns on pgvector's
+ITERATIVE scan for its own transaction (`strict_order`, bounded by
+`adapters.postgres.HNSW_MAX_SCAN_TUPLES` = 20 000 index tuples — the worst case, a scope that
+never fills its `limit`, measured at ~40–47 ms at 768 dimensions). On a pgvector older than 0.8
+the setting does not exist and the query runs as before. The memory search needs none of this:
+it orders by an expression the index cannot serve, and scans the scope exactly.
+
 For scale, opt the high-volume tables into HASH(scope) partitioning (the generic
 equivalent of the parent's LIST(tenant), with zero DDL per new scope):
 

@@ -67,12 +67,14 @@ from cogno_engram.documents import (
     KbDraft,
     KbHit,
     KbSearchResult,
+    KbServedText,
     KbTextChunk,
     KbTombstone,
     KbVersion,
     KbVersionText,
     OriginalTooLarge,
     VERSION_TEXT_LIMIT,
+    assemble_served_text,
     assemble_version_text,
     chunk_id,
     clamp_unit,
@@ -2377,9 +2379,10 @@ _VERSION_SELECT = (
     "v.expires_at, v.claimed_at, (o.document_id IS NOT NULL) AS has_original "
     "FROM kb_versions v LEFT JOIN kb_originals o "
     "  ON o.document_id = v.document_id AND o.version = v.version ")
-# THE filter of the reader path — one string, so the three reads that serve a reader
-# (`readable_documents`, the search itself, and the models the search reports) cannot drift:
-# this owner, this profile among the published ones, the SERVED version, in state ready.
+# THE filter of the reader path — one string, so the four reads that serve a reader
+# (`readable_documents`, the search itself, the models the search reports, and `read_served`)
+# cannot drift: this owner, this profile among the published ones, the SERVED version, in state
+# ready.
 _SERVED = (f"JOIN kb_versions v ON v.document_id = d.id AND v.version = d.active_version "
            f"AND v.state = '{KB_READY}' "
            "WHERE d.owner_key = %s AND %s = ANY(d.profiles)")
@@ -3062,6 +3065,46 @@ class PostgresDocumentStore(_PgBase):
                 per_doc.setdefault(str(r["document_id"]), []).append(
                     (int(r["depth"]), int(r["first_ordinal"]), r["heading"]))
         return [replace(d, sections=section_headings(per_doc.get(d.id, ()))) for d in docs]
+
+    async def read_served(self, owner_key: str, document_id: str, *, profile: str,
+                          after: Optional[int] = None,
+                          limit: int = VERSION_TEXT_LIMIT) -> Optional[KbServedText]:
+        require_owner(owner_key)
+        profile = require_profile(profile)
+        _, start, size = text_window(None, after, limit)
+        doc = _doc_uuid(document_id)
+        if doc is None:
+            return None
+        async with self._conn() as conn:
+            # ONE snapshot for the served version and its slice, as in `version_text`: a swap
+            # committing between the two reads would pair one version's number with another's
+            # chunks. Read only, no lock — a reader never holds up a commit.
+            async with conn.transaction():
+                await conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+                cur = await conn.execute(
+                    f"SELECT d.title, v.version, v.pages FROM kb_documents d {_SERVED} "
+                    "AND d.id = %s",
+                    (owner_key, profile, doc))
+                v = await cur.fetchone()
+                if v is None:
+                    return None
+                number = int(v["version"])
+                # The SERVED version's number, from the filter above — a version still being
+                # built has chunks in `kb_chunks` too, and only this number keeps them out; a
+                # draft's chunks live in `kb_drafts`, which this read never joins.
+                cur = await conn.execute(
+                    "SELECT ordinal, heading_path, page, content FROM kb_chunks "
+                    "WHERE document_id = %s AND version = %s AND ordinal > %s "
+                    "ORDER BY ordinal LIMIT %s",
+                    (doc, number, start, size + 1))
+                rows = await cur.fetchall()
+        return assemble_served_text(
+            document_id=doc, version=number, title=v["title"], pages=int(v["pages"] or 0),
+            fetched=[KbTextChunk(ordinal=int(r["ordinal"]), page=r["page"],
+                                 heading_path=tuple(r["heading_path"] or ()),
+                                 text=chunk_text(r["content"], tuple(r["heading_path"] or ())))
+                     for r in rows],
+            limit=size)
 
     async def search(self, owner_key: str, *, profile: str, text: str,
                      vector: Optional[list[float]] = None, embed_model: Optional[str] = None,

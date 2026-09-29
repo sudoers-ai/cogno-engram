@@ -187,7 +187,7 @@ contacts. The split with the host, piece by piece:
 | The tool that searches, its relevance floor, its description | the skill (cortex) |
 
 ```python
-from cogno_engram import documents_probe, embed_model_label
+from cogno_engram import chunking, documents_probe, embed_model_label
 from cogno_engram.adapters.postgres import PostgresDocumentStore
 from cogno_engram.ingest import (TokensPerMinute, commit, discard_draft, expire_drafts, ingest,
                                  interrupt_stale, prepare)
@@ -232,6 +232,12 @@ text = await docs.version_text(owner, doc.id, version=draft.version, page=None, 
 res = await docs.search(owner, profile=identity_role, text=original_text,
                         vector=query_vector, embed_model=model)
 # res.degradations == ("kb_embed_space_unavailable",) → the search was lexical only
+
+# …and a document WHOLE, on the same turn, by the SAME filter — never `version_text` here
+served = await docs.read_served(owner, res.hits[0].document_id, profile=identity_role)
+# None → not this reader's (or not served, or a draft, or no such id: one answer for all)
+text = chunking.join_passages(served.chunks)   # one passage per section, the overlap said once
+# continue with after=served.next_after while served.has_more
 ```
 
 - **Health.** Call `documents_probe(docs, embed_model=model)` from `/health`: it runs every read
@@ -291,6 +297,20 @@ res = await docs.search(owner, profile=identity_role, text=original_text,
   `VERSION_TEXT_MAX_LIMIT`. Postgres reads the version and its slice in ONE snapshot
   (`REPEATABLE READ, READ ONLY`, no lock) and slices a draft's chunks inside the database. It is
   part of `documents_probe`.
+- **Reading a document whole on a turn.** `read_served` is the READER's counterpart of
+  `version_text`: the same chunks of the served version, the same exclusive `after` cursor and
+  `VERSION_TEXT_MAX_LIMIT` ceiling, but it takes the reader's `profile` and applies the reader
+  filter (the one string `_SERVED` that `search` and `readable_documents` use in Postgres, the
+  one `_served` walk in memory) on EVERY call. That is what makes it safe to take a document id
+  from a model's arguments: a forged id of another profile's document, another owner's, or a
+  draft's reads `None`, exactly like an id that does not exist. It carries the document's
+  `title` (the reader already sees it in `readable_documents`) and no management facts — no
+  `state`, no `has_original`: it never asks the originals' table anything. Postgres reads the
+  served version and its slice in ONE snapshot, as `version_text` does. It is part of
+  `documents_probe`. To show the chunks as one text, `chunking.join_passages` removes the head
+  each chunk repeats from the one before — only the head the chunker itself writes
+  (`_tail(prev, overlap_chars)` followed by a joiner), so two sections that share a heading are
+  never glued into one; pass `previous=` (the chunk before the slice) on a continuation.
 - **The removal trail.** `tombstones(owner_prefix)` (newest first) is where every removal of a
   version's content is recorded — `deleted`, `purged`, `expired`, `discarded`, `interrupted`,
   `superseded` and `failed`. `superseded` is the commit's own: ONE per commit naming every

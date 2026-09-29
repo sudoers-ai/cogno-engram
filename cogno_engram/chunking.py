@@ -38,6 +38,7 @@ from cogno_engram.documents import (
     ExtractedPage,
     ExtractionError,
     KbChunk,
+    KbTextChunk,
     OutlineEntry,
 )
 
@@ -200,6 +201,84 @@ def chunk_text(content: str, heading_path: Sequence[str]) -> str:
     gap = head.find(path[1], len(path[0]))
     separator = head[len(path[0]):gap] if gap > len(path[0]) else ""
     return body if separator and head == separator.join(path) else content
+
+
+def _overlap_length(prev: str, nxt: str, config: ChunkingConfig) -> int:
+    """How many leading characters of ``nxt`` repeat the tail of ``prev`` — the overlap
+    :func:`_pack` put there — or ``0`` when there is none that the chunker could have written.
+
+    Two chunks with the same heading path can be two SECTIONS with the same heading, and between
+    those there is no overlap — so only what :func:`_pack` could have written is accepted, and
+    each condition below is a NECESSARY one for a real cut inside a section:
+
+    * **the previous chunk is longer than ``overlap_chars``.** ``_pack`` flushes a body only when
+      the next unit does not fit (``len(body) + joiner + unit > target``), and a unit is at most
+      ``target − overlap − 2`` characters, so a body cut mid-section is always longer than the
+      overlap. A shorter one is the END of a section (its whole text would otherwise have been
+      "repeated", which ``_tail`` does for a short body — but never mid-section);
+    * **the repeated head is EXACTLY ``_tail(prev, overlap_chars)``** — the chunker's own function,
+      which is deterministic — followed by a joiner (a blank line between paragraphs, one space
+      inside a split paragraph). Not "the longest suffix of ``prev`` that ``nxt`` opens with": a
+      section that happens to open with the words the last one ended on matches THAT, and not
+      this;
+    * **the two did not fit together**: ``len(prev) + len(rest) > target_chars``, where ``rest``
+      is what follows the repeated head (joiner included) — the flush condition again.
+
+    Anything else is ``0``: the caller then keeps both texts whole, which at worst shows a
+    sentence twice. What it cannot tell apart, said plainly: a section whose heading repeats the
+    one before AND that opens by repeating, verbatim, the previous section's last ~``overlap_chars``
+    characters from the same word — that head is taken as overlap and shown once."""
+    most = config.overlap_chars
+    if most <= 0 or len(prev) <= most or not nxt:
+        return 0
+    head = _tail(prev, most)
+    rest = nxt[len(head):]
+    if head and nxt.startswith(head) and (rest.startswith("\n\n") or rest.startswith(" ")) \
+            and len(prev) + len(rest) > config.target_chars:
+        return len(head)
+    return 0
+
+
+def join_passages(chunks: Sequence[KbTextChunk], *, previous: "KbTextChunk | None" = None,
+                  config: ChunkingConfig = DEFAULT_CHUNKING) -> list[KbTextChunk]:
+    """Chunks read back in ``ordinal`` order → ONE passage per run of the same section, with the
+    overlap the chunker repeated at the head of each chunk REMOVED — what a reader needs to show
+    a document as one text rather than as pieces that each restate the end of the one before.
+
+    The inverse of :func:`_pack`'s overlap, as :func:`chunk_text` is the inverse of
+    :func:`_content`: the two rules live together so a reader never re-derives the chunker's. Pure.
+
+    * A run is consecutive ordinals with the SAME ``heading_path`` and the SAME ``page`` — the
+      chunker never overlaps across a section or a page, so neither does this.
+    * Inside a run, each chunk's repeated head (:func:`_overlap_length`) is dropped and the rest
+      appended with the joiner the chunker wrote. A chunk whose head is NOT a plausible overlap is
+      appended whole after a blank line: at worst a reader sees a sentence twice, never a passage
+      with words missing.
+    * ``previous`` is the chunk just BEFORE ``chunks[0]`` (a continuation that read from the
+      middle of a document): it is not returned, but when ``chunks[0]`` continues its run, the
+      head they share is removed from ``chunks[0]`` too.
+    * Each returned passage carries the ``ordinal`` of the FIRST chunk of its run.
+    """
+    out: list[KbTextChunk] = []
+    last = previous
+    for chunk in chunks:
+        same_run = (last is not None and chunk.ordinal == last.ordinal + 1
+                    and tuple(chunk.heading_path) == tuple(last.heading_path)
+                    and chunk.page == last.page)
+        text = chunk.text
+        if same_run and last is not None:
+            cut = _overlap_length(last.text, text, config)
+            if out and out[-1].ordinal <= last.ordinal:
+                joined = out[-1].text + (text[cut:] if cut else "\n\n" + text)
+                out[-1] = KbTextChunk(ordinal=out[-1].ordinal, page=out[-1].page,
+                                      heading_path=out[-1].heading_path, text=joined)
+                last = chunk
+                continue
+            text = text[cut:].lstrip() if cut else text
+        out.append(KbTextChunk(ordinal=chunk.ordinal, page=chunk.page,
+                               heading_path=tuple(chunk.heading_path), text=text))
+        last = chunk
+    return out
 
 
 class _Emitter:

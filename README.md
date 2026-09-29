@@ -98,8 +98,8 @@ rules live in one module, `cogno_engram.documents`:
   composes it, engram never parses it — with the same subtree rule: `purge_owner_subtree("t1")`
   removes `t1` and every `t1/…`, never `t10`.
 - **Opaque reader labels, no wildcard.** A document is published to `profiles`; every reader
-  call (`search`, `readable_documents`) takes `profile` as a REQUIRED keyword and a blank one
-  is refused. Only the SERVED version in state `ready` is ever read.
+  call (`search`, `readable_documents`, `read_served`) takes `profile` as a REQUIRED keyword
+  and a blank one is refused. Only the SERVED version in state `ready` is ever read.
 - **One model per version, never mixed.** Every version records the `embed_model` label
   (`embed_model_label("ollama:nomic-embed-text:latest", 768)`) it was indexed with. A search is
   handed one vector plus that label; if any readable chunk has another label (a global model
@@ -144,6 +144,18 @@ rules live in one module, `cogno_engram.documents`:
   without pages), `after` is an exclusive ordinal cursor (`has_more`/`next_after` continue it),
   and no call returns more than `VERSION_TEXT_MAX_LIMIT` (200) chunks. No profile: never on a
   contact's turn. It never reads the original.
+- **What a reader may read WHOLE — the reader path.** `read_served(owner_key, document_id, *,
+  profile, after=None, limit=50) -> KbServedText | None` returns the SERVED version of one
+  document, chunk by chunk in `ordinal` order with the heading path off the text, for a turn that
+  needs a document whole rather than its best passages. It applies THE reader filter on every
+  call — this owner, `profile` among the published ones, the served version, `ready` — so an id
+  echoed back (or invented) by a model reads nothing its reader could not have found. `None` for
+  another owner, another profile, a document with no served version, a DRAFT, and an id that
+  cannot exist — one answer for all of them. Same cursor and ceiling as `version_text`; never a
+  draft, never an original. `version_text` stays the ADMINISTRATOR's read and must never be a
+  contact's path. The chunks overlap; `chunking.join_passages(chunks, previous=None)` gives one
+  passage per run of the same section and page with each repeated head removed — the inverse of
+  the chunker's own overlap, beside it.
 - **Delete is immediate and leaves a tombstone.** The originals of every version go with it
   (they live in their own table, which no search joins); a job finishing after the delete
   writes nothing.

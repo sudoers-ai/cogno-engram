@@ -10,8 +10,9 @@ from cogno_engram.chunking import (
     chunk_markdown,
     chunk_pages,
     chunk_text,
+    join_passages,
 )
-from cogno_engram.documents import ExtractedPage, ExtractionError, OutlineEntry
+from cogno_engram.documents import ExtractedPage, ExtractionError, KbTextChunk, OutlineEntry
 
 SMALL = ChunkingConfig(target_chars=200, overlap=0.15)
 
@@ -181,3 +182,95 @@ def test_chunk_text_takes_off_exactly_the_head_the_chunker_wrote(separator):
 ])
 def test_chunk_text_leaves_a_chunk_whole_when_its_head_is_not_the_path(content, path):
     assert chunk_text(content, path) == content
+
+
+# ── join_passages: the inverse of the OVERLAP, in the same module as the overlap ────────
+#
+# A reader that shows a document WHOLE (``DocumentStore.read_served``, P9) must not show every
+# chunk's repeated head: a 15% overlap per chunk is 15% of the budget spent on text already said.
+# The rule that removes it lives beside the rule that writes it, pinned against what the chunker
+# actually emits — never re-derived by a reader.
+
+def _read_back(chunks):
+    return [KbTextChunk(ordinal=c.ordinal, page=c.page, heading_path=c.heading_path,
+                        text=chunk_text(c.content, c.heading_path)) for c in chunks]
+
+
+def _words(text):
+    return " ".join(text.split())
+
+
+LONG_SECTIONS = ("# Horários\n\n" + "\n\n".join(
+    " ".join(f"hora{p}x{w:02d}" for w in range(30)) for p in range(12)) +
+    "\n\n# Preços\n\n" + " ".join(f"preco{w:03d}" for w in range(400)) + "\n")
+
+
+def test_join_passages_gives_back_each_section_whole_with_the_overlap_said_once():
+    chunks = chunk_markdown("Guia", LONG_SECTIONS, SMALL)
+    runs = join_passages(_read_back(chunks), config=SMALL)
+    assert len(chunks) > 10 and len(runs) == 2                   # the shape: many chunks, 2 runs
+    assert [r.heading_path for r in runs] == [("Guia", "Horários"), ("Guia", "Preços")]
+    horarios = "\n\n".join(" ".join(f"hora{p}x{w:02d}" for w in range(30)) for p in range(12))
+    precos = " ".join(f"preco{w:03d}" for w in range(400))
+    # every word once, in order — a split paragraph comes back joined by the space it was cut at
+    assert _words(runs[0].text) == _words(horarios)
+    assert _words(runs[1].text) == _words(precos)
+    said = [w for r in runs for w in r.text.split()]
+    assert len(said) == len(set(said))                   # every (unique) word said ONCE
+    assert (runs[0].ordinal, runs[1].ordinal) == (0, [c.heading_path for c in chunks].index(
+        ("Guia", "Preços")))                                       # the FIRST chunk of each run
+    # CONTROL — read chunk by chunk, the overlap IS there: the same words, said more times
+    raw = [w for c in _read_back(chunks) for w in c.text.split()]
+    assert len(raw) > len(said) and set(raw) == set(said)
+
+
+def test_join_passages_never_crosses_a_page():
+    pages = [ExtractedPage(1, " ".join(f"um{w:03d}" for w in range(120))),
+             ExtractedPage(2, " ".join(f"dois{w:03d}" for w in range(120)))]
+    chunks = chunk_pages("Doc", pages, (), SMALL)
+    runs = join_passages(_read_back(chunks), config=SMALL)
+    assert [r.page for r in runs] == [1, 2]
+    assert _words(runs[0].text) == " ".join(f"um{w:03d}" for w in range(120))
+    assert _words(runs[1].text) == " ".join(f"dois{w:03d}" for w in range(120))
+
+
+def test_two_sections_with_the_same_heading_are_never_merged_into_one_overlap():
+    """Two sections can share a heading path, and between them there is NO overlap — even when
+    the second opens with the words the first ended on. Nothing of either is dropped."""
+    first = " ".join(f"alfa{w:03d}" for w in range(90)) + " ponto final comum"
+    second = "ponto final comum " + " ".join(f"beta{w:03d}" for w in range(90))
+    md = f"# Notas\n\n{first}\n\n# Notas\n\n{second}\n"
+    chunks = chunk_markdown("Guia", md, SMALL)
+    assert len({c.heading_path for c in chunks}) == 1               # the shape: ONE path
+    runs = join_passages(_read_back(chunks), config=SMALL)
+    joined = _words(" ".join(r.text for r in runs))
+    assert joined == _words(first + " " + second)                   # both whole, in order
+    assert joined.count("ponto final comum") == 2
+
+
+def test_a_chunk_whose_head_is_not_the_overlap_is_kept_whole():
+    """A chunk written by another writer (no overlap at all): kept whole after a blank line — at
+    worst a sentence twice, never a passage with words missing."""
+    a = KbTextChunk(ordinal=0, page=None, heading_path=("Doc",), text="x" * 400)
+    b = KbTextChunk(ordinal=1, page=None, heading_path=("Doc",), text="novo texto sem cabeça")
+    [run] = join_passages([a, b], config=SMALL)
+    assert run.text == "x" * 400 + "\n\n" + "novo texto sem cabeça"
+    # a gap in the ordinals is two runs, whatever the texts
+    c = KbTextChunk(ordinal=5, page=None, heading_path=("Doc",), text="depois")
+    assert [r.ordinal for r in join_passages([a, c], config=SMALL)] == [0, 5]
+
+
+def test_a_continuation_drops_the_head_it_shares_with_the_chunk_before_it():
+    chunks = _read_back(chunk_markdown("Guia", LONG_SECTIONS, SMALL))
+    k = 3
+    assert chunks[k].heading_path == chunks[k - 1].heading_path       # the shape: mid-section
+    whole = join_passages(chunks, config=SMALL)
+    head, tail = join_passages(chunks[:k], config=SMALL), join_passages(chunks[k:],
+                                                                         previous=chunks[k - 1],
+                                                                         config=SMALL)
+    assert _words(" ".join(r.text for r in head + tail)) == \
+        _words(" ".join(r.text for r in whole))                       # nothing twice, nothing lost
+    # CONTROL — without `previous`, the continuation repeats the shared head
+    bare = join_passages(chunks[k:], config=SMALL)
+    assert len(_words(" ".join(r.text for r in head + bare))) > \
+        len(_words(" ".join(r.text for r in whole)))

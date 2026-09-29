@@ -1,5 +1,74 @@
 # Changelog
 
+## Unreleased — `read_served`: the text of ONE served document, for a READER, by the reader filter (P9, 2026-09-29)
+
+### Added
+
+- **`DocumentStore.read_served(owner_key, document_id, *, profile, after=None,
+  limit=VERSION_TEXT_LIMIT) -> Optional[KbServedText]`**, in the port and BOTH adapters — the
+  reader path's whole-document read, for a turn that needs a document WHOLE rather than its best
+  passages (the owner's order: «quando a persona tiver documentos, o sistema consiga fazer a
+  leitura completa dele»). The SERVED version only, chunk by chunk in `ordinal` order, the
+  heading path off the text (`KbTextChunk`), with the same exclusive `after` cursor,
+  `has_more`/`next_after` and `VERSION_TEXT_MAX_LIMIT` ceiling as `version_text`.
+- **It applies THE reader filter on every call** — this owner, `profile` among the published
+  ones, the served version, `ready`: in Postgres the one `_SERVED` string `search` and
+  `readable_documents` already share (now four reads), in memory the one `_served` walk. So a
+  document id taken from a MODEL's arguments reads nothing its reader could not have found. `None`
+  for another owner (prefix siblings included), another profile, a document with no served
+  version, a DRAFT and an id that cannot exist — ONE answer for all of them, so a reader cannot
+  tell "exists, not for you" from "does not exist". A change of `profiles` takes effect on the
+  next read. Never an original, never a draft.
+- **`KbServedText(document_id, version, title, pages, chunks, has_more, next_after)`** — the
+  reader path's own type, apart from `KbVersionText`, so the two reads cannot be confused: no
+  `state` (it is always the served version), no `has_original` (the reader path never asks the
+  originals' table anything), no page filter; the `title` the same reader already sees in
+  `readable_documents`. Postgres reads the served version and its slice in ONE snapshot
+  (`REPEATABLE READ, READ ONLY`, no lock), as `version_text` does. Part of `documents_probe`.
+- **`chunking.join_passages(chunks, *, previous=None, config=DEFAULT_CHUNKING)`** — pure: one
+  passage per run of consecutive ordinals under the same heading path and page, with the head
+  each chunk repeats from the one before REMOVED; the inverse of the chunker's overlap, beside it
+  (as `chunk_text` is the inverse of its head). It removes ONLY the head the chunker writes —
+  exactly `_tail(prev, overlap_chars)` followed by a joiner, after a previous chunk longer than
+  the overlap (`_pack` never cuts a shorter one mid-section) and when the two did not fit together
+  — so two SECTIONS that share a heading are never glued, even when the second opens with the
+  words the first ended on. Anything else is kept whole after a blank line: at worst a sentence
+  twice, never one missing. `previous=` drops the shared head on a continuation. The one shape it
+  cannot tell apart, stated in its docstring: a same-heading section that opens by repeating,
+  verbatim, the previous section's last ~`overlap_chars` characters from the same word.
+
+`version_text` is unchanged and stays the ADMINISTRATOR's read — no profile, drafts by number —
+which must never be a contact's path.
+
+### Tests
+
+- `tests/test_documents_read_served.py` (both adapters; the Postgres leg runs in CI's
+  integration job): the served version in order, the SAME chunks the administrator's read shows;
+  paging and the ceiling; windows refused; the profile required, blank no wildcard. The security
+  twins, each with its CONTROL: **another profile** never comes back, by any spelling (control:
+  the same id, the profile it is published to, reads it — and the search agrees both ways); a
+  change of profiles takes effect on the next read; **another owner** reads nothing, prefix
+  siblings included; **a draft** alone never comes back (control: `version_text(version=1)` shows
+  it), and **a draft beside the served version** is never what the reader gets (control: the
+  draft has the marker; once committed, the reader sees it); a version being built, failed or
+  deleted reads nothing; the original is never read.
+- `tests/test_documents_chunking.py`: `join_passages` gives each section back whole with the
+  overlap said once (control: read chunk by chunk, the same words are said more times); never
+  across a page; two same-heading sections are never merged even when the second opens with the
+  first's last words; a chunk without the overlap is kept whole; a continuation with `previous=`.
+- Round trip measured beyond the suite (scratch probe, not committed): 744 random sections and
+  400 random documents come back word for word, continuations included; 400 documents of
+  consecutive same-heading sections whose second opens with the first's last 20–45 words: 0
+  merged at the default configuration.
+
+**Mutations, each by hand (anchor `grep -cxF` = 1, `ast.parse`, red, reverted):**
+- the profile check dropped from the in-memory reader filter (`_served`) →
+  `test_twin_a_document_of_another_profile_never_comes_back[memory]` and
+  `test_twin_a_change_of_profiles_takes_effect_on_the_next_read[memory]`;
+- the served read taking a newer DRAFT's chunks when there is one →
+  `test_twin_a_draft_beside_the_served_version_is_never_what_the_reader_gets[memory]`;
+- the overlap guessed as "the longest suffix at a word boundary" instead of `_tail` →
+  `test_two_sections_with_the_same_heading_are_never_merged_into_one_overlap`.
 ## Unreleased — fix(graph): a ordem do `walk` é a da CONSULTA, não a do plano; um candidato do grafo é numerado pelo id da ARESTA na base (P1, 2026-09-25)
 
 ### O defeito, medido

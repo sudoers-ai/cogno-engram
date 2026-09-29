@@ -519,6 +519,7 @@ async def documents_probe(store: Any, *, embed_model: str) -> None:
     await store.get_original(PROBE_OWNER, _PROBE_DOCUMENT, version=1)
     await store.version_text(PROBE_OWNER, _PROBE_DOCUMENT, version=1)
     await store.readable_documents(PROBE_OWNER, profile=PROBE_PROFILE)
+    await store.read_served(PROBE_OWNER, _PROBE_DOCUMENT, profile=PROBE_PROFILE, limit=1)
     await store.search(PROBE_OWNER, profile=PROBE_PROFILE, text="probe", vector=unit,
                        embed_model=embed_model, limit=1)
     await store.tombstones(PROBE_OWNER, limit=1)

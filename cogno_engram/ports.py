@@ -31,6 +31,7 @@ from cogno_engram.documents import (
     KbDocument,
     KbDraft,
     KbSearchResult,
+    KbServedText,
     VERSION_TEXT_LIMIT,
     KbTombstone,
     KbVersion,
@@ -291,11 +292,11 @@ class DocumentStore(Protocol):
 
     **Two kinds of read, and the difference is who is reading.**
 
-    * The READER path — :meth:`search` and :meth:`readable_documents` — is what a contact's turn
-      calls. ``profile`` is a REQUIRED keyword with no default and no wildcard: forgetting it is
-      a ``TypeError`` at the call, a blank one a ``ValueError``. Only the SERVED version of a
-      document in state ``ready`` is ever read, and only when ``profile`` is one it is
-      published to.
+    * The READER path — :meth:`search`, :meth:`readable_documents` and :meth:`read_served` — is
+      what a contact's turn calls. ``profile`` is a REQUIRED keyword with no default and no
+      wildcard: forgetting it is a ``TypeError`` at the call, a blank one a ``ValueError``. Only
+      the SERVED version of a document in state ``ready`` is ever read, and only when ``profile``
+      is one it is published to.
     * The MANAGEMENT path — :meth:`get_document`, :meth:`list_documents`, :meth:`get_original`,
       :meth:`version_text`, :meth:`tombstones` — is what the owner's administrator calls to see
       and fix what they uploaded. It takes no profile because the administrator sees everything
@@ -433,6 +434,23 @@ class DocumentStore(Protocol):
     # The served, ready documents ``profile`` may read — what decides whether a tool that
     # searches them is offered at all, and whose titles describe it.
     async def readable_documents(self, owner_key: str, *, profile: str) -> list[KbDocument]: ...
+    # The SERVED text of ONE document, for a reader — what a turn reads when it needs a document
+    # WHOLE rather than its best passages. The same filter as ``search`` and
+    # ``readable_documents`` (this owner, ``profile`` among the published ones, the served
+    # version, ``ready``), applied here on EVERY call — so an id the model echoes back, or
+    # invents, reads nothing it could not have found. Chunks in ``ordinal`` order with the
+    # heading path OFF the text (``KbTextChunk``); ``after`` is an EXCLUSIVE ordinal cursor and
+    # ``limit`` is cut to ``documents.VERSION_TEXT_MAX_LIMIT``, exactly as in ``version_text``;
+    # an ``after``/``limit`` that is not an integer of the right range is a ``ValueError``.
+    # ``None`` for a document of another owner, one ``profile`` is not published to, one with no
+    # served version, a DRAFT, and an id that cannot exist — ONE answer for all of them, so a
+    # reader cannot tell "exists, not for you" from "does not exist". Past the end → a result
+    # with no chunks, never ``None``. Never reads an original, never reads a draft: that is
+    # ``version_text``, the ADMINISTRATOR's read, which takes no profile and must never be the
+    # path of a contact's turn.
+    async def read_served(self, owner_key: str, document_id: str, *, profile: str,
+                          after: Optional[int] = None,
+                          limit: int = VERSION_TEXT_LIMIT) -> Optional[KbServedText]: ...
     # Hybrid search over the SERVED version of every ready document ``profile`` may read.
     # ``vector`` is compared ONLY with chunks whose recorded model equals ``embed_model``, and
     # only when EVERY readable chunk has that model; otherwise the whole search is lexical,

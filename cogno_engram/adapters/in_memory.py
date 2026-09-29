@@ -53,12 +53,14 @@ from cogno_engram.documents import (
     KbDraft,
     KbHit,
     KbSearchResult,
+    KbServedText,
     KbTextChunk,
     KbTombstone,
     KbVersion,
     KbVersionText,
     OriginalTooLarge,
     VERSION_TEXT_LIMIT,
+    assemble_served_text,
     assemble_version_text,
     REASON_EXPIRED,
     chunk_id,
@@ -1424,6 +1426,30 @@ class InMemoryDocumentStore:
                       key=lambda rv: (rv[0].created_at or _now(), rv[0].id))
         return [replace(self._document(r), sections=self._sections(r.id, v.version))
                 for r, v in rows]
+
+    async def read_served(self, owner_key: str, document_id: str, *, profile: str,
+                          after: Optional[int] = None,
+                          limit: int = VERSION_TEXT_LIMIT) -> Optional[KbServedText]:
+        require_owner(owner_key)
+        require_profile(profile)
+        _, start, size = text_window(None, after, limit)
+        # THE filter of the reader path, the same one `search` and `readable_documents` walk —
+        # never a lookup by id followed by checks of its own, which would be a second copy of
+        # the rule that could drift from the first.
+        served = {row.id: (row, v) for row, v in self._served(owner_key, profile)}
+        found = served.get(str(document_id or ""))
+        if found is None:
+            return None
+        row, v = found
+        source = self._chunks.get((row.id, v.version), {}).values()
+        fetched = sorted((c for c in source if c.ordinal > start),
+                         key=lambda c: c.ordinal)[:size + 1]
+        return assemble_served_text(
+            document_id=row.id, version=v.version, title=row.title, pages=v.pages,
+            fetched=[KbTextChunk(ordinal=c.ordinal, page=c.page,
+                                 heading_path=tuple(c.heading_path),
+                                 text=chunk_text(c.content, c.heading_path)) for c in fetched],
+            limit=size)
 
     def _sections(self, document_id: str, version: int) -> "tuple[str, ...]":
         """The served version's section headings — :func:`section_headings` over its chunks."""

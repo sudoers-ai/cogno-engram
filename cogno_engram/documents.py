@@ -158,11 +158,12 @@ DISCARD_MISSING = "missing"        # no such version of a document of this owner
 VALID_DISCARD_OUTCOMES: frozenset[str] = frozenset({DISCARD_OK, DISCARD_NOT_A_DRAFT,
                                                     DISCARD_MISSING})
 
-# ── reading a version's text back (the management view) ──────────────────────────────
-#: How many chunks one :meth:`DocumentStore.version_text` call returns when the caller does not
-#: say, and the most it ever returns: a larger ``limit`` is CUT to the ceiling, never an error —
-#: the ceiling is the store's protection, not the caller's mistake. A version may hold thousands
-#: of chunks (``ChunkingConfig.max_chunks``); a call never ships more than this many.
+# ── reading a version's text back (the management view, and the reader's) ────────────
+#: How many chunks one :meth:`DocumentStore.version_text` (or :meth:`DocumentStore.read_served`)
+#: call returns when the caller does not say, and the most it ever returns: a larger ``limit`` is
+#: CUT to the ceiling, never an error — the ceiling is the store's protection, not the caller's
+#: mistake. A version may hold thousands of chunks (``ChunkingConfig.max_chunks``); a call never
+#: ships more than this many.
 VERSION_TEXT_LIMIT = 50
 VERSION_TEXT_MAX_LIMIT = 200
 
@@ -511,6 +512,41 @@ class KbVersionText:
     chunks: tuple[KbTextChunk, ...] = ()
     has_more: bool = False
     next_after: Optional[int] = None
+
+
+@dataclass(frozen=True)
+class KbServedText:
+    """A slice of the text a READER may read — the SERVED version of ONE document, chunk by chunk
+    (:meth:`DocumentStore.read_served`).
+
+    The reader path's own type, apart from :class:`KbVersionText` (the administrator's), so the
+    two cannot be confused: it has no ``state`` (it is always the served version, ``ready``), no
+    ``has_original`` (the reader path never asks the originals' table anything) and no page
+    filter. ``title`` is the document's, which the same reader already sees in
+    ``readable_documents``. ``pages`` is the version's page count, ``None`` for a format without
+    pages. The slice is in ``ordinal`` order; ``has_more``/``next_after`` continue it exactly as
+    in :class:`KbVersionText`. The chunks OVERLAP (``ChunkingConfig.overlap``): to show them as
+    one text, :func:`cogno_engram.chunking.join_passages` removes the repeated heads."""
+
+    document_id: str
+    version: int
+    title: str
+    pages: Optional[int]
+    chunks: tuple[KbTextChunk, ...] = ()
+    has_more: bool = False
+    next_after: Optional[int] = None
+
+
+def assemble_served_text(*, document_id: str, version: int, title: str, pages: int,
+                         fetched: Sequence[KbTextChunk], limit: int) -> KbServedText:
+    """The ONE place a reader's slice becomes a :class:`KbServedText`, for both adapters — the
+    same ``limit + 1`` rule as :func:`assemble_version_text`."""
+    kept = tuple(fetched[:limit])
+    has_more = len(fetched) > limit
+    return KbServedText(document_id=document_id, version=int(version), title=str(title or ""),
+                        pages=int(pages) if int(pages or 0) > 0 else None, chunks=kept,
+                        has_more=has_more,
+                        next_after=kept[-1].ordinal if has_more and kept else None)
 
 
 def _is_int(x: object) -> bool:

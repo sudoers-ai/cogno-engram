@@ -107,9 +107,14 @@ async def test_n_statements_run_on_at_most_max_backends_and_close_frees_them():
         assert 1 <= len(seen) <= MAX, seen
         assert 1 <= peak <= MAX, peak
         assert await _backends(app) >= 1          # min_size: the pool keeps one open
+        # held here so only close() can free its connections: an unreferenced pool is also
+        # reclaimed by the garbage collector, which would let a close() that closes nothing pass
+        held = store._own_pool
+        assert held is not None
     finally:
         await store.close()
     assert await _settled(app, 0) == 0            # close() gave every backend back
+    del held
 
 
 async def test_CONTROL_without_the_pool_every_statement_is_a_backend_of_its_own():

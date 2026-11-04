@@ -45,7 +45,9 @@ dev = [
     "pyyaml>=6.0",
 ]
 # Reference adapters — install only what you wire up.
-postgres = ["psycopg[binary,pool]>=3.1", "pgvector>=0.2"]
+# psycopg-pool>=3.2: a `dsn=` store keeps its own pool and checks each borrowed connection with
+# `AsyncConnectionPool.check_connection`, which arrived in 3.2.
+postgres = ["psycopg[binary,pool]>=3.1", "psycopg-pool>=3.2", "pgvector>=0.2"]
 redis = ["redis>=5.0"]
 # hypnos consolidation drives an LLM via a cogno-synapse LLMBackend (host-injected).
 # Sibling libs, imported under TYPE_CHECKING only (engram has no runtime dep on them):

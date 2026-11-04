@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased — a `dsn=` Postgres store keeps a connection pool of its own (2026-11-04)
+
+### Changed
+
+- **`PostgresStore`, `PostgresKnowledgeGraph` and `PostgresDocumentStore` built with `dsn=` no
+  longer open a connection per statement.** Each keeps a psycopg `AsyncConnectionPool` of its
+  own, opened on the first statement inside the running event loop (one per loop), with
+  `pool_min_size=1`, `pool_max_size=8`, `pool_timeout=30.0` (constructor arguments,
+  `DEFAULT_POOL_*`). A connection per statement was measured downstream at ~750 ms at the p90 of
+  a turn's memory work. `pool_max_size=0` keeps the old path, byte for byte.
+- The pooled connections are the fresh ones they replace: `autocommit=True`, `dict_row`, no
+  server-side prepared statements (`prepare_threshold=None`), checked on every borrow
+  (`AsyncConnectionPool.check_connection`).
+- `PostgresStore.session_lock` on a `dsn=` store takes a connection of its OWN, outside the pool
+  (held for a whole critical section, it would starve the bounded pool; and a lock whose unlock
+  never ran must not go back to it). On a caller's `pool=` it stays on that pool.
+
+### Added
+
+- `close()` on the three stores: closes the store's own pool; idempotent; never touches a
+  caller's `pool=`; a store used after it opens a new pool.
+- The `postgres` extra declares `psycopg-pool>=3.2` (`check_connection` arrived in 3.2).
+- Tests: `tests/test_pg_own_pool.py` (the plumbing, with doubles) and
+  `tests/test_pool_postgres.py` (the server's count: N statements on at most `pool_max_size`
+  backends through `pg_stat_activity` and `pg_backend_pid()`; the control without the pool, one
+  backend per statement; `close()` leaves none; the session lock is a backend beside the pool).
+
 ## Unreleased — `read_served`: the text of ONE served document, for a READER, by the reader filter (P9, 2026-09-29)
 
 ### Added

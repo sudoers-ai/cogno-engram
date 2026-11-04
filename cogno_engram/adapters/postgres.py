@@ -20,6 +20,7 @@ idempotent DDL (tables + indexes; HASH-by-scope partitioning is left opt-in).
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -121,6 +122,32 @@ logger = logging.getLogger("cogno_engram.postgres")
 # concurrent writer committed, so the budget bounds a real contention burst rather
 # than a spin: under READ COMMITTED the first retry already sees the winner.
 _ALLOC_ATTEMPTS = 5
+
+
+# ── the store's OWN connection pool (the ``dsn=`` path) ─────────────────────────────────
+#
+# A store built with ``dsn=`` used to open a NEW connection for every statement and close it
+# after: TCP + auth + backend start, paid per statement and measured downstream as ~750 ms at
+# the p90 of a turn's memory work. It now keeps a pool of its own (psycopg's), created on the
+# first statement, inside the event loop that runs it. The public API does not change.
+#
+# A pooled connection must return what a fresh one returned, so it is configured like one:
+# ``autocommit=True`` and ``dict_row`` (what the per-statement connection had), and NO
+# server-side prepared statements (``prepare_threshold=None``) — a fresh connection never
+# reached psycopg's threshold of 5 executions, a pooled one does, and Postgres may then answer
+# with a generic plan. Each borrow is checked (``check_connection``, one empty round trip) so a
+# connection the server dropped while idle is replaced instead of failing a statement, which a
+# fresh connection never did either.
+#
+#: Idle connections the pool keeps open once it exists.
+DEFAULT_POOL_MIN_SIZE = 1
+#: The most connections ONE store holds at once. ``0`` turns the pool off: a connection per
+#: statement, exactly as before. Keep ``max × stores × worker processes`` under the server's
+#: ``max_connections``.
+DEFAULT_POOL_MAX_SIZE = 8
+#: Seconds a statement waits for a free connection before ``psycopg_pool.PoolTimeout`` (an
+#: ``OperationalError``). psycopg_pool's own default.
+DEFAULT_POOL_TIMEOUT_S = 30.0
 
 
 # Default embedding width — nomic-embed-text (the parent's default embedder).
@@ -993,7 +1020,12 @@ def _label_collision_error(groups: "list[str]", cause: Exception) -> RuntimeErro
 
 
 class _PgBase:
-    """Shared connection plumbing for the Postgres adapters."""
+    """Shared connection plumbing for the Postgres adapters.
+
+    Two ways in. ``pool=`` is the CALLER's pool: borrowed per statement, never opened or closed
+    here. ``dsn=`` is this store's own: a pool (``pool_min_size``/``pool_max_size``/
+    ``pool_timeout``) built on the first statement and closed by :meth:`close`;
+    ``pool_max_size=0`` keeps the old connection-per-statement path."""
 
     #: This store ALLOCATES ``turn_n`` when handed ``ALLOCATE_TURN_N``.
     #:
@@ -1008,11 +1040,28 @@ class _PgBase:
 
     def __init__(self, *, dsn: Optional[str] = None, pool=None,
                  ts_config: str = DEFAULT_TS_CONFIG, mask_pii: bool = False,
-                 trace_revision_window_s: float = TRACE_REVISION_WINDOW_S) -> None:
+                 trace_revision_window_s: float = TRACE_REVISION_WINDOW_S,
+                 pool_min_size: int = DEFAULT_POOL_MIN_SIZE,
+                 pool_max_size: int = DEFAULT_POOL_MAX_SIZE,
+                 pool_timeout: float = DEFAULT_POOL_TIMEOUT_S) -> None:
         if not dsn and pool is None:
             raise ValueError("provide either dsn= or pool=")
+        min_size, max_size = int(pool_min_size), int(pool_max_size)
+        if max_size < 0 or min_size < 0 or (max_size and min_size > max_size):
+            raise ValueError(f"pool sizes must satisfy 0 <= pool_min_size <= pool_max_size "
+                             f"(or pool_max_size=0 for no pool); got {min_size}, {max_size}")
+        if not float(pool_timeout) > 0:
+            raise ValueError(f"pool_timeout must be > 0; got {pool_timeout!r}")
         self._dsn = dsn
         self._pool = pool
+        self._pool_min_size = min_size
+        self._pool_max_size = max_size
+        self._pool_timeout = float(pool_timeout)
+        # The store's own pool, and the loop it was opened in (a psycopg pool's workers are
+        # tasks of ONE loop). A task, so concurrent first statements share one opening.
+        self._own_pool: Any = None
+        self._own_pool_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._own_pool_opening: Optional["asyncio.Task[Any]"] = None
         self._ts = _validate_ts_config(ts_config)
         self._mask_pii = mask_pii
         self._trace_revision_window_s = float(trace_revision_window_s)
@@ -1031,14 +1080,79 @@ class _PgBase:
                     # restore the pooled connection's factory so a later borrower that expects
                     # tuple rows isn't handed dicts (a shared-pool consumer must not inherit this).
                     conn.row_factory = previous_rows
-        else:
-            assert self._dsn is not None  # __init__ guarantees dsn when pool is None
-            conn = await psycopg.AsyncConnection.connect(
-                self._dsn, autocommit=True, row_factory=dict_row)
-            try:
+        elif self._pool_max_size:
+            pool = await self._owned_pool()
+            async with pool.connection() as conn:
                 yield conn
-            finally:
-                await conn.close()
+        else:
+            async with self._fresh_conn() as conn:
+                yield conn
+
+    @asynccontextmanager
+    async def _fresh_conn(self) -> AsyncIterator[Any]:
+        """A connection of its own, closed after: the ``dsn=`` path before the pool, and still
+        the one for a session advisory lock (see ``PostgresStore.session_lock``)."""
+        assert self._dsn is not None  # __init__ guarantees dsn when pool is None
+        conn = await psycopg.AsyncConnection.connect(
+            self._dsn, autocommit=True, row_factory=dict_row)
+        try:
+            yield conn
+        finally:
+            await conn.close()
+
+    async def _owned_pool(self) -> Any:
+        """This store's pool, opened once per event loop.
+
+        A pool opened in ANOTHER loop cannot serve this one (its workers are that loop's
+        tasks), so a store moved to a new loop — a test suite's per-test loop, a second
+        ``asyncio.run`` — gets a new pool and the old one is left to its loop. A host that
+        builds the store in its lifespan never sees this."""
+        loop = asyncio.get_running_loop()
+        if self._own_pool_loop is not loop:
+            if self._own_pool is not None:
+                logger.warning("stage=pool event=pool_reopened_for_new_loop max=%d",
+                               self._pool_max_size)
+            self._own_pool, self._own_pool_loop = None, loop
+            self._own_pool_opening = loop.create_task(self._open_pool())
+        if self._own_pool is not None:
+            return self._own_pool
+        opening = self._own_pool_opening
+        if opening is None:
+            opening = self._own_pool_opening = loop.create_task(self._open_pool())
+        try:
+            # shielded: one caller cancelled mid-open must not cancel the open for the others
+            pool = await asyncio.shield(opening)
+        except BaseException:
+            if self._own_pool_opening is opening and opening.done():
+                self._own_pool_opening = None     # a failed open is retried by the next call
+            raise
+        if self._own_pool_opening is opening:
+            self._own_pool = pool
+        return pool
+
+    async def _open_pool(self) -> Any:
+        from psycopg_pool import AsyncConnectionPool
+
+        pool = AsyncConnectionPool(
+            self._dsn or "", open=False, min_size=self._pool_min_size,
+            max_size=self._pool_max_size, timeout=self._pool_timeout,
+            name="cogno-engram", check=AsyncConnectionPool.check_connection,
+            kwargs={"autocommit": True, "row_factory": dict_row, "prepare_threshold": None})
+        await pool.open(wait=False)
+        return pool
+
+    async def close(self) -> None:
+        """Close this store's OWN pool — the clean shutdown of a ``dsn=`` store. Idempotent,
+        never touches a caller's ``pool=``, and a store used after it opens a new pool."""
+        pool, opening = self._own_pool, self._own_pool_opening
+        self._own_pool, self._own_pool_loop, self._own_pool_opening = None, None, None
+        if pool is None and opening is not None:
+            try:
+                pool = await asyncio.shield(opening)
+            except Exception:                    # noqa: BLE001 — nothing was opened
+                pool = None
+        if pool is not None:
+            await pool.close()
 
 
 # ── the HNSW index under a filter: ITERATIVE scan (pgvector 0.8+) ─────────────────────
@@ -1755,7 +1869,13 @@ class PostgresStore(_PgBase):
         _require_scope(scope)
         digest = hashlib.sha256(f"{scope}:{session_id}".encode()).digest()
         lock_id = int.from_bytes(digest[:8], "big", signed=True)
-        async with self._conn() as conn:
+        # On a ``dsn=`` store the lock takes a connection of its OWN, never one of the store's
+        # pool: it is held for the whole critical section (a turn), which would starve the
+        # bounded pool of the statements the section itself runs, and an unlock that never ran
+        # (a cancel) would go back to the pool with the lock still held. Closing a dedicated
+        # connection releases it, as it always did. A caller's ``pool=`` is its own decision.
+        conn_cm = self._conn() if self._pool is not None else self._fresh_conn()
+        async with conn_cm as conn:
             await conn.execute("SELECT pg_advisory_lock(%s)", (lock_id,))
             try:
                 yield
@@ -2412,8 +2532,12 @@ class PostgresDocumentStore(_PgBase):
     def __init__(self, *, dsn: Optional[str] = None, pool=None,
                  ts_config: str = DEFAULT_TS_CONFIG, unaccent: bool = False,
                  embedding_dim: int = DEFAULT_EMBEDDING_DIM,
-                 max_original_bytes: int = DEFAULT_MAX_BYTES) -> None:
-        super().__init__(dsn=dsn, pool=pool, ts_config=ts_config)
+                 max_original_bytes: int = DEFAULT_MAX_BYTES,
+                 pool_min_size: int = DEFAULT_POOL_MIN_SIZE,
+                 pool_max_size: int = DEFAULT_POOL_MAX_SIZE,
+                 pool_timeout: float = DEFAULT_POOL_TIMEOUT_S) -> None:
+        super().__init__(dsn=dsn, pool=pool, ts_config=ts_config, pool_min_size=pool_min_size,
+                         pool_max_size=pool_max_size, pool_timeout=pool_timeout)
         # The SAME (ts_config, unaccent) the schema was built with: the name is derived by the
         # one function both sides call, so the question and the chunks fold alike.
         self._ts = documents_ts_config(ts_config, unaccent=unaccent)

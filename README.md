@@ -69,7 +69,17 @@ async with await psycopg.AsyncConnection.connect(dsn, autocommit=True) as conn:
 
 store = PostgresStore(dsn=dsn, mask_pii=True)
 hits = await store.load_memories("acme/phone1", query=RetrievalQuery(text="...", embedding=[...]))
+await store.close()                           # at shutdown: the store's own pool
 ```
+
+**A `dsn=` store keeps a connection pool of its own** (psycopg's `AsyncConnectionPool`, opened on
+the first statement in the running event loop): `pool_min_size=1`, `pool_max_size=8`,
+`pool_timeout=30.0` by default, all three constructor arguments. `pool_max_size=0` turns it off —
+a connection per statement, as before. The pooled connections are configured like the fresh ones
+they replace (autocommit, dict rows, no server-side prepared statements, checked on every
+borrow); `session_lock` keeps a connection of its own, outside the pool; `close()` closes the pool
+and never touches a caller's `pool=`. Keep `pool_max_size × stores × worker processes` under the
+server's `max_connections`.
 
 **Nearest nodes under a scope filter — pgvector 0.8+ recommended.** One HNSW index serves every
 scope of `knowledge_nodes`, and the scope and audience conditions are applied to what the index

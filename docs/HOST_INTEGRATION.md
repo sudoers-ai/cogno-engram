@@ -383,4 +383,11 @@ kg = PostgresKnowledgeGraph(dsn=DSN)
 buffer = RedisConversationBuffer(redis_url=REDIS_URL)
 ```
 
+A `dsn=` Postgres store (`PostgresStore`, `PostgresKnowledgeGraph`, `PostgresDocumentStore`) keeps
+a pool of its OWN — at most `pool_max_size` (default 8) server connections, opened on the first
+statement — so the host closes it on shutdown with `await store.close()`. `pool_max_size=0` is the
+old connection-per-statement path; `pool=` is still the caller's pool, borrowed and never closed
+here. Size the pools as `pool_max_size × stores × worker processes` ≤ the server's
+`max_connections`.
+
 See `examples/host_min.py` for a runnable host wiring anima + engram end to end.

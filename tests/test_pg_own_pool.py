@@ -25,7 +25,9 @@ from cogno_engram.adapters.postgres import (  # noqa: E402
     PostgresStore,
 )
 
-DSN = "postgresql://u:p@127.0.0.1:1/never_test"
+# Not named `DSN`: the conftest blanks a module-level `DSN` when nothing listens there, and
+# this one is never connected to — every connection here is a double.
+FAKE_DSN = "postgresql://u:p@127.0.0.1:1/never_test"
 
 
 class FakeConn:
@@ -99,7 +101,7 @@ async def _statements(store, n: int) -> None:
 
 @pytest.mark.parametrize("cls", [PostgresStore, PostgresKnowledgeGraph, PostgresDocumentStore])
 async def test_n_statements_one_pool_and_no_connection_per_statement(doubles, cls):
-    store = cls(dsn=DSN)
+    store = cls(dsn=FAKE_DSN)
     await _statements(store, 25)
     assert len(FakePool.built) == 1
     pool = FakePool.built[0]
@@ -108,9 +110,9 @@ async def test_n_statements_one_pool_and_no_connection_per_statement(doubles, cl
 
 
 async def test_the_pool_is_configured_like_the_fresh_connection_it_replaces(doubles):
-    await _statements(PostgresStore(dsn=DSN), 1)
+    await _statements(PostgresStore(dsn=FAKE_DSN), 1)
     pool = FakePool.built[0]
-    assert pool.conninfo == DSN
+    assert pool.conninfo == FAKE_DSN
     assert pool.kw["kwargs"] == {"autocommit": True, "row_factory": dict_row,
                                  "prepare_threshold": None}
     assert pool.kw["check"] is FakePool.check_connection
@@ -120,21 +122,21 @@ async def test_the_pool_is_configured_like_the_fresh_connection_it_replaces(doub
 
 
 async def test_sizes_and_timeout_are_the_callers(doubles):
-    await _statements(PostgresStore(dsn=DSN, pool_min_size=2, pool_max_size=5,
+    await _statements(PostgresStore(dsn=FAKE_DSN, pool_min_size=2, pool_max_size=5,
                                     pool_timeout=7.5), 1)
     kw = FakePool.built[0].kw
     assert (kw["min_size"], kw["max_size"], kw["timeout"]) == (2, 5, 7.5)
 
 
 async def test_concurrent_first_statements_share_one_opening(doubles):
-    store = PostgresStore(dsn=DSN)
+    store = PostgresStore(dsn=FAKE_DSN)
     await asyncio.gather(*(_statements(store, 3) for _ in range(20)))
     assert len(FakePool.built) == 1
     assert FakePool.built[0].opened == 1 and FakePool.built[0].borrowed == 60
 
 
 async def test_a_failed_open_is_retried_by_the_next_statement(doubles):
-    store = PostgresStore(dsn=DSN)
+    store = PostgresStore(dsn=FAKE_DSN)
     FakePool.fail_next_open = 1
     with pytest.raises(psycopg.OperationalError):
         await _statements(store, 1)
@@ -145,7 +147,7 @@ async def test_a_failed_open_is_retried_by_the_next_statement(doubles):
 # ── the off switch: the old path, byte for byte ──────────────────────────────────────────
 
 async def test_pool_max_size_0_is_a_connection_per_statement(doubles):
-    store = PostgresStore(dsn=DSN, pool_max_size=0, pool_min_size=0)
+    store = PostgresStore(dsn=FAKE_DSN, pool_max_size=0, pool_min_size=0)
     await _statements(store, 7)
     assert FakePool.built == []
     assert len(doubles) == 7 and all(c.closed for c in doubles)
@@ -155,7 +157,7 @@ async def test_pool_max_size_0_is_a_connection_per_statement(doubles):
 # ── close ────────────────────────────────────────────────────────────────────────────────
 
 async def test_close_closes_the_pool_once_and_is_idempotent(doubles):
-    store = PostgresStore(dsn=DSN)
+    store = PostgresStore(dsn=FAKE_DSN)
     await _statements(store, 3)
     await store.close()
     await store.close()
@@ -163,12 +165,12 @@ async def test_close_closes_the_pool_once_and_is_idempotent(doubles):
 
 
 async def test_close_before_any_statement_builds_nothing(doubles):
-    await PostgresStore(dsn=DSN).close()
+    await PostgresStore(dsn=FAKE_DSN).close()
     assert FakePool.built == []
 
 
 async def test_a_store_used_after_close_opens_a_new_pool(doubles):
-    store = PostgresStore(dsn=DSN)
+    store = PostgresStore(dsn=FAKE_DSN)
     await _statements(store, 1)
     await store.close()
     await _statements(store, 1)
@@ -189,7 +191,7 @@ async def test_close_never_touches_the_callers_pool(doubles):
 # ── the session lock keeps a connection of its own ───────────────────────────────────────
 
 async def test_session_lock_on_a_dsn_store_takes_its_own_connection(doubles):
-    store = PostgresStore(dsn=DSN)
+    store = PostgresStore(dsn=FAKE_DSN)
     async with store.session_lock("acme", "s1"):
         pass
     assert FakePool.built == []                     # the lock never borrowed from the pool
@@ -209,7 +211,7 @@ async def test_session_lock_on_a_callers_pool_stays_on_that_pool(doubles):
 # ── a new event loop gets a new pool ─────────────────────────────────────────────────────
 
 def test_a_store_moved_to_another_loop_opens_a_pool_there(doubles):
-    store = PostgresStore(dsn=DSN)
+    store = PostgresStore(dsn=FAKE_DSN)
     asyncio.run(_statements(store, 2))
     asyncio.run(_statements(store, 2))
     assert len(FakePool.built) == 2
@@ -223,7 +225,7 @@ def test_a_store_moved_to_another_loop_opens_a_pool_there(doubles):
                                 dict(pool_timeout=0), dict(pool_timeout=-1.0)])
 def test_refused_pool_configurations(kw):
     with pytest.raises(ValueError):
-        PostgresStore(dsn=DSN, **kw)
+        PostgresStore(dsn=FAKE_DSN, **kw)
 
 
 def test_the_module_names_the_defaults():

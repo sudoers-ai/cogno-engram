@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.1.2 — 2026-11-06 — release to PyPI of the changes below
+
+Publishes every «Unreleased» entry below, merged since 0.1.1. No change of its own.
+
 ## Unreleased — `read_served`: the text of ONE served document, for a READER, by the reader filter (P9, 2026-09-29)
 
 ### Added

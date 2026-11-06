@@ -61,7 +61,7 @@ from cogno_engram.types import (
     sanitize_edge_status,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.1.2"
 
 __all__ = [
     # write losses this library counts instead of swallowing (see write_loss.py)
